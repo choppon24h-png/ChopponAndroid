@@ -1,5 +1,11 @@
-import com.android.build.api.dsl.Packaging
-import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
+// ═══════════════════════════════════════════════════════════════════════════
+// NOTA: Com AGP 8.9.0 + Kotlin 2.0.21, a API correta para forçar JVM-target
+// é kotlin { compilerOptions { jvmTarget } } — NÃO kotlinOptions nem
+// afterEvaluate. O kotlinOptions foi depreciado no Kotlin 2.x e o
+// afterEvaluate é ignorado pelo plugin Compose nessa versão.
+// ═══════════════════════════════════════════════════════════════════════════
+
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.android.application)
@@ -7,18 +13,13 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// SOLUÇÃO TRIPLA para "Inconsistent JVM-target (17) vs (21)"
-//
-// CAMADA 1 — JVM Toolchain (ideal, requer JDK 17 instalado na máquina)
-// CAMADA 2 — kotlinOptions (fallback explícito por task)
-// CAMADA 3 — afterEvaluate hook (força o target em TODAS as tasks Kotlin,
-//             incluindo as geradas pelo plugin Compose, que sobrescrevem o valor)
-// ═════════════════════════════════════════════════════════════════════════════
-
-// CAMADA 1
+// ── SOLUÇÃO DEFINITIVA: nova API compilerOptions do Kotlin 2.x ──────────────
+// Esta é a única API que o plugin kotlin.compose respeita no Kotlin 2.0+.
+// Ela age ANTES de qualquer plugin registrar suas tasks.
 kotlin {
-    jvmToolchain(17)
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+    }
 }
 
 android {
@@ -44,13 +45,10 @@ android {
         }
     }
 
-    // CAMADA 2 — compileOptions + kotlinOptions explícitos
+    // Alinhamento Java — deve bater com o JvmTarget.JVM_17 acima
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-    kotlinOptions {
-        jvmTarget = "17"
     }
 
     buildFeatures {
@@ -70,18 +68,6 @@ android {
                 "META-INF/*.kotlin_module",
                 "META-INF/INDEX.LIST"
             )
-        }
-    }
-}
-
-// CAMADA 3 — afterEvaluate: garante que TODAS as tasks KotlinCompile
-// (incluindo as geradas pelo plugin Compose após a configuração do android {})
-// usem JVM 17. Esta é a camada que resolve o problema quando o plugin Compose
-// sobrescreve o jvmTarget definido nas camadas anteriores.
-afterEvaluate {
-    tasks.withType<KotlinCompile>().configureEach {
-        kotlinOptions {
-            jvmTarget = "17"
         }
     }
 }
