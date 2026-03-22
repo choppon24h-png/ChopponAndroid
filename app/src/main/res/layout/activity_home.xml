@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    activity_home.xml — Layout v2.1
+    ─────────────────────────────────────────────────────────────────────────
+    Mudanças v2.1:
+      • Nome da bebida: cor preta brilhante (#1A1A1A) em vez de laranja
+      • Subtítulo "Selecione o volume desejado": cor laranja (#FF8C00)
+      • Botões: todos com a mesma cor laranja (#FF8C00) — unificado
+      • Fonte dos botões aumentada de 17sp para 22sp (ml e valor mais visíveis)
+      • Pulso: removido pulso contínuo em cascata — pulsação aleatória via Home.java
+    ─────────────────────────────────────────────────────────────────────────
+-->
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/main"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#FFFFFF">
+
+    <!-- ── Status Bluetooth ──────────────────────────────────────────── -->
+    <include
+        android:id="@+id/bluetooth_status_container"
+        layout="@layout/bluetooth_status_indicator"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <!-- ── Logo Chopp ON ─────────────────────────────────────────────── -->
+    <ImageView
+        android:id="@+id/logoChoppOn"
+        android:layout_width="0dp"
+        android:layout_height="50dp"
+        android:layout_marginTop="2dp"
+        android:contentDescription="Logo Chopp ON"
+        android:scaleType="fitCenter"
+        android:src="@drawable/logo_choppon"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/bluetooth_status_container"
+        app:layout_constraintWidth_percent="0.55" />
+
+    <!-- ── Imagem da Bebida ───────────────────────────────────────────
+         Proporção 4:3 (mais larga). Margens 8dp para maximizar largura.
+         centerCrop preenche o card sem distorção.
+    ─────────────────────────────────────────────────────────────────── -->
+    <androidx.cardview.widget.CardView
+        android:id="@+id/cardBebida2"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_marginStart="8dp"
+        android:layout_marginTop="6dp"
+        android:layout_marginEnd="8dp"
+        app:cardCornerRadius="16dp"
+        app:cardElevation="8dp"
+        app:layout_constraintDimensionRatio="4:3"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/logoChoppOn">
+
+        <ImageView
+            android:id="@+id/imageBeer2"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:contentDescription="Imagem da bebida"
+            android:scaleType="centerCrop" />
+
+    </androidx.cardview.widget.CardView>
+
+    <!-- ── Nome da Bebida ─────────────────────────────────────────────
+         30sp, negrito, preto brilhante — destaque máximo para o cliente.
+    ─────────────────────────────────────────────────────────────────── -->
+    <TextView
+        android:id="@+id/txtBebida"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:layout_marginTop="4dp"
+        android:layout_marginEnd="8dp"
+        android:text="Carregando..."
+        android:textAlignment="center"
+        android:textColor="#1A1A1A"
+        android:textSize="30sp"
+        android:textStyle="bold"
+        android:maxLines="2"
+        android:ellipsize="end"
+        android:letterSpacing="0.02"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/cardBebida2" />
+
+    <!-- ── Subtítulo ─────────────────────────────────────────────────── -->
+    <TextView
+        android:id="@+id/textView4"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="Selecione o volume desejado:"
+        android:textColor="#FF8C00"
+        android:textSize="12sp"
+        android:textStyle="italic"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/txtBebida" />
+
+    <!-- ══════════════════════════════════════════════════════════════
+         GRADE 2×2
+         Linha 1: btn100 = 300ml  |  btn300 = 500ml
+         Linha 2: btn500 = 700ml  |  btn700 = 1000ml
+         ratio 1.6:1 → botões achatados, cabem na tela com a imagem
+         Todos com a mesma cor laranja #FF8C00 — muda ao selecionar via Java
+    ══════════════════════════════════════════════════════════════════ -->
+
+    <!-- Linha 1 — Esquerda: 300ml -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btn100"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_marginStart="8dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="4dp"
+        android:backgroundTint="#FF8C00"
+        android:text="300 ml\nR$ 0,00"
+        android:textColor="#FFFFFF"
+        android:textSize="22sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:lineSpacingMultiplier="1.1"
+        app:cornerRadius="18dp"
+        app:layout_constraintDimensionRatio="1.6:1"
+        app:layout_constraintEnd_toStartOf="@+id/btn300"
+        app:layout_constraintHorizontal_chainStyle="spread"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/textView4" />
+
+    <!-- Linha 1 — Direita: 500ml -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btn300"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_marginStart="4dp"
+        android:layout_marginEnd="8dp"
+        android:backgroundTint="#FF8C00"
+        android:text="500 ml\nR$ 0,00"
+        android:textColor="#FFFFFF"
+        android:textSize="22sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:lineSpacingMultiplier="1.1"
+        app:cornerRadius="18dp"
+        app:layout_constraintDimensionRatio="1.6:1"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toEndOf="@+id/btn100"
+        app:layout_constraintTop_toTopOf="@+id/btn100" />
+
+    <!-- Linha 2 — Esquerda: 700ml -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btn500"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="4dp"
+        android:backgroundTint="#FF8C00"
+        android:text="700 ml\nR$ 0,00"
+        android:textColor="#FFFFFF"
+        android:textSize="22sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:lineSpacingMultiplier="1.1"
+        app:cornerRadius="18dp"
+        app:layout_constraintDimensionRatio="1.6:1"
+        app:layout_constraintEnd_toStartOf="@+id/btn700"
+        app:layout_constraintStart_toStartOf="@+id/btn100"
+        app:layout_constraintTop_toBottomOf="@+id/btn100" />
+
+    <!-- Linha 2 — Direita: 1000ml -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btn700"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_marginTop="8dp"
+        android:backgroundTint="#FF8C00"
+        android:text="1000 ml\nR$ 0,00"
+        android:textColor="#FFFFFF"
+        android:textSize="22sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:lineSpacingMultiplier="1.1"
+        app:cornerRadius="18dp"
+        app:layout_constraintDimensionRatio="1.6:1"
+        app:layout_constraintEnd_toEndOf="@+id/btn300"
+        app:layout_constraintStart_toEndOf="@+id/btn500"
+        app:layout_constraintTop_toBottomOf="@+id/btn300" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>

@@ -1,0 +1,52 @@
+# Android build artifacts
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# App module build
+app/build/
+app/.cxx/
+
+# Gradle wrapper (manter gradlew e gradle/wrapper)
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+
+# Keystore (NUNCA commitar chaves de assinatura)
+*.jks
+*.keystore
+release/
+signing.properties
+
+# IDE
+*.swp
+*.swo
+*~
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/gradle.xml
+.idea/assetWizardSettings.xml
+.idea/dictionaries/
+.idea/libraries/
+.idea/caches/
+.idea/modules.xml
+.idea/*.iml
+
+# Kotlin
+kotlin-js-store/
+
+# PHP (pasta de scripts auxiliares)
+php/vendor/
+php/.env
+
+# Logs
+*.log
