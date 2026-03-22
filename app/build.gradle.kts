@@ -1,4 +1,5 @@
 import com.android.build.api.dsl.Packaging
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
     alias(libs.plugins.android.application)
@@ -6,14 +7,16 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// JVM TOOLCHAIN — solução definitiva para o erro:
-//   "Inconsistent JVM-target compatibility detected (17) vs (21)"
+// ═════════════════════════════════════════════════════════════════════════════
+// SOLUÇÃO TRIPLA para "Inconsistent JVM-target (17) vs (21)"
 //
-// O Kotlin 2.x usa JVM 21 por padrão. O bloco kotlin { jvmToolchain(17) }
-// força AMBOS os compiladores (javac + kotlinc) a usar o mesmo JDK 17,
-// eliminando o conflito de uma vez por todas, sem precisar de kotlinOptions.
-// ─────────────────────────────────────────────────────────────────────────────
+// CAMADA 1 — JVM Toolchain (ideal, requer JDK 17 instalado na máquina)
+// CAMADA 2 — kotlinOptions (fallback explícito por task)
+// CAMADA 3 — afterEvaluate hook (força o target em TODAS as tasks Kotlin,
+//             incluindo as geradas pelo plugin Compose, que sobrescrevem o valor)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// CAMADA 1
 kotlin {
     jvmToolchain(17)
 }
@@ -28,7 +31,6 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "2.0.0"
-
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -42,10 +44,13 @@ android {
         }
     }
 
-    // compileOptions mantido para compatibilidade explícita com bibliotecas Java
+    // CAMADA 2 — compileOptions + kotlinOptions explícitos
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
     }
 
     buildFeatures {
@@ -55,12 +60,6 @@ android {
 
     packaging {
         resources {
-            // ─────────────────────────────────────────────────────────────────
-            // ANTECIPAÇÃO: conflito de META-INF entre jjwt + okhttp + gson
-            // Sem este bloco, o build falha com:
-            //   "More than one file was found with OS independent path
-            //    'META-INF/DEPENDENCIES'"
-            // ─────────────────────────────────────────────────────────────────
             excludes += setOf(
                 "META-INF/DEPENDENCIES",
                 "META-INF/LICENSE",
@@ -71,6 +70,18 @@ android {
                 "META-INF/*.kotlin_module",
                 "META-INF/INDEX.LIST"
             )
+        }
+    }
+}
+
+// CAMADA 3 — afterEvaluate: garante que TODAS as tasks KotlinCompile
+// (incluindo as geradas pelo plugin Compose após a configuração do android {})
+// usem JVM 17. Esta é a camada que resolve o problema quando o plugin Compose
+// sobrescreve o jvmTarget definido nas camadas anteriores.
+afterEvaluate {
+    tasks.withType<KotlinCompile>().configureEach {
+        kotlinOptions {
+            jvmTarget = "17"
         }
     }
 }
@@ -99,19 +110,12 @@ dependencies {
     implementation("com.google.code.gson:gson:2.10.1")
 
     // ── JWT ───────────────────────────────────────────────────────────────────
-    // ANTECIPAÇÃO: java-jwt 3.10.3 tem vulnerabilidade CVE-2022-23529.
-    // Atualizado para 4.4.0 (API compatível, sem breaking changes para uso básico).
     implementation("com.auth0:java-jwt:4.4.0")
-
-    // ANTECIPAÇÃO: jjwt 0.7.0 é muito antigo e causa conflito de classes com
-    // java-jwt. Substituído pela versão modular 0.12.6 que não conflita.
     implementation("io.jsonwebtoken:jjwt-api:0.12.6")
     runtimeOnly("io.jsonwebtoken:jjwt-impl:0.12.6")
     runtimeOnly("io.jsonwebtoken:jjwt-jackson:0.12.6")
 
     // ── BLE ───────────────────────────────────────────────────────────────────
-    // ANTECIPAÇÃO: nordic BLE 2.11.0 pode ter conflito de R class com AGP 8.9.
-    // Atualizado para 2.11.1 (última estável compatível com compileSdk 35).
     implementation("no.nordicsemi.android:ble:2.11.1")
 
     // ── QR Code ───────────────────────────────────────────────────────────────
