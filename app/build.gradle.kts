@@ -1,25 +1,7 @@
-// ═══════════════════════════════════════════════════════════════════════════
-// NOTA: Com AGP 8.9.0 + Kotlin 2.0.21, a API correta para forçar JVM-target
-// é kotlin { compilerOptions { jvmTarget } } — NÃO kotlinOptions nem
-// afterEvaluate. O kotlinOptions foi depreciado no Kotlin 2.x e o
-// afterEvaluate é ignorado pelo plugin Compose nessa versão.
-// ═══════════════════════════════════════════════════════════════════════════
-
-import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
-}
-
-// ── SOLUÇÃO DEFINITIVA: nova API compilerOptions do Kotlin 2.x ──────────────
-// Esta é a única API que o plugin kotlin.compose respeita no Kotlin 2.0+.
-// Ela age ANTES de qualquer plugin registrar suas tasks.
-kotlin {
-    compilerOptions {
-        jvmTarget.set(JvmTarget.JVM_17)
-    }
 }
 
 android {
@@ -45,7 +27,6 @@ android {
         }
     }
 
-    // Alinhamento Java — deve bater com o JvmTarget.JVM_17 acima
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
