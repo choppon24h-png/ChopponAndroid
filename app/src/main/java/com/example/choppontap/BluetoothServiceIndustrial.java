@@ -95,9 +95,12 @@ import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.Date;
+import java.util.Locale;
 import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.SignatureAlgorithm;
@@ -207,15 +210,18 @@ public class BluetoothServiceIndustrial extends Service {
     // Constantes de protocolo
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /** PIN de autenticação BLE — deve coincidir com BLE_AUTH_PIN no firmware ESP32. */
+    /** PIN de pareamento BLE — usado apenas no pairing/bonding, NÃO no comando AUTH. */
     public static final String ESP32_PIN = "259087";
-
     /** Prefixo do nome BLE do ESP32. Apenas dispositivos com este prefixo são aceitos. */
     public static final String BLE_NAME_PREFIX = "CHOPP_";
-
-    /** Comando de autenticação enviado após discoverServices. */
+    /**
+     * Chave secreta HMAC-SHA256 — DEVE ser idêntica a AUTH_SECRET_KEY no config.h do firmware.
+     * Formato do token: HMAC(SESSION_ID + ":" + timestamp_segundos, SECRET_KEY)
+     * Formato do comando AUTH: AUTH|<HMAC_HEX>:<TIMESTAMP>|<CMD_ID>|<SESSION_ID>
+     */
+    private static final String AUTH_SECRET_KEY = "CHOPP_FRANQUIA_SECRET_2024_v2";
+    /** ID do comando de autenticação (incrementar por sessão se necessário). */
     private static final String AUTH_CMD_ID = "1";
-    private static final String AUTH_SESSION_ID = "ABC";
 
     /** Comando de heartbeat enviado a cada {@link #HEARTBEAT_INTERVAL_MS}. */
     private static final String PING_COMMAND = "PING";
@@ -1222,8 +1228,62 @@ public class BluetoothServiceIndustrial extends Service {
      * Envia AUTH industrial após delay de 600ms.
      * REQUISITO 9 — Se AUTH_OK não chegar em 8s, mantém BLE bloqueado.
      */
+    /**
+     * Gera o comando AUTH com token HMAC-SHA256 no formato esperado pelo firmware v2.0.
+     *
+     * Formato enviado: AUTH|<HMAC_HEX>:<TIMESTAMP_SEG>|<CMD_ID>|<SESSION_ID>
+     * Onde HMAC = HMAC-SHA256(SESSION_ID + ":" + TIMESTAMP_SEG, AUTH_SECRET_KEY)
+     *
+     * O firmware valida em auth_validator.cpp:
+     *   message = sessionId + ":" + timestampStr
+     *   expectedHmac = HMAC-SHA256(message, AUTH_SECRET_KEY)
+     */
     private String gerarAuth() {
-        return "AUTH|" + ESP32_PIN + "|" + AUTH_CMD_ID + "|" + AUTH_SESSION_ID;
+        // Gerar SESSION_ID único por sessão (8 chars hex aleatório)
+        final String sessionId = String.format(Locale.US, "%08X",
+                (int)(System.currentTimeMillis() & 0xFFFFFFFFL));
+        // Timestamp em segundos (uptime do Android — firmware usa millis()/1000)
+        final long timestampSeg = System.currentTimeMillis() / 1000L;
+        // Mensagem para HMAC: SESSION_ID + ":" + timestamp
+        final String message = sessionId + ":" + timestampSeg;
+        // Calcular HMAC-SHA256
+        String hmacHex = calcularHmacSha256(message, AUTH_SECRET_KEY);
+        if (hmacHex == null) {
+            // Fallback seguro: se HMAC falhar, envia token inválido mas loggável
+            Log.e(TAG, "[AUTH] FALHA ao calcular HMAC — usando fallback");
+            hmacHex = "0000000000000000000000000000000000000000000000000000000000000000";
+        }
+        // Token = HMAC_HEX + ":" + timestamp (formato esperado pelo authValidator_validate)
+        final String token = hmacHex + ":" + timestampSeg;
+        // Comando completo: AUTH|<TOKEN>|<CMD_ID>|<SESSION_ID>
+        final String cmd = "AUTH|" + token + "|" + AUTH_CMD_ID + "|" + sessionId;
+        Log.d(TAG, "[AUTH] Gerando AUTH v2.0 | session=" + sessionId
+                + " | ts=" + timestampSeg + " | hmac=" + hmacHex.substring(0, 8) + "...");
+        return cmd;
+    }
+
+    /**
+     * Calcula HMAC-SHA256 de uma mensagem com a chave fornecida.
+     * Retorna string hexadecimal de 64 caracteres ou null em caso de erro.
+     */
+    private static String calcularHmacSha256(String message, String key) {
+        try {
+            final Mac mac = Mac.getInstance("HmacSHA256");
+            final SecretKeySpec secretKey = new SecretKeySpec(
+                    key.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+            mac.init(secretKey);
+            final byte[] hmacBytes = mac.doFinal(
+                    message.getBytes(StandardCharsets.UTF_8));
+            // Converter para hexadecimal lowercase (igual ao firmware: %02x)
+            final StringBuilder sb = new StringBuilder(64);
+            for (byte b : hmacBytes) {
+                sb.append(String.format(Locale.US, "%02x", b));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            Log.e("BLE_INDUSTRIAL", "[AUTH] Erro HMAC: " + e.getMessage());
+            return null;
+        }
     }
 
     private void enviarAutenticacao(BluetoothGatt gatt) {

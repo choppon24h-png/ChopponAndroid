@@ -254,7 +254,18 @@ public class BleParser {
                     Log.e(TAG, "[ERROR] Válvula travada — verificar hardware!");
                     return new ParsedMessage(MessageType.ERROR_VALVE_STUCK,
                             s, null, null, 0);
+                case "INVALID_AUTH":
+                    // Firmware v2.0: pacote AUTH mal-formado (falta campo ou token muito curto)
+                    Log.e(TAG, "[AUTH] ERROR:INVALID_AUTH — formato do pacote AUTH incorreto");
+                    return new ParsedMessage(MessageType.AUTH_FAIL, s, null, null, 0);
                 default:
+                    // Captura ERROR:INVALID_TOKEN|<detalhe> com pipe (ex: INVALID_TOKEN|HMAC invalido)
+                    if (err.startsWith("INVALID_TOKEN")) {
+                        String detail = err.contains("|") ? err.substring(err.indexOf('|') + 1) : err;
+                        Log.e(TAG, "[AUTH] ERROR:INVALID_TOKEN — " + detail
+                                + " (HMAC inválido ou token expirado)");
+                        return new ParsedMessage(MessageType.AUTH_FAIL, s, null, null, 0);
+                    }
                     Log.e(TAG, "[ERROR] Código desconhecido: " + err);
                     return new ParsedMessage(MessageType.UNKNOWN, s, null, null, 0);
             }
