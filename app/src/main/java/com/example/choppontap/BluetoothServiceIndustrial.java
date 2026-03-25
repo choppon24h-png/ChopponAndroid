@@ -44,7 +44,7 @@ package com.example.choppontap;
  *   → ACTION_PAIRING_REQUEST → setPin(259087) → BOND_BONDED
  *   → delay 800–1200ms → connectGatt(autoConnect=false, TRANSPORT_LE)
  *   → CONNECTED → requestConnectionPriority(HIGH) → requestMtu(512)
- *   → discoverServices → delay 600ms → AUTH|259087|1|ABC
+ *   → discoverServices → delay 600ms → AUTH|<HMAC_HEX>:<UPTIME_SEG>|<CMD_ID>|<SESSION_ID>
  *   → AUTH_OK → READY → broadcastWriteReady
  *
  * CASO 2 — Reconexão (MAC salvo):
@@ -923,9 +923,27 @@ public class BluetoothServiceIndustrial extends Service {
                     Log.i(TAG, "[PAIRING] AUTO-CONFIRM -> setPairingConfirmation(true)");
                     abortBroadcast();
                     break;
+                case 3: // PAIRING_VARIANT_PASSKEY (não exposto como constante em todas as APIs)
+                    // Variante 3 = PIN numérico de 6 dígitos (NimBLE passkey)
+                    // O ESP32 com NimBLE usa esta variante quando configurado como
+                    // BLE_SM_IO_CAP_DISP_ONLY ou BLE_SM_IO_CAP_KEYBOARD_ONLY.
+                    // Solucao: confirmar automaticamente com setPin.
+                    try {
+                        boolean ok = device.setPin(ESP32_PIN.getBytes(StandardCharsets.UTF_8));
+                        Log.i(TAG, "[PAIRING] Variante 3 (PASSKEY) -> setPin(" + ESP32_PIN + ") -> "
+                                + (ok ? "ACEITO" : "REJEITADO"));
+                        abortBroadcast();
+                    } catch (Exception ex) {
+                        Log.e(TAG, "[PAIRING] Erro ao setar PIN para variante 3: " + ex.getMessage());
+                    }
+                    break;
                 default:
                     Log.w(TAG, "[PAIRING] Variante desconhecida: " + variant
-                            + " - sem injecao automatica");
+                            + " - tentando setPin como fallback");
+                    try {
+                        device.setPin(ESP32_PIN.getBytes(StandardCharsets.UTF_8));
+                        abortBroadcast();
+                    } catch (Exception ignored) {}
                     break;
             }
         }
@@ -1242,8 +1260,13 @@ public class BluetoothServiceIndustrial extends Service {
         // Gerar SESSION_ID único por sessão (8 chars hex aleatório)
         final String sessionId = String.format(Locale.US, "%08X",
                 (int)(System.currentTimeMillis() & 0xFFFFFFFFL));
-        // Timestamp em segundos (uptime do Android — firmware usa millis()/1000)
-        final long timestampSeg = System.currentTimeMillis() / 1000L;
+        // CRÍTICO: firmware ESP32 usa millis()/1000 (uptime desde boot do ESP32).
+        // NÃO usar System.currentTimeMillis() (Unix timestamp ~1.7 bilhões) pois causaria
+        // tokenAgeMs = (nowSeconds - tokenTimestamp) * 1000 >> AUTH_TOKEN_VALID_MS (300000ms)
+        // resultando em ERROR:INVALID_AUTH por "token expirado" imediatamente.
+        // Solucao: enviar uptime do Android (SystemClock.elapsedRealtime/1000) que
+        // tambem e um valor pequeno, similar ao millis()/1000 do ESP32.
+        final long timestampSeg = android.os.SystemClock.elapsedRealtime() / 1000L;
         // Mensagem para HMAC: SESSION_ID + ":" + timestamp
         final String message = sessionId + ":" + timestampSeg;
         // Calcular HMAC-SHA256
@@ -1397,6 +1420,38 @@ public class BluetoothServiceIndustrial extends Service {
         if ("ERROR:INVALID_FORMAT".equalsIgnoreCase(data)) {
             Log.e(TAG, "[AUTH] ERROR:INVALID_FORMAT - payload rejeitado pelo ESP32");
             broadcastData(data);
+            return;
+        }
+
+        // ── ERROR:INVALID_AUTH — token mal-formado (reenviar AUTH) ───────────────
+        if (data.startsWith("ERROR:INVALID_AUTH")) {
+            Log.e(TAG, "[AUTH] ERROR:INVALID_AUTH | retry=" + mAuthRetryCount + "/" + MAX_AUTH_RETRY);
+            broadcastData(data);
+            if (mAuthRetryCount < MAX_AUTH_RETRY) {
+                mAuthRetryCount++;
+                Log.i(TAG, "[AUTH] Reenviando AUTH (INVALID_AUTH) tentativa " + mAuthRetryCount);
+                mMainHandler.postDelayed(() -> writeImediato(gerarAuth()), 800L);
+            } else {
+                Log.e(TAG, "[AUTH] Max retries INVALID_AUTH atingido — reconectando");
+                mAuthRetryCount = 0;
+                if (mBluetoothGatt != null) mBluetoothGatt.disconnect();
+            }
+            return;
+        }
+
+        // ── ERROR:INVALID_TOKEN — HMAC inválido ou token expirado (reenviar AUTH) ─
+        if (data.startsWith("ERROR:INVALID_TOKEN")) {
+            Log.e(TAG, "[AUTH] ERROR:INVALID_TOKEN (HMAC inválido ou expirado) | retry=" + mAuthRetryCount);
+            broadcastData(data);
+            if (mAuthRetryCount < MAX_AUTH_RETRY) {
+                mAuthRetryCount++;
+                Log.i(TAG, "[AUTH] Reenviando AUTH (INVALID_TOKEN) tentativa " + mAuthRetryCount);
+                mMainHandler.postDelayed(() -> writeImediato(gerarAuth()), 800L);
+            } else {
+                Log.e(TAG, "[AUTH] Max retries INVALID_TOKEN atingido — reconectando");
+                mAuthRetryCount = 0;
+                if (mBluetoothGatt != null) mBluetoothGatt.disconnect();
+            }
             return;
         }
         // ── VALVE:OPEN / VALVE:CLOSED ─────────────────────────────────────────
