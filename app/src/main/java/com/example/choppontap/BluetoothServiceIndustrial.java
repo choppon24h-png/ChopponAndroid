@@ -210,8 +210,6 @@ public class BluetoothServiceIndustrial extends Service {
     // Constantes de protocolo
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /** PIN de pareamento BLE — usado apenas no pairing/bonding, NÃO no comando AUTH. */
-    public static final String ESP32_PIN = "259087";
     /** Prefixo do nome BLE do ESP32. Apenas dispositivos com este prefixo são aceitos. */
     public static final String BLE_NAME_PREFIX = "CHOPP_";
     /**
@@ -219,7 +217,7 @@ public class BluetoothServiceIndustrial extends Service {
      * Formato do token: HMAC(SESSION_ID + ":" + timestamp_segundos, SECRET_KEY)
      * Formato do comando AUTH: AUTH|<HMAC_HEX>:<TIMESTAMP>|<CMD_ID>|<SESSION_ID>
      */
-    private static final String AUTH_SECRET_KEY = "CHOPP_FRANQUIA_SECRET_2024_v2";
+    private static final String AUTH_SECRET_KEY = "Choppon103614@";
     /** ID do comando de autenticação (incrementar por sessão se necessário). */
     private static final String AUTH_CMD_ID = "1";
 
@@ -858,7 +856,7 @@ public class BluetoothServiceIndustrial extends Service {
                 iniciarTimeoutBond(device);
                 break;
             default: // BOND_NONE
-                Log.i(TAG, "[BOND] BOND_NONE → createBond() com PIN " + ESP32_PIN);
+                Log.i(TAG, "[BOND] BOND_NONE → createBond() com PIN ");
                 boolean ok = device.createBond();
                 Log.i(TAG, "[BOND] createBond() → " + (ok ? "INICIADO" : "FALHOU"));
                 iniciarTimeoutBond(device);
@@ -912,8 +910,8 @@ public class BluetoothServiceIndustrial extends Service {
 
             switch (variant) {
                 case BluetoothDevice.PAIRING_VARIANT_PIN: {
-                    boolean ok = device.setPin(ESP32_PIN.getBytes(StandardCharsets.UTF_8));
-                    Log.i(TAG, "[PAIRING] PIN " + ESP32_PIN + " -> "
+                    // boolean ok = device.setPin(...); // PIN removido conforme solicitacao
+                    Log.i(TAG, "[PAIRING] PIN " + " -> "
                             + (ok ? "ACEITO" : "REJEITADO"));
                     abortBroadcast();
                     break;
@@ -929,8 +927,8 @@ public class BluetoothServiceIndustrial extends Service {
                     // BLE_SM_IO_CAP_DISP_ONLY ou BLE_SM_IO_CAP_KEYBOARD_ONLY.
                     // Solucao: confirmar automaticamente com setPin.
                     try {
-                        boolean ok = device.setPin(ESP32_PIN.getBytes(StandardCharsets.UTF_8));
-                        Log.i(TAG, "[PAIRING] Variante 3 (PASSKEY) -> setPin(" + ESP32_PIN + ") -> "
+                        // boolean ok = device.setPin(...); // PIN removido conforme solicitacao
+                        Log.i(TAG, "[PAIRING] Variante 3 (PASSKEY) -> setPin(" + ") -> "
                                 + (ok ? "ACEITO" : "REJEITADO"));
                         abortBroadcast();
                     } catch (Exception ex) {
@@ -941,7 +939,7 @@ public class BluetoothServiceIndustrial extends Service {
                     Log.w(TAG, "[PAIRING] Variante desconhecida: " + variant
                             + " - tentando setPin como fallback");
                     try {
-                        device.setPin(ESP32_PIN.getBytes(StandardCharsets.UTF_8));
+                        // device.setPin(...); // PIN removido conforme solicitacao
                         abortBroadcast();
                     } catch (Exception ignored) {}
                     break;
@@ -973,7 +971,7 @@ public class BluetoothServiceIndustrial extends Service {
 
             } else if (newState == BluetoothDevice.BOND_NONE
                     && prevState == BluetoothDevice.BOND_BONDING) {
-                Log.e(TAG, "[BOND] Pareamento FALHOU. Verifique PIN " + ESP32_PIN
+                Log.e(TAG, "[BOND] Pareamento FALHOU. Verifique PIN "
                         + " no firmware ESP32.");
                 cancelarBondTimeout();
                 broadcastConnectionStatus("bond_failed");
@@ -1260,28 +1258,31 @@ public class BluetoothServiceIndustrial extends Service {
         // Gerar SESSION_ID único por sessão (8 chars hex aleatório)
         final String sessionId = String.format(Locale.US, "%08X",
                 (int)(System.currentTimeMillis() & 0xFFFFFFFFL));
-        // CRÍTICO: firmware ESP32 usa millis()/1000 (uptime desde boot do ESP32).
-        // NÃO usar System.currentTimeMillis() (Unix timestamp ~1.7 bilhões) pois causaria
-        // tokenAgeMs = (nowSeconds - tokenTimestamp) * 1000 >> AUTH_TOKEN_VALID_MS (300000ms)
-        // resultando em ERROR:INVALID_AUTH por "token expirado" imediatamente.
-        // Solucao: enviar uptime do Android (SystemClock.elapsedRealtime/1000) que
-        // tambem e um valor pequeno, similar ao millis()/1000 do ESP32.
-        final long timestampSeg = android.os.SystemClock.elapsedRealtime() / 1000L;
-        // Mensagem para HMAC: SESSION_ID + ":" + timestamp
-        final String message = sessionId + ":" + timestampSeg;
+                
+        // Regra: timestamp = currentTimeMillis (em segundos)
+        final long timestampSeg = System.currentTimeMillis() / 1000L;
+        
+        // Regra: payload = "$timestamp:$sessionId"
+        final String payload = timestampSeg + ":" + sessionId;
+        
         // Calcular HMAC-SHA256
-        String hmacHex = calcularHmacSha256(message, AUTH_SECRET_KEY);
+        String hmacHex = calcularHmacSha256(payload, AUTH_SECRET_KEY);
         if (hmacHex == null) {
-            // Fallback seguro: se HMAC falhar, envia token inválido mas loggável
             Log.e(TAG, "[AUTH] FALHA ao calcular HMAC — usando fallback");
             hmacHex = "0000000000000000000000000000000000000000000000000000000000000000";
         }
-        // Token = HMAC_HEX + ":" + timestamp (formato esperado pelo authValidator_validate)
+        
+        // Regra: Resultado final: <hex_hmac>:<timestamp>
         final String token = hmacHex + ":" + timestampSeg;
-        // Comando completo: AUTH|<TOKEN>|<CMD_ID>|<SESSION_ID>
+        
+        // Regra: Formato final: AUTH|<token>|<cmdId>|<sessionId>
         final String cmd = "AUTH|" + token + "|" + AUTH_CMD_ID + "|" + sessionId;
-        Log.d(TAG, "[AUTH] Gerando AUTH v2.0 | session=" + sessionId
-                + " | ts=" + timestampSeg + " | hmac=" + hmacHex.substring(0, 8) + "...");
+        
+        // Logs obrigatórios
+        Log.d("BLE_AUTH", "Payload: " + payload);
+        Log.d("BLE_AUTH", "Token gerado: " + token);
+        Log.d("BLE_AUTH", "Comando enviado: " + cmd);
+        
         return cmd;
     }
 
