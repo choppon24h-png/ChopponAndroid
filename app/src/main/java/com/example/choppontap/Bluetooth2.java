@@ -353,10 +353,12 @@ public class Bluetooth2 extends BleManager {
                                         String liberado = txtVolumeLiberado.getText().toString();
 
                                         String pulsos = qtdAtual.replace("PL:","");
-                                        Float pulsosInt = Float.parseFloat(pulsos.replace("\n",""));
+                                        Float pulsosInt = Float.parseFloat(pulsos.replace("
+",""));
 
                                         String liberadoF = liberado.replace("ML","");
-                                        Float liberadoInt = Float.parseFloat(liberadoF.replace("\n",""));
+                                        Float liberadoInt = Float.parseFloat(liberadoF.replace("
+",""));
 
                                         Float mlsFloat = ((pulsosInt)/(liberadoInt/10));
                                         Integer mls = (int) Math.round(mlsFloat);
@@ -464,7 +466,8 @@ public class Bluetooth2 extends BleManager {
                             runOnCallbackThread(new Runnable() {
                                 @Override
                                 public void run() {
-                                    txtQtdLocal.setText(data1.replace("\n",""));
+                                    txtQtdLocal.setText(data1.replace("
+",""));
                                     // close(); // NÃO fechar a conexão
                                 }
                             });
