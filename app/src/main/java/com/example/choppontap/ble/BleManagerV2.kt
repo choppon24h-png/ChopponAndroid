@@ -90,13 +90,14 @@ class BleManagerV2 {
         // ── Chave HMAC compartilhada com o firmware ESP32 ────────────────────
         // IMPORTANTE: Esta chave DEVE ser idêntica à HMAC_SECRET_KEY no config.h do ESP32
         // Em produção, considere obter esta chave via API segura (HTTPS) no login do franqueado
-        private const val HMAC_SECRET_KEY = "ChoppFranquia2024SecretKey!@#"
+        private const val HMAC_SECRET_KEY = "Choppon103614@"
 
         // ── Algoritmo HMAC ────────────────────────────────────────────────────
         private const val HMAC_ALGORITHM = "HmacSHA256"
 
         // ── Comprimento do token HMAC no comando (primeiros 16 chars do hex) ─
-        private const val HMAC_TOKEN_LENGTH = 16
+        // Token completo (64 chars hex) — não truncar para manter compatibilidade com firmware v2.0
+        private const val HMAC_TOKEN_LENGTH = 64
     }
 
     // ── Interface de callback para o BluetoothServiceIndustrial ─────────────
@@ -156,34 +157,43 @@ class BleManagerV2 {
     // ═════════════════════════════════════════════════════════════════════════
 
     /**
-     * Gera um token de autenticação HMAC-SHA256 para o comando.
-     *
-     * O token é calculado sobre a string: "<COMANDO>|<CMD_ID>|<SESSION_ID>"
-     * Apenas os primeiros [HMAC_TOKEN_LENGTH] caracteres hexadecimais são usados
-     * para manter o tamanho do pacote BLE dentro do limite de 512 bytes.
-     *
-     * @param command   Tipo do comando (ex: "SERVE", "AUTH", "STOP")
-     * @param cmdId     ID único do comando (8 chars)
-     * @param sessionId ID da sessão de venda
-     * @return          Token HMAC truncado (16 chars hex) ou "0000000000000000" em caso de erro
+     * Gera token HMAC-SHA256 no formato exigido pelo firmware v2.0:
+     * payload = "$timestamp:$sessionId"
+     * token   = "$hmacHex:$timestamp"
      */
-    fun generateAuthToken(command: String, cmdId: String, sessionId: String): String {
+    fun generateAuthToken(sessionId: String): String {
         return try {
-            val payload = "$command|$cmdId|$sessionId"
+            val timestampSeg = System.currentTimeMillis() / 1000L
+            val payload = "$timestampSeg:$sessionId"
             val keySpec = SecretKeySpec(HMAC_SECRET_KEY.toByteArray(Charsets.UTF_8), HMAC_ALGORITHM)
             val mac = Mac.getInstance(HMAC_ALGORITHM)
             mac.init(keySpec)
             val hmacBytes = mac.doFinal(payload.toByteArray(Charsets.UTF_8))
-
-            // Converte para hex e trunca para HMAC_TOKEN_LENGTH chars
-            val fullHex = hmacBytes.joinToString("") { "%02x".format(it) }
-            val token = fullHex.take(HMAC_TOKEN_LENGTH).uppercase()
-
-            Log.d(TAG, "[HMAC] payload='$payload' token='$token'")
+            val hmacHex = hmacBytes.joinToString("") { "%02x".format(it) }
+            val token = "$hmacHex:$timestampSeg"
+            Log.d("BLE_AUTH", "Payload: $payload")
+            Log.d("BLE_AUTH", "Token gerado: $token")
             token
         } catch (e: Exception) {
             Log.e(TAG, "[HMAC] Erro ao gerar token: ${e.message}")
-            "0".repeat(HMAC_TOKEN_LENGTH)
+            "0".repeat(64) + ":0"
+        }
+    }
+
+    // Mantido por compatibilidade com chamadas internas de SERVE/STOP
+    fun generateAuthToken(command: String, cmdId: String, sessionId: String): String {
+        return try {
+            val timestampSeg = System.currentTimeMillis() / 1000L
+            val payload = "$timestampSeg:$sessionId"
+            val keySpec = SecretKeySpec(HMAC_SECRET_KEY.toByteArray(Charsets.UTF_8), HMAC_ALGORITHM)
+            val mac = Mac.getInstance(HMAC_ALGORITHM)
+            mac.init(keySpec)
+            val hmacBytes = mac.doFinal(payload.toByteArray(Charsets.UTF_8))
+            val hmacHex = hmacBytes.joinToString("") { "%02x".format(it) }
+            "$hmacHex:$timestampSeg"
+        } catch (e: Exception) {
+            Log.e(TAG, "[HMAC] Erro ao gerar token ($command): ${e.message}")
+            "0".repeat(64) + ":0"
         }
     }
 
@@ -216,8 +226,10 @@ class BleManagerV2 {
      * Formato: AUTH|<CMD_ID>|<SESSION_ID>|<HMAC>
      */
     fun buildAuthCommand(cmdId: String, sessionId: String): String {
-        val token = generateAuthToken("AUTH", cmdId, sessionId)
-        return "AUTH|$cmdId|$sessionId|$token"
+        val token = generateAuthToken(sessionId)
+        val command = "AUTH|$token|$cmdId|$sessionId"
+        Log.d("BLE_AUTH", "Comando enviado: $command")
+        return command
     }
 
     /**

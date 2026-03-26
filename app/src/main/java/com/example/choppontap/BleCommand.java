@@ -252,7 +252,8 @@ public class BleCommand {
             case SERVE:
                 return "SERVE|" + volumeMl + "|ID=" + commandId + "|SESSION=" + sessionId;
             case AUTH:
-                return "$AUTH:" + BluetoothServiceIndustrial.ESP32_PIN + ":" + commandId;
+                // ESP32_PIN removido — autenticação agora usa HMAC-SHA256 via BluetoothServiceIndustrial.gerarAuth()
+                return "$AUTH:HMAC_AUTH:" + commandId;
             case STOP:
                 return "$STOP:" + commandId;
             case STATUS:

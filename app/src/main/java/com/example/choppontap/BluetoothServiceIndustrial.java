@@ -910,8 +910,10 @@ public class BluetoothServiceIndustrial extends Service {
 
             switch (variant) {
                 case BluetoothDevice.PAIRING_VARIANT_PIN: {
-                    // boolean ok = device.setPin(...); // PIN removido conforme solicitacao
-                    Log.i(TAG, "[PAIRING] PIN " + " -> "
+                    // PIN removido — autenticação é feita via HMAC-SHA256 no nível do protocolo BLE
+                    // O pareamento BLE é feito sem PIN (JustWorks)
+                    boolean ok = device.setPairingConfirmation(true);
+                    Log.i(TAG, "[PAIRING] PIN_VARIANT → setPairingConfirmation(true) -> "
                             + (ok ? "ACEITO" : "REJEITADO"));
                     abortBroadcast();
                     break;
@@ -927,12 +929,13 @@ public class BluetoothServiceIndustrial extends Service {
                     // BLE_SM_IO_CAP_DISP_ONLY ou BLE_SM_IO_CAP_KEYBOARD_ONLY.
                     // Solucao: confirmar automaticamente com setPin.
                     try {
-                        // boolean ok = device.setPin(...); // PIN removido conforme solicitacao
-                        Log.i(TAG, "[PAIRING] Variante 3 (PASSKEY) -> setPin(" + ") -> "
-                                + (ok ? "ACEITO" : "REJEITADO"));
+                        // PIN removido — confirmar pareamento automaticamente (JustWorks)
+                        boolean okPasskey = device.setPairingConfirmation(true);
+                        Log.i(TAG, "[PAIRING] Variante 3 (PASSKEY) → setPairingConfirmation(true) -> "
+                                + (okPasskey ? "ACEITO" : "REJEITADO"));
                         abortBroadcast();
                     } catch (Exception ex) {
-                        Log.e(TAG, "[PAIRING] Erro ao setar PIN para variante 3: " + ex.getMessage());
+                        Log.e(TAG, "[PAIRING] Erro ao confirmar pareamento variante 3: " + ex.getMessage());
                     }
                     break;
                 default:
