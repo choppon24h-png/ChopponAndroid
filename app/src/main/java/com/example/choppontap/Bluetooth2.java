@@ -65,13 +65,12 @@ public class Bluetooth2 extends BleManager {
         Log.d("Bluetooth2", "Iniciando BleManager");
     }
 
-    @Override
     public boolean isRequiredServiceSupported(@NonNull BluetoothGatt gatt) {
         BluetoothGattService service = gatt.getService(serviceUuid);
         if (service != null) {
             rxChar = service.getCharacteristic(RX);
             txChar = service.getCharacteristic(TX);
-            
+
             boolean writeRequest = rxChar != null && (rxChar.getProperties() & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0;
             boolean notify = txChar != null && (txChar.getProperties() & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0;
 
@@ -205,8 +204,6 @@ public class Bluetooth2 extends BleManager {
                                 }
                             });
                         }
-                    }).fail((device1, status) -> {
-                        Log.e("Bluetooth2", "Falha ao configurar callback de notificação: status=" + status);
                     });
 
                     writeCharacteristic(rxChar, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
@@ -265,8 +262,6 @@ public class Bluetooth2 extends BleManager {
                                 Log.e("Bluetooth2", "Erro em liberacaoContinua: " + e.getMessage());
                             }
                         }
-                    }).fail((device1, status) -> {
-                        Log.e("Bluetooth2", "Falha ao configurar callback em liberacaoContinua: status=" + status);
                     });
 
                     writeCharacteristic(rxChar, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
@@ -345,8 +340,6 @@ public class Bluetooth2 extends BleManager {
                                 }
                             });
                         }
-                    }).fail((device1, status) -> {
-                        Log.e("Bluetooth2", "Falha ao configurar callback em teste: status=" + status);
                     });
 
                     writeCharacteristic(rxChar, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
@@ -385,8 +378,6 @@ public class Bluetooth2 extends BleManager {
                         public void onDataReceived(@NonNull BluetoothDevice device, @NonNull Data data) {
                             getPulsos(context, txtQtdLocal);
                         }
-                    }).fail((device1, status) -> {
-                        Log.e("Bluetooth2", "Falha ao configurar callback em changePulsos: status=" + status);
                     });
 
                     writeCharacteristic(rxChar, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
@@ -428,8 +419,6 @@ public class Bluetooth2 extends BleManager {
                                 runOnCallbackThread(() -> txtQtdLocal.setText(cleanedData));
                             }
                         }
-                    }).fail((device1, status) -> {
-                        Log.e("Bluetooth2", "Falha ao configurar callback em getPulsos: status=" + status);
                     });
 
                     writeCharacteristic(rxChar, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
@@ -469,8 +458,6 @@ public class Bluetooth2 extends BleManager {
                                 runOnCallbackThread(() -> txtTimeoutAtual.setText(data1));
                             }
                         }
-                    }).fail((device1, status) -> {
-                        Log.e("Bluetooth2", "Falha ao configurar callback em getTimeout: status=" + status);
                     });
 
                     writeCharacteristic(rxChar, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
