@@ -1661,9 +1661,11 @@ public class BluetoothServiceIndustrial extends Service {
             return null;
         }
 
+        // AUTH_SESSION_ID removido junto com o PIN — gera um sessionId de fallback aleatório
         String safeSessionId = (sessionId != null && !sessionId.trim().isEmpty())
                 ? sessionId.trim()
-                : AUTH_SESSION_ID;
+                : String.format(java.util.Locale.US, "%08X",
+                        (int)(System.currentTimeMillis() & 0xFFFFFFFFL));
 
         BleCommand cmd = mCommandQueueV2.enqueueServe(volumeMl, safeSessionId);
         if (cmd == null) {
