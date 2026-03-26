@@ -21,6 +21,7 @@ import android.widget.EditText;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.core.app.ActivityCompat;
 
 import java.io.IOException;
@@ -62,32 +63,46 @@ public class Bluetooth2 extends BleManager {
     private String command;
     private BluetoothGattService gattService;
     private Context localContext;
+
+    private BluetoothGattCharacteristic rxChar, txChar;
+
     public Bluetooth2(Context context)
     {
         super(context);
         localContext = context;
     }
+
+    @Override
+    protected void initialize() {
+        // Inicialização do BleManager
+    }
+
     @Override
     public boolean isRequiredServiceSupported(@NonNull BluetoothGatt gatt) {
-        BluetoothGattService gattService = gatt.getService(serviceUuid);
-        if (gattService != null) {
-            Log.d("Bluetooth2", "Serviço UART encontrado");
-            return true;
+        BluetoothGattService service = gatt.getService(serviceUuid);
+        if (service != null) {
+            rxChar = service.getCharacteristic(RX);
+            txChar = service.getCharacteristic(TX);
+            
+            boolean writeRequest = rxChar != null && (rxChar.getProperties() & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0;
+            boolean notify = txChar != null && (txChar.getProperties() & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0;
+
+            Log.d("Bluetooth2", "Serviço UART encontrado: " + (rxChar != null && txChar != null));
+            return rxChar != null && txChar != null;
         }
         Log.e("Bluetooth2", "Serviço UART NÃO encontrado");
         return false;
     }
 
-
+    @Override
+    protected void onDeviceDisconnected() {
+        rxChar = null;
+        txChar = null;
+    }
 
 
     public boolean connected() {
-        BluetoothManager manager = (BluetoothManager) localContext.getSystemService(Context.BLUETOOTH_SERVICE);
-        List<BluetoothDevice> connectedGattDevices = manager.getConnectedDevices(BluetoothProfile.GATT);
-        if (!connectedGattDevices.isEmpty()) {
-            return true;
-        }
-        return false;
+        return isConnected();
     }
 
 
@@ -103,14 +118,6 @@ public class Bluetooth2 extends BleManager {
     public void connectDevice(Context context, BluetoothGattCallback gattCallback )
     {
         if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-
-            // TODO: Consider calling
-            //    ActivityCompat#requestPermissions
-            // here to request the missing permissions, and then overriding
-            //   public void onRequestPermissionsResult(int requestCode, String[] permissions,
-            //                                          int[] grantResults)
-            // to handle the case where the user grants the permission. See the documentation
-            // for ActivityCompat#requestPermissions for more details.
             return;
         }
 
@@ -118,28 +125,19 @@ public class Bluetooth2 extends BleManager {
         {
             ScanCallback scanCallbackStop = new ScanCallback() {
                 @Override
-                public void onScanResult(int callbackType, ScanResult result) {
-
-                }
-
+                public void onScanResult(int callbackType, ScanResult result) {}
                 @Override
-                public void onBatchScanResults(List<ScanResult> results) {
-                    // Process a batch of scan results
-                }
-
+                public void onBatchScanResults(List<ScanResult> results) {}
                 @Override
-                public void onScanFailed(int errorCode) {
-                    // Handle scan failure
-                }
+                public void onScanFailed(int errorCode) {}
             };
             bluetoothLeScanner.stopScan(scanCallbackStop);
         }
         BluetoothManager bluetoothManager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
         List<BluetoothDevice> devices = bluetoothManager.getConnectedDevices(BluetoothProfile.GATT);
         for(BluetoothDevice device : devices){
-            if(bluetoothGatt == null && device.getName() != null && device.getName().startsWith("CHOPP_")){
-                bluetoothGatt = device.connectGatt(context, true, gattCallback);
-
+            if(!isConnected() && device.getName() != null && device.getName().startsWith("CHOPP_")){
+                connect(device).retry(3, 100).enqueue();
             }
         }
 
@@ -151,7 +149,6 @@ public class Bluetooth2 extends BleManager {
         txtVz = txtVz1;
         txtMl = txtMl1;
 
-
         BluetoothManager manager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
         List<BluetoothDevice> connectedGattDevices = manager.getConnectedDevices(BluetoothProfile.GATT);
 
@@ -161,92 +158,56 @@ public class Bluetooth2 extends BleManager {
             byte[] messageBytes = command.getBytes();
             
             BluetoothDevice device = connectedGattDevices.get(0);
-            Log.d("Bluetooth2", "Iniciando liberação de líquido: " + command + " para " + device.getAddress());
+            Log.d("Bluetooth2", "Iniciando liberação de líquido: " + command);
             
             connect(device).done(d -> {
-                Log.d("Bluetooth2", "Conectado com sucesso para liberação");
-                BluetoothGatt gatt = getBluetoothGatt();
-                if (gatt == null) {
-                    Log.e("Bluetooth2", "GATT nulo após conexão");
-                    return;
-                }
+                Log.d("Bluetooth2", "Conectado com sucesso");
                 
-                BluetoothGattService gattService = gatt.getService(serviceUuid);
-                if (gattService == null) {
-                    Log.e("Bluetooth2", "Serviço não encontrado");
-                    return;
-                }
-                
-                BluetoothGattCharacteristic rx = gattService.getCharacteristic(RX);
-                BluetoothGattCharacteristic tx = gattService.getCharacteristic(TX);
-                
-                if (rx == null || tx == null) {
-                    Log.e("Bluetooth2", "Características RX/TX não encontradas");
+                if (txChar == null || rxChar == null) {
+                    Log.e("Bluetooth2", "Características não encontradas");
                     return;
                 }
 
-                // 1. Configurar callback de notificação
-                setNotificationCallback(tx).with(new DataReceivedCallback() {
+                setNotificationCallback(txChar).with(new DataReceivedCallback() {
                     @Override
                     public void onDataReceived(@NonNull BluetoothDevice device, @NonNull Data data) {
-                        byte[] data2 = data.getValue();
-                        if (data2 == null) return;
-                        String receivedData = new String(data2);
+                        String receivedData = data.getStringValue(0);
+                        if (receivedData == null) return;
                         Log.d("Bluetooth2", "Recebido: " + receivedData);
                         
-                        runOnCallbackThread(new Runnable() {
-                            @Override
-                            public void run() {
-                                if(receivedData.contains("VZ")){
-                                   // txtVz.setText(receivedData);
-                                }
-                                if(receivedData.contains("QP")){
-                                    txtQtd.setText(receivedData);
-                                }
-                                if(receivedData.contains("VP")){
-                                    try {
-                                        String vp = receivedData.replace("VP:","").trim();
-                                        Double mlsFloat = Double.valueOf(vp);
-                                        Integer mls = (int) Math.round(mlsFloat);
-                                        mlsLiberados += mls;
-                                        if(liberado > 0) {
-                                            mls += liberado;
-                                        }
-                                        txtVz.setText(mls.toString()+"ML");
-                                        if(!mls.equals(mlsSolicitado)){
-                                            btnLiberar.setVisibility(TextView.VISIBLE);
-                                        }else{
-                                            btnLiberar.setVisibility(TextView.GONE);
-                                        }
-                                    } catch (Exception e) {
-                                        Log.e("Bluetooth2", "Erro ao parsear VP: " + e.getMessage());
+                        runOnCallbackThread(() -> {
+                            if(receivedData.contains("QP")){
+                                txtQtd.setText(receivedData);
+                            }
+                            if(receivedData.contains("VP")){
+                                try {
+                                    String vp = receivedData.replace("VP:","").trim();
+                                    Double mlsFloat = Double.valueOf(vp);
+                                    Integer mls = (int) Math.round(mlsFloat);
+                                    mlsLiberados += mls;
+                                    if(liberado > 0) mls += liberado;
+                                    txtVz.setText(mls.toString()+"ML");
+                                    if(!mls.equals(mlsSolicitado)){
+                                        btnLiberar.setVisibility(TextView.VISIBLE);
+                                    }else{
+                                        btnLiberar.setVisibility(TextView.GONE);
                                     }
+                                } catch (Exception e) {
+                                    Log.e("Bluetooth2", "Erro VP: " + e.getMessage());
                                 }
-                                if(receivedData.contains("ML")){
-                                    sendRequest(mlsLiberados,checkout_id,android_id);
-                                    txtMl.setText(receivedData);
-                                    // NÃO fechar a conexão aqui para permitir novos comandos
-                                    // close(); 
-                                }
+                            }
+                            if(receivedData.contains("ML")){
+                                sendRequest(mlsLiberados,checkout_id,android_id);
+                                txtMl.setText(receivedData);
                             }
                         });
                     }
                 });
 
-                // 2. Habilitar notificações PRIMEIRO
-                enableNotifications(tx).done(d2 -> {
-                    Log.d("Bluetooth2", "Notificações habilitadas, enviando comando...");
-                    // 3. Escrever comando DEPOIS de habilitar notificações
-                    writeCharacteristic(rx, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-                            .done(d3 -> Log.d("Bluetooth2", "Comando enviado com sucesso"))
-                            .fail((d3, status) -> Log.e("Bluetooth2", "Falha ao enviar comando: " + status))
-                            .enqueue();
-                }).fail((d2, status) -> {
-                    Log.e("Bluetooth2", "Falha ao habilitar notificações: " + status);
+                enableNotifications(txChar).done(d2 -> {
+                    writeCharacteristic(rxChar, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT).enqueue();
                 }).enqueue();
 
-            }).fail((d, status) -> {
-                Log.e("Bluetooth2", "Falha ao conectar: " + status);
             }).enqueue();
         }
     }
@@ -258,45 +219,32 @@ public class Bluetooth2 extends BleManager {
         List<BluetoothDevice> connectedGattDevices = manager.getConnectedDevices(BluetoothProfile.GATT);
 
         if(!connectedGattDevices.isEmpty()) {
-
-            close();
-
             String command = "$LB:";
             byte[] messageBytes = command.getBytes();
             connect(connectedGattDevices.get(0)).done(device -> {
-                BluetoothGattService gattService = bluetoothGatt.getService(UUID.fromString("7f0a0001-7b6b-4b5f-9d3e-3c7b9f100001"));
-                BluetoothGattCharacteristic rx = gattService.getCharacteristic(RX);
-                writeCharacteristic(rx, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
-                        .enqueue();
-                BluetoothGattCharacteristic tx = gattService.getCharacteristic(TX);
-                setNotificationCallback(tx).with(new DataReceivedCallback() {
+                if (rxChar == null || txChar == null) return;
+
+                setNotificationCallback(txChar).with(new DataReceivedCallback() {
                     @Override
                     public void onDataReceived(@NonNull BluetoothDevice device, @NonNull Data data) {
-                        byte[] data2 = data.getValue();
-                        String receivedData = new String(data2);
+                        String receivedData = data.getStringValue(0);
+                        if (receivedData == null) return;
                         Log.d("LB",receivedData);
-                        String vp = receivedData.replace("VP:","");
-                        Double mlsFloat = Double.valueOf(vp);
-                        Integer mls = (int) Math.round(mlsFloat);
-                        sendRequest(mls,android_id);
-                        runOnCallbackThread(new Runnable() {
-                            @Override
-                            public void run() {
-                                txtVolumeLiberado.setText(receivedData);
-                            }
-                        });
-                        if(receivedData.contains("ML")){
-                            close();
-                        }
+                        try {
+                            String vp = receivedData.replace("VP:","").trim();
+                            Double mlsFloat = Double.valueOf(vp);
+                            Integer mls = (int) Math.round(mlsFloat);
+                            sendRequest(mls,android_id);
+                            runOnCallbackThread(() -> txtVolumeLiberado.setText(receivedData));
+                            if(receivedData.contains("ML")) disconnect().enqueue();
+                        } catch (Exception e) {}
                     }
                 });
 
-                enableNotifications(tx).enqueue();
-
-
-                readCharacteristic(tx).enqueue();
+                enableNotifications(txChar).done(d2 -> {
+                    writeCharacteristic(rxChar, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE).enqueue();
+                }).enqueue();
             }).enqueue();
-
         }
     }
 
@@ -309,76 +257,52 @@ public class Bluetooth2 extends BleManager {
             String command = "$ML:" + qtd_ml.toString();
             byte[] messageBytes = command.getBytes();
             
-            BluetoothDevice device = connectedGattDevices.get(0);
-            Log.d("Bluetooth2", "Iniciando liberação teste: " + command);
-            
-            connect(device).done(d -> {
-                BluetoothGatt gatt = getBluetoothGatt();
-                if (gatt == null) return;
-                
-                BluetoothGattService gattService = gatt.getService(serviceUuid);
-                if (gattService == null) return;
-                
-                BluetoothGattCharacteristic rx = gattService.getCharacteristic(RX);
-                BluetoothGattCharacteristic tx = gattService.getCharacteristic(TX);
-                
-                if (rx == null || tx == null) return;
+            connect(connectedGattDevices.get(0)).done(d -> {
+                if (txChar == null || rxChar == null) return;
 
-                setNotificationCallback(tx).with(new DataReceivedCallback() {
+                setNotificationCallback(txChar).with(new DataReceivedCallback() {
                     @Override
                     public void onDataReceived(@NonNull BluetoothDevice device, @NonNull Data data) {
-                        byte[] data2 = data.getValue();
-                        if (data2 == null) return;
-                        String receivedData = new String(data2);
-                        Log.d("Bluetooth2", "Recebido (Teste): " + receivedData);
+                        String receivedData = data.getStringValue(0);
+                        if (receivedData == null) return;
                         
-                        runOnCallbackThread(new Runnable() {
-                            @Override
-                            public void run() {
-                                if(receivedData.contains("VP")){
-                                    try {
-                                        String vp = receivedData.replace("VP:","").trim();
-                                        Double mlsFloat = Double.valueOf(vp);
-                                        Integer mls = (int) Math.round(mlsFloat);
-                                        mlsLiberados = mls;
-                                        txtVolumeLiberado.setText(mls.toString()+"ML");
-                                    } catch (Exception e) {
-                                        Log.e("Bluetooth2", "Erro ao parsear VP: " + e.getMessage());
+                        runOnCallbackThread(() -> {
+                            if(receivedData.contains("VP")){
+                                try {
+                                    String vp = receivedData.replace("VP:","").trim();
+                                    Double mlsFloat = Double.valueOf(vp);
+                                    Integer mls = (int) Math.round(mlsFloat);
+                                    mlsLiberados = mls;
+                                    txtVolumeLiberado.setText(mls.toString()+"ML");
+                                } catch (Exception e) {}
+                            }
+                            if(receivedData.contains("ML")){
+                                try {
+                                    String qtdAtual = txtQtd.getText().toString();
+                                    String vp = receivedData.replace("ML:","").trim();
+                                    String liberado = txtVolumeLiberado.getText().toString();
+
+                                    String pulsos = qtdAtual.replace("PL:","").trim();
+                                    Float pulsosInt = Float.parseFloat(pulsos.replace("\n",""));
+
+                                    String liberadoF = liberado.replace("ML","").trim();
+                                    Float liberadoInt = Float.parseFloat(liberadoF.replace("\n",""));
+
+                                    Float mlsFloat = ((pulsosInt)/(liberadoInt/10));
+                                    Integer mls = (int) Math.round(mlsFloat);
+
+                                    mlsLiberados = mls;
+                                    if(liberadoInt != 100.0) {
+                                        txtVolumeLiberado.setText(vp+"ML");
                                     }
-                                }
-                                if(receivedData.contains("ML")){
-                                    try {
-                                        String qtdAtual = txtQtd.getText().toString();
-                                        String vp = receivedData.replace("ML:","").trim();
-                                        String liberado = txtVolumeLiberado.getText().toString();
-
-                                        String pulsos = qtdAtual.replace("PL:","");
-                                        Float pulsosInt = Float.parseFloat(pulsos.replace("
-",""));
-
-                                        String liberadoF = liberado.replace("ML","");
-                                        Float liberadoInt = Float.parseFloat(liberadoF.replace("
-",""));
-
-                                        Float mlsFloat = ((pulsosInt)/(liberadoInt/10));
-                                        Integer mls = (int) Math.round(mlsFloat);
-
-                                        mlsLiberados = mls;
-                                        if(liberadoInt != 100.0) {
-                                            txtVolumeLiberado.setText(vp+"ML");
-                                            // close(); // NÃO fechar a conexão
-                                        }
-                                    } catch (Exception e) {
-                                        Log.e("Bluetooth2", "Erro no cálculo de teste: " + e.getMessage());
-                                    }
-                                }
+                                } catch (Exception e) {}
                             }
                         });
                     }
                 });
 
-                enableNotifications(tx).done(d2 -> {
-                    writeCharacteristic(rx, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT).enqueue();
+                enableNotifications(txChar).done(d2 -> {
+                    writeCharacteristic(rxChar, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT).enqueue();
                 }).enqueue();
 
             }).enqueue();
@@ -386,7 +310,6 @@ public class Bluetooth2 extends BleManager {
     }
 
     public void changePulsos(Context context, Integer pulsoPorLitro,TextView qtdAtual){
-
         BluetoothManager manager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
         List<BluetoothDevice> connectedGattDevices = manager.getConnectedDevices(BluetoothProfile.GATT);
         txtQtdLocal = qtdAtual;
@@ -394,143 +317,74 @@ public class Bluetooth2 extends BleManager {
             String command = "$PL:" + pulsoPorLitro.toString();
             byte[] messageBytes = command.getBytes();
             
-            BluetoothDevice device = connectedGattDevices.get(0);
-            Log.d("Bluetooth2", "Iniciando changePulsos: " + command);
-            
-            connect(device).done(d -> {
-                BluetoothGatt gatt = getBluetoothGatt();
-                if (gatt == null) return;
-                
-                BluetoothGattService gattService = gatt.getService(serviceUuid);
-                if (gattService == null) return;
-                
-                BluetoothGattCharacteristic rx = gattService.getCharacteristic(RX);
-                BluetoothGattCharacteristic tx = gattService.getCharacteristic(TX);
-                
-                if (rx == null || tx == null) return;
+            connect(connectedGattDevices.get(0)).done(d -> {
+                if (txChar == null || rxChar == null) return;
 
-                setNotificationCallback(tx).with(new DataReceivedCallback() {
+                setNotificationCallback(txChar).with(new DataReceivedCallback() {
                     @Override
                     public void onDataReceived(@NonNull BluetoothDevice device, @NonNull Data data) {
-                        byte[] data2 = data.getValue();
-                        if (data2 == null) return;
-                        String data1 = new String(data2);
-                        Log.d("Bluetooth2", "Recebido (changePulsos): " + data1);
                         getPulsos(context, txtQtdLocal);
                     }
                 });
 
-                enableNotifications(tx).done(d2 -> {
-                    writeCharacteristic(rx, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT).enqueue();
+                enableNotifications(txChar).done(d2 -> {
+                    writeCharacteristic(rxChar, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT).enqueue();
                 }).enqueue();
-
             }).enqueue();
         }
-
     }
 
     public void getPulsos(Context context, TextView txtQtd){
         txtQtdLocal = txtQtd;
-
-
         BluetoothManager manager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
         List<BluetoothDevice> connectedGattDevices = manager.getConnectedDevices(BluetoothProfile.GATT);
 
         if (!connectedGattDevices.isEmpty()) {
             byte[] messageBytes = "$PL:0".getBytes();
-            
-            BluetoothDevice device = connectedGattDevices.get(0);
-            Log.d("Bluetooth2", "Iniciando getPulsos");
-            
-            connect(device).done(d -> {
-                BluetoothGatt gatt = getBluetoothGatt();
-                if (gatt == null) return;
-                
-                BluetoothGattService gattService = gatt.getService(serviceUuid);
-                if (gattService == null) return;
-                
-                BluetoothGattCharacteristic rx = gattService.getCharacteristic(RX);
-                BluetoothGattCharacteristic tx = gattService.getCharacteristic(TX);
-                
-                if (rx == null || tx == null) return;
+            connect(connectedGattDevices.get(0)).done(d -> {
+                if (txChar == null || rxChar == null) return;
 
-                setNotificationCallback(tx).with(new DataReceivedCallback() {
+                setNotificationCallback(txChar).with(new DataReceivedCallback() {
                     @Override
                     public void onDataReceived(@NonNull BluetoothDevice device, @NonNull Data data) {
-                        byte[] data2 = data.getValue();
-                        if (data2 == null) return;
-                        String data1 = new String(data2);
-                        Log.d("Bluetooth2", "Recebido (getPulsos): " + data1);
-                        
-                        if(data1.contains("PL")){
-                            runOnCallbackThread(new Runnable() {
-                                @Override
-                                public void run() {
-                                    txtQtdLocal.setText(data1.replace("
-",""));
-                                    // close(); // NÃO fechar a conexão
-                                }
-                            });
+                        String data1 = data.getStringValue(0);
+                        if(data1 != null && data1.contains("PL")){
+                            runOnCallbackThread(() -> txtQtdLocal.setText(data1.replace("\n","")));
                         }
                     }
                 });
 
-                enableNotifications(tx).done(d2 -> {
-                    writeCharacteristic(rx, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT).enqueue();
+                enableNotifications(txChar).done(d2 -> {
+                    writeCharacteristic(rxChar, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT).enqueue();
                 }).enqueue();
-
             }).enqueue();
         }
-
-
     }
+
     public void getTimeout(TextView txtTimeoutAtual){
         BluetoothManager manager = (BluetoothManager) localContext.getSystemService(Context.BLUETOOTH_SERVICE);
         List<BluetoothDevice> connectedGattDevices = manager.getConnectedDevices(BluetoothProfile.GATT);
 
         if (!connectedGattDevices.isEmpty()) {
-            String commando = "$TO:";
-            byte[] messageBytes = commando.getBytes();
-            
-            BluetoothDevice device = connectedGattDevices.get(0);
-            Log.d("Bluetooth2", "Iniciando getTimeout");
-            
-            connect(device).done(d -> {
-                BluetoothGatt gatt = getBluetoothGatt();
-                if (gatt == null) return;
-                
-                BluetoothGattService gattService = gatt.getService(serviceUuid);
-                if (gattService == null) return;
-                
-                BluetoothGattCharacteristic rx = gattService.getCharacteristic(RX);
-                BluetoothGattCharacteristic tx = gattService.getCharacteristic(TX);
-                
-                if (rx == null || tx == null) return;
+            byte[] messageBytes = "$TO:".getBytes();
+            connect(connectedGattDevices.get(0)).done(d -> {
+                if (txChar == null || rxChar == null) return;
 
-                setNotificationCallback(tx).with(new DataReceivedCallback() {
+                setNotificationCallback(txChar).with(new DataReceivedCallback() {
                     @Override
                     public void onDataReceived(@NonNull BluetoothDevice device, @NonNull Data data) {
-                        byte[] data2 = data.getValue();
-                        if (data2 == null) return;
-                        String data1 = new String(data2);
-                        Log.d("Bluetooth2", "Recebido (getTimeout): " + data1);
-                        
-                        runOnCallbackThread(new Runnable() {
-                            @Override
-                            public void run() {
-                                txtTimeoutAtual.setText(data1);
-                            }
-                        });
+                        String data1 = data.getStringValue(0);
+                        if (data1 != null) runOnCallbackThread(() -> txtTimeoutAtual.setText(data1));
                     }
                 });
 
-                enableNotifications(tx).done(d2 -> {
-                    writeCharacteristic(rx, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT).enqueue();
+                enableNotifications(txChar).done(d2 -> {
+                    writeCharacteristic(rxChar, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT).enqueue();
                 }).enqueue();
-
             }).enqueue();
         }
     }
+
     public void setTimeout(String value){
         Integer ms = Integer.parseInt(value)*1000;
         BluetoothManager manager = (BluetoothManager) localContext.getSystemService(Context.BLUETOOTH_SERVICE);
@@ -540,238 +394,82 @@ public class Bluetooth2 extends BleManager {
             String commando = "$TO:" + ms.toString();
             byte[] messageBytes = commando.getBytes();
             
-            BluetoothDevice device = connectedGattDevices.get(0);
-            Log.d("Bluetooth2", "Iniciando setTimeout: " + commando);
-            
-            connect(device).done(d -> {
-                BluetoothGatt gatt = getBluetoothGatt();
-                if (gatt == null) return;
-                
-                BluetoothGattService gattService = gatt.getService(serviceUuid);
-                if (gattService == null) return;
-                
-                BluetoothGattCharacteristic rx = gattService.getCharacteristic(RX);
-                BluetoothGattCharacteristic tx = gattService.getCharacteristic(TX);
-                
-                if (rx == null || tx == null) return;
-
-                setNotificationCallback(tx).with(new DataReceivedCallback() {
-                    @Override
-                    public void onDataReceived(@NonNull BluetoothDevice device, @NonNull Data data) {
-                        byte[] data2 = data.getValue();
-                        if (data2 == null) return;
-                        String data1 = new String(data2);
-                        Log.d("Bluetooth2", "Recebido (setTimeout): " + data1);
-                    }
-                });
-
-                enableNotifications(tx).done(d2 -> {
-                    writeCharacteristic(rx, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT).enqueue();
+            connect(connectedGattDevices.get(0)).done(d -> {
+                if (txChar == null || rxChar == null) return;
+                enableNotifications(txChar).done(d2 -> {
+                    writeCharacteristic(rxChar, messageBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT).enqueue();
                 }).enqueue();
-
             }).enqueue();
         }
     }
 
-
-    public void sendCommand(BluetoothGatt gatt,Context context,String command)
-    {
-
-        BluetoothGattService gattService = getUartService(gatt);
-        if(gattService == null)
-        {
-            return;
+    // Métodos legados mantidos para compatibilidade, mas ajustados para BleManager
+    public void sendCommand(BluetoothGatt gatt,Context context,String command) {
+        if (rxChar != null) {
+            writeCharacteristic(rxChar, command.getBytes(), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT).enqueue();
         }
-        List<BluetoothGattCharacteristic> gattCharacteristics = gattService.getCharacteristics();
-        if(!started){
-            started = true;
-            BluetoothGattCharacteristic tx = gattService.getCharacteristic(TX);
-            BluetoothGattCharacteristic rx = gattService.getCharacteristic(RX);
-
-            byte[] messageBytes = command.getBytes();
-            rx.setValue(messageBytes);
-            gatt.writeCharacteristic(rx);
-
-            Log.d("tamanho",String.valueOf(gattCharacteristics.size()));
-
-            gatt.setCharacteristicNotification(tx, true);
-            gatt.readCharacteristic(tx);
-
-
-        }
-
-
     }
-    public BluetoothGattService getUartService(BluetoothGatt gatt)
-    {
-        List<BluetoothGattService> gattServices = gatt.getServices();
-        if(gattServices == null)
-        {
-            return null;
-        }
-        for (BluetoothGattService gattService : gattServices) {
-            gattService.getCharacteristics();
 
-            if(!gattService.getUuid().equals(UUID.fromString("00001800-0000-1000-8000-00805f9b34fb")) &&
-                    !gattService.getUuid().equals(UUID.fromString("00001801-0000-1000-8000-00805f9b34fb"))){
-                return gattService;
-            }
-        }
-        return null;
+    public BluetoothGattService getUartService(BluetoothGatt gatt) {
+        return gatt.getService(serviceUuid);
     }
 
     public void scan(Context context,Button btnCalibrar){
-
         BluetoothAdapter bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
-        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
-            // Request to enable Bluetooth
-        }
+        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) return;
 
         bluetoothLeScanner = bluetoothAdapter.getBluetoothLeScanner();
         scanCallback = new ScanCallback() {
             @Override
             public void onScanResult(int callbackType, ScanResult result) {
                 BluetoothDevice device = result.getDevice();
-                if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                    // TODO: Consider calling
-                    //    ActivityCompat#requestPermissions
-                    // here to request the missing permissions, and then overriding
-                    //   public void onRequestPermissionsResult(int requestCode, String[] permissions,
-                    //                                          int[] grantResults)
-                    // to handle the case where the user grants the permission. See the documentation
-                    // for ActivityCompat#requestPermissions for more details.
-                    return;
-                }
-                // Aceita apenas dispositivos com prefixo CHOPP_ (ex: CHOPP_E123, CHOPP_F45A)
-                if(device.getName() == null || !device.getName().startsWith("CHOPP_"))
-                {
-                    return;
-                }
-                BluetoothManager bluetoothManager = (BluetoothManager) getContext().getSystemService(Context.BLUETOOTH_SERVICE);
-                List<BluetoothDevice> devices = bluetoothManager.getConnectedDevices(BluetoothProfile.GATT);
+                if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) return;
+                
+                if(device.getName() == null || !device.getName().startsWith("CHOPP_")) return;
 
-                if(devices.isEmpty()) {
+                if(!isConnected()) {
                     connect(device).done(device2 -> {
-                        BluetoothGattService gattService = bluetoothGatt.getService(UUID.fromString("7f0a0001-7b6b-4b5f-9d3e-3c7b9f100001"));
-                        BluetoothGattCharacteristic tx = gattService.getCharacteristic(TX);
-                        setNotificationCallback(tx).with(new DataReceivedCallback() {
-                            @Override
-                            public void onDataReceived(@NonNull BluetoothDevice device, @NonNull Data data) {
-                                byte[] data2 = data.getValue();
-                                String receivedData = new String(data2);
-                                String id = receivedData.replace("ID:","").replace("\\n","");
-                                Log.d("ID",id);
-                                runOnCallbackThread(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        if(id.replace("\n","").equals("0589af9a")) {
-                                            btnCalibrar.setVisibility(TextView.VISIBLE);
-                                        }
-                                    }
-                                });
+                        if (txChar == null) return;
+                        setNotificationCallback(txChar).with((device3, data) -> {
+                            String receivedData = data.getStringValue(0);
+                            if (receivedData == null) return;
+                            String id = receivedData.replace("ID:","").replace("\n","");
+                            if(id.equals("0589af9a")) {
+                                runOnCallbackThread(() -> btnCalibrar.setVisibility(TextView.VISIBLE));
                             }
-                        }).then(()->{
-                            Log.d("THEN","S");
                         });
-
-                        enableNotifications(tx).enqueue();
-                        readCharacteristic(tx).enqueue();
+                        enableNotifications(txChar).enqueue();
                     }).enqueue();
                 }
-                else{
-                    BluetoothGattService gattService = bluetoothGatt.getService(UUID.fromString("7f0a0001-7b6b-4b5f-9d3e-3c7b9f100001"));
-                    BluetoothGattCharacteristic tx = gattService.getCharacteristic(TX);
-                    setNotificationCallback(tx).with(new DataReceivedCallback() {
-                        @Override
-                        public void onDataReceived(@NonNull BluetoothDevice device, @NonNull Data data) {
-                            byte[] data2 = data.getValue();
-                            String receivedData = new String(data2);
-                            String id = receivedData.replace("ID:","").replace("\n","");
-                            Log.d("ID",id);
-                            runOnCallbackThread(new Runnable() {
-                                @Override
-                                public void run() {
-                                    if(id.replace("\n","").equals("0589af9a")) {
-                                        btnCalibrar.setVisibility(TextView.VISIBLE);
-                                    }
-                                }
-                            });
-                        }
-                    }).then(()->{
-                        Log.d("THEN","S");
-                    });
-
-                    enableNotifications(tx).enqueue();
-                    readCharacteristic(tx).enqueue();
-                }
-
-            }
-            @Override
-            public void onBatchScanResults(List<ScanResult> results) {
-                // Process a batch of scan results
-            }
-
-            @Override
-            public void onScanFailed(int errorCode) {
-                // Handle scan failure
             }
         };
         bluetoothLeScanner.startScan(scanCallback);
     }
 
-    private void sendRequest(Integer qtd_ml,String checkout_id, String android_id)
-    {
+    private void sendRequest(Integer qtd_ml,String checkout_id, String android_id) {
         Map<String,String> body = new HashMap<>();
-
         body.put("android_id",android_id);
         body.put("qtd_ml",qtd_ml.toString());
         body.put("checkout_id",checkout_id);
-
-        Callback callback = new Callback() {
-            @Override public void onFailure(Call call, IOException e) {
-
-            }
-
-            @Override public void onResponse(Call call, Response response) throws IOException {
-                try (ResponseBody responseBody = response.body()) {
-
-                    if (!response.isSuccessful()) throw new IOException("Unexpected code " + response);
-                    Log.d("Response",responseBody.string());
-
-                }catch (Exception e){
-
-                }
-            }
-        };
-
         ApiHelper apiHelper = new ApiHelper(localContext);
-        apiHelper.sendPost(body,"liberacao.php",callback);
+        apiHelper.sendPost(body,"liberacao.php", new Callback() {
+            @Override public void onFailure(Call call, IOException e) {}
+            @Override public void onResponse(Call call, Response response) throws IOException {
+                response.close();
+            }
+        });
     }
-    private void sendRequest(Integer qtd_ml, String android_id)
-    {
-        Map<String,String> body = new HashMap<>();
 
+    private void sendRequest(Integer qtd_ml, String android_id) {
+        Map<String,String> body = new HashMap<>();
         body.put("android_id",android_id);
         body.put("qtd_ml",qtd_ml.toString());
-        Callback callback = new Callback() {
-            @Override public void onFailure(Call call, IOException e) {
-
-            }
-
-            @Override public void onResponse(Call call, Response response) throws IOException {
-                try (ResponseBody responseBody = response.body()) {
-
-                    if (!response.isSuccessful()) throw new IOException("Unexpected code " + response);
-                    Log.d("Response",responseBody.string());
-
-                }catch (Exception e){
-
-                }
-            }
-        };
-
         ApiHelper apiHelper = new ApiHelper(localContext);
-        apiHelper.sendPost(body,"liquido_liberado.php",callback);
+        apiHelper.sendPost(body,"liquido_liberado.php", new Callback() {
+            @Override public void onFailure(Call call, IOException e) {}
+            @Override public void onResponse(Call call, Response response) throws IOException {
+                response.close();
+            }
+        });
     }
-
 }
