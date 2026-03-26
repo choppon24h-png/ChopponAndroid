@@ -6,12 +6,15 @@ import android.graphics.BitmapFactory;
 import android.util.Log;
 
 import java.io.IOException;
-import java.util.Date;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.SignatureAlgorithm;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
+import android.util.Base64;
 import okhttp3.Call;
 import okhttp3.Callback;
 import okhttp3.ConnectionPool;
@@ -136,7 +139,8 @@ public class ApiHelper {
 
     // ── Configuração da API ───────────────────────────────────────────────────
     private final String api = "https://ochoppoficial.com.br/api/";
-    private final String key = "teaste";
+    // Chave JWT — DEVE ser idêntica a JWT_SECRET em php/includes/config.php
+    private static final String JWT_SECRET = "teaste";
 
     // ─────────────────────────────────────────────────────────────────────────
     // Warm-up do servidor
@@ -176,26 +180,50 @@ public class ApiHelper {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Gera token JWT com margem de segurança para clock skew.
-     * Inicia 5 minutos no passado para evitar erros de relógio dessincronizado.
+     * Gera token JWT compatível com o servidor PHP (php/includes/jwt.php).
+     *
+     * O servidor PHP usa JWT caseiro com HMAC-SHA256 sobre raw bytes.
+     * A biblioteca JJWT rejeita a chave 'teaste' (48 bits < 256 bits mínimos HS256)
+     * e retorna string vazia — causando HTTP 401.
+     *
+     * Esta implementação manual replica exatamente o comportamento do PHP:
+     *   base64url(header) + "." + base64url(payload) + "." + base64url(hmac_raw)
      */
     private String gerarToken() {
         try {
-            long nowMillis = System.currentTimeMillis();
-            Date issuedAt  = new Date(nowMillis - 300000);  // -5 min (clock skew)
-            Date expiresAt = new Date(nowMillis + 7200000); // +2 horas
+            long nowSec = System.currentTimeMillis() / 1000L;
 
-            return Jwts.builder()
-                    .setIssuedAt(issuedAt)
-                    .setExpiration(expiresAt)
-                    .setId(java.util.UUID.randomUUID().toString())
-                    .claim("app", "choppon_tap")
-                    .signWith(SignatureAlgorithm.HS256, key.getBytes("UTF-8"))
-                    .compact();
+            // Header
+            String headerJson = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+            // Payload
+            String jti = UUID.randomUUID().toString().replace("-", "").substring(0, 32);
+            String payloadJson = "{\"iat\":" + (nowSec - 300)
+                    + ",\"exp\":" + (nowSec + 7200)
+                    + ",\"jti\":\"" + jti + "\""
+                    + ",\"app\":\"choppon_tap\"}";
+
+            String h = base64UrlEncode(headerJson.getBytes(StandardCharsets.UTF_8));
+            String p = base64UrlEncode(payloadJson.getBytes(StandardCharsets.UTF_8));
+            String msg = h + "." + p;
+
+            // Assinatura HMAC-SHA256 (raw bytes, igual ao PHP)
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(JWT_SECRET.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            byte[] sigBytes = mac.doFinal(msg.getBytes(StandardCharsets.UTF_8));
+            String s = base64UrlEncode(sigBytes);
+
+            String token = msg + "." + s;
+            Log.d(TAG, "[JWT] Token gerado com sucesso (" + token.length() + " chars)");
+            return token;
         } catch (Exception e) {
-            Log.e(TAG, "Erro JWT: " + e.getMessage());
+            Log.e(TAG, "[JWT] Erro ao gerar token: " + e.getMessage());
             return "";
         }
+    }
+
+    /** Base64 URL encode sem padding (RFC 4648 §5). */
+    private static String base64UrlEncode(byte[] data) {
+        return Base64.encodeToString(data, Base64.URL_SAFE | Base64.NO_PADDING | Base64.NO_WRAP);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

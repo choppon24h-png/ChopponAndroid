@@ -102,8 +102,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.SignatureAlgorithm;
+import android.util.Base64;
 import okhttp3.FormBody;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -1775,16 +1774,34 @@ public class BluetoothServiceIndustrial extends Service {
     // JWT para validação de MAC na API
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Gera token JWT compatível com o servidor PHP (php/includes/jwt.php).
+     * Implementação manual — evita JJWT que rejeita chaves < 256 bits.
+     */
     private String gerarJwtToken() {
         try {
-            long now = System.currentTimeMillis();
-            return Jwts.builder()
-                    .setIssuedAt(new Date(now - 300_000L))
-                    .setExpiration(new Date(now + 7_200_000L))
-                    .setId(UUID.randomUUID().toString())
-                    .claim("app", "choppon_tap")
-                    .signWith(SignatureAlgorithm.HS256, "teaste".getBytes("UTF-8"))
-                    .compact();
+            long nowSec = System.currentTimeMillis() / 1000L;
+            String headerJson  = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+            String jti = UUID.randomUUID().toString().replace("-", "").substring(0, 32);
+            String payloadJson = "{\"iat\":" + (nowSec - 300)
+                    + ",\"exp\":" + (nowSec + 7200)
+                    + ",\"jti\":\"" + jti + "\""
+                    + ",\"app\":\"choppon_tap\"}";
+
+            String h   = Base64.encodeToString(headerJson.getBytes("UTF-8"),
+                             Base64.URL_SAFE | Base64.NO_PADDING | Base64.NO_WRAP);
+            String p   = Base64.encodeToString(payloadJson.getBytes("UTF-8"),
+                             Base64.URL_SAFE | Base64.NO_PADDING | Base64.NO_WRAP);
+            String msg = h + "." + p;
+
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec("teaste".getBytes("UTF-8"), "HmacSHA256"));
+            byte[] sig = mac.doFinal(msg.getBytes("UTF-8"));
+            String s   = Base64.encodeToString(sig,
+                             Base64.URL_SAFE | Base64.NO_PADDING | Base64.NO_WRAP);
+
+            Log.d(TAG, "[JWT] Token gerado com sucesso");
+            return msg + "." + s;
         } catch (Exception e) {
             Log.e(TAG, "[JWT] Erro ao gerar token: " + e.getMessage());
             return "";
