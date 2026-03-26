@@ -83,7 +83,7 @@ dependencies {
     runtimeOnly("io.jsonwebtoken:jjwt-jackson:0.12.6")
 
     // ── BLE ───────────────────────────────────────────────────────────────────
-    implementation("no.nordicsemi.android:ble:2.11.1")
+    implementation("no.nordicsemi.android:ble:2.6.1")
 
     // ── QR Code ───────────────────────────────────────────────────────────────
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
