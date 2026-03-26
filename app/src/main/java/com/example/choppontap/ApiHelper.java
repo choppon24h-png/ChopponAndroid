@@ -74,7 +74,7 @@ import okhttp3.Response;
  *   - Timeouts ajustados para o perfil real do servidor
  *   - TlsSocketFactory REMOVIDA (era desnecessária e pode causar conflito
  *     com o Conscrypt do Android que já gerencia TLS corretamente)
- *   - warmupServer() usa o cliente singleton
+ *   - warmupServer() usa cliente ISOLADO (pool separado) para evitar contaminar o singleton
  */
 public class ApiHelper {
     private static final String TAG = "ApiHelper";
@@ -154,24 +154,32 @@ public class ApiHelper {
      * Tempo esperado: <100ms (vs 5s+ com HTTP/1.1).
      */
     public void warmupServer() {
-        Log.d(TAG, "🔥 [Warm-up] Iniciando com HTTP/2 nativo...");
+        // IMPORTANTE: O warm-up usa um cliente COMPLETAMENTE ISOLADO (novo ConnectionPool).
+        // Motivo: se o warm-up falhar (ex: servidor retorna 401 + Connection: close),
+        // a conexão corrompida NÃO contamina o pool do cliente singleton.
+        // Antes disso, o warm-up usava getClient().newBuilder() que COMPARTILHA o pool,
+        // causando TLS handshake travado de 33s na tentativa seguinte.
+        Log.d(TAG, "🔥 [Warm-up] Iniciando (cliente isolado)...");
+        OkHttpClient warmupClient = new OkHttpClient.Builder()
+                .connectTimeout(8, TimeUnit.SECONDS)
+                .readTimeout(8, TimeUnit.SECONDS)
+                .callTimeout(12, TimeUnit.SECONDS)
+                .connectionPool(new ConnectionPool(1, 30, TimeUnit.SECONDS))
+                .retryOnConnectionFailure(false)
+                .build();
+
         Request warmupRequest = new Request.Builder()
                 .url(api + "verify_tap.php")
                 .get()
                 .addHeader("X-Warmup", "true")
                 .build();
 
-        OkHttpClient warmupClient = getClient().newBuilder()
-                .connectTimeout(8, TimeUnit.SECONDS)
-                .readTimeout(8, TimeUnit.SECONDS)
-                .callTimeout(12, TimeUnit.SECONDS)
-                .build();
-
         try (Response response = warmupClient.newCall(warmupRequest).execute()) {
             Log.i(TAG, "✅ [Warm-up] Finalizado: HTTP " + response.code() +
                     " | Protocol: " + response.protocol());
         } catch (Exception e) {
-            Log.d(TAG, "⚠️ [Warm-up] Falhou: " + e.getMessage());
+            // Falha no warm-up é esperada (sem token) — não afeta o fluxo principal
+            Log.d(TAG, "⚠️ [Warm-up] Falhou (ignorado): " + e.getMessage());
         }
     }
 
