@@ -94,16 +94,16 @@ public class Bluetooth2 extends BleManager {
     }
 
 
-    private void checkDevice(Context context, BluetoothGattCallback gattCallback) {
+    private void checkDevice(Context context) {
         BluetoothManager bluetoothManager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
         List<BluetoothDevice> devices = bluetoothManager.getConnectedDevices(BluetoothProfile.GATT);
 
         if(!devices.isEmpty()) {
-            connectDevice(context,gattCallback);
+            connectDevice(context);
         }
 
     }
-    public void connectDevice(Context context, BluetoothGattCallback gattCallback )
+    public void connectDevice(Context context)
     {
         if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
             return;
