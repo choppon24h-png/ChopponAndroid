@@ -79,6 +79,9 @@ import okhttp3.Response;
 public class ApiHelper {
     private static final String TAG = "ApiHelper";
 
+    // FIX: Evitar múltiplas chamadas simultâneas de verify_tap
+    private static volatile boolean sVerifyTapInProgress = false;
+
     private Context context;
 
     public ApiHelper(Context context) {
@@ -245,25 +248,32 @@ public class ApiHelper {
      * O servidor responde em <100ms sem nenhum header de Upgrade problemático.
      */
     public void sendPost(Map<String, String> body, String endpoint, Callback callback) {
+        // FIX: Evitar múltiplas chamadas simultâneas de verify_tap
+        if (endpoint.contains("verify_tap")) {
+            if (sVerifyTapInProgress) {
+                Log.w(TAG, "[API] ⚠️  verify_tap já em progresso — ignorando chamada duplicada");
+                callback.onFailure(null, new IOException("Request já em andamento"));
+                return;
+            }
+            sVerifyTapInProgress = true;
+            Log.i(TAG, "[API] 🔄 verify_tap iniciado");
+        }
+
         try {
             String token = gerarToken();
             FormBody.Builder builder = new FormBody.Builder();
 
             if (body != null) {
                 for (Map.Entry<String, String> entry : body.entrySet()) {
-                    builder.add(entry.getKey(),
-                            entry.getValue() != null ? entry.getValue() : "NULL");
+                    builder.add(entry.getKey(), entry.getValue() != null ? entry.getValue() : "NULL");
                 }
             }
 
-            // Separa o endpoint do query string antes de verificar a extensão .php.
-            // Sem isso, "liberacao.php?action=iniciada" resulta em
-            // "liberacao.php?action=iniciada.php" (bug confirmado no log 2026-03-07 19:33:35).
-            String base  = endpoint;
+            String base = endpoint;
             String query = "";
             int qIdx = endpoint.indexOf('?');
             if (qIdx >= 0) {
-                base  = endpoint.substring(0, qIdx);
+                base = endpoint.substring(0, qIdx);
                 query = endpoint.substring(qIdx); // inclui o '?'
             }
             if (!base.endsWith(".php")) base = base + ".php";
@@ -284,25 +294,52 @@ public class ApiHelper {
 
                 @Override
                 public void onFailure(Call call, IOException e) {
+                    if (endpoint.contains("verify_tap")) {
+                        sVerifyTapInProgress = false;
+                        Log.i(TAG, "[API] ❌ verify_tap falhou");
+                    }
                     callback.onFailure(call, e);
                 }
 
                 @Override
                 public void onResponse(Call call, Response response) throws IOException {
+                    if (endpoint.contains("verify_tap")) {
+                        sVerifyTapInProgress = false;
+                        Log.i(TAG, "[API] ✅ verify_tap concluído");
+                    }
+
                     if (response.code() == 401 && !retried) {
                         retried = true;
                         Log.w(TAG, "[API] 401 Unauthorized recebido. Invalidando token e tentando novamente...");
                         response.close();
-                        
+
                         String newToken = gerarToken();
                         String newPartial = newToken.length() > 10 ? newToken.substring(0, 10) : newToken;
                         Log.d(TAG, "[API] Novo Header Authorization: Bearer " + newPartial + "...");
-                        
+
                         Request retryRequest = request.newBuilder()
                                 .header("token", newToken)
                                 .header("Authorization", "Bearer " + newToken)
                                 .build();
-                        getClient().newCall(retryRequest).enqueue(callback);
+                        getClient().newCall(retryRequest).enqueue(new Callback() {
+                            @Override
+                            public void onFailure(Call call, IOException e) {
+                                if (endpoint.contains("verify_tap")) {
+                                    sVerifyTapInProgress = false;
+                                    Log.i(TAG, "[API] ❌ verify_tap retry falhou");
+                                }
+                                callback.onFailure(call, e);
+                            }
+
+                            @Override
+                            public void onResponse(Call call, Response response) throws IOException {
+                                if (endpoint.contains("verify_tap")) {
+                                    sVerifyTapInProgress = false;
+                                    Log.i(TAG, "[API] ✅ verify_tap retry concluído");
+                                }
+                                callback.onResponse(call, response);
+                            }
+                        });
                     } else {
                         callback.onResponse(call, response);
                     }

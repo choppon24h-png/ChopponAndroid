@@ -653,6 +653,15 @@ public class Home extends AppCompatActivity {
     // ─────────────────────────────────────────────────────────────────────────
 
     private void bindBluetoothService() {
+        // FIX: Verificar se serviço já está rodando antes de iniciar
+        if (BluetoothServiceIndustrial.isRunning()) {
+            Log.i(TAG, "[BLE] Serviço BLE já está rodando — apenas fazendo bind");
+            Intent serviceIntent = new Intent(this, BluetoothServiceIndustrial.class);
+            bindService(serviceIntent, mServiceConnection, Context.BIND_AUTO_CREATE);
+            return;
+        }
+
+        Log.i(TAG, "[BLE] Iniciando novo serviço BLE");
         Intent serviceIntent = new Intent(this, BluetoothServiceIndustrial.class);
         // FIX: BackgroundServiceStartNotAllowedException (Android 12+)
         // O sistema Android 12+ não permite startService() quando o app está em background.

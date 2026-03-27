@@ -199,34 +199,41 @@ public class AcessoMaster extends AppCompatActivity {
      */
     private void exibirQrCode(String qrData) {
         progressQr.setVisibility(View.GONE);
-        try {
-            Bitmap bmp = gerarBitmapQr(qrData, 600);
-            imgQrCode.setImageBitmap(bmp);
-            imgQrCode.setVisibility(View.VISIBLE);
-            txtStatusQr.setText("Aguardando aprovação do administrador...\nAponte a câmera do PC para este QR Code em Permissões.");
-            txtStatusQr.setVisibility(View.VISIBLE);
-            Log.i(TAG, "[QR] QR Code exibido. token_id=" + mTokenId + " | qr_data=" + qrData);
 
-            // Iniciar polling
-            iniciarPolling();
+        // FIX: Mover geração de QR para background para evitar ANR
+        new Thread(() -> {
+            try {
+                Bitmap bmp = gerarBitmapQr(qrData, 600);
+                runOnUiThread(() -> {
+                    imgQrCode.setImageBitmap(bmp);
+                    imgQrCode.setVisibility(View.VISIBLE);
+                    txtStatusQr.setText("Aguardando aprovação do administrador...\nAponte a câmera do PC para este QR Code em Permissões.");
+                    txtStatusQr.setVisibility(View.VISIBLE);
+                    Log.i(TAG, "[QR] QR Code exibido. token_id=" + mTokenId + " | qr_data=" + qrData);
 
-            // Timer de expiração: após 5min, cancelar e avisar
-            mainHandler.postDelayed(() -> {
-                if (!mAprovado) {
-                    pararPolling();
-                    txtStatusQr.setText("QR Code expirado. Toque em 'Acesso QR Code' para gerar um novo.");
-                    imgQrCode.setVisibility(View.GONE);
+                    // Iniciar polling
+                    iniciarPolling();
+
+                    // Timer de expiração: após 5min, cancelar e avisar
+                    mainHandler.postDelayed(() -> {
+                        if (!mAprovado) {
+                            pararPolling();
+                            txtStatusQr.setText("QR Code expirado. Toque em 'Acesso QR Code' para gerar um novo.");
+                            imgQrCode.setVisibility(View.GONE);
+                            btnAcessoQrCode.setEnabled(true);
+                            btnAcessoSenha.setEnabled(true);
+                        }
+                    }, QR_EXPIRY_MS);
+                });
+            } catch (WriterException e) {
+                Log.e(TAG, "[QR] Erro ao gerar bitmap: " + e.getMessage());
+                runOnUiThread(() -> {
+                    txtStatusQr.setText("Erro ao gerar QR Code. Tente novamente.");
                     btnAcessoQrCode.setEnabled(true);
                     btnAcessoSenha.setEnabled(true);
-                }
-            }, QR_EXPIRY_MS);
-
-        } catch (WriterException e) {
-            Log.e(TAG, "[QR] Erro ao gerar bitmap: " + e.getMessage());
-            txtStatusQr.setText("Erro ao gerar QR Code. Tente novamente.");
-            btnAcessoQrCode.setEnabled(true);
-            btnAcessoSenha.setEnabled(true);
-        }
+                });
+            }
+        }).start();
     }
 
     /**

@@ -740,11 +740,17 @@ public class PagamentoConcluido extends AppCompatActivity {
         // FIX-4: carregar imagem — tenta banco local primeiro, depois URL
         carregarImagemComFallback();
 
-        // Inicia e vincula o BluetoothService
-        Log.i(TAG, "[BLE] Iniciando BluetoothService...");
-        Intent serviceIntent = new Intent(this, BluetoothServiceIndustrial.class);
-        startService(serviceIntent);
-        bindService(serviceIntent, mServiceConnection, Context.BIND_AUTO_CREATE);
+        // FIX: Verificar se serviço BLE já está rodando
+        if (BluetoothServiceIndustrial.isRunning()) {
+            Log.i(TAG, "[BLE] Serviço BLE já está rodando — apenas fazendo bind");
+            Intent serviceIntent = new Intent(this, BluetoothServiceIndustrial.class);
+            bindService(serviceIntent, mServiceConnection, Context.BIND_AUTO_CREATE);
+        } else {
+            Log.i(TAG, "[BLE] Iniciando novo serviço BLE");
+            Intent serviceIntent = new Intent(this, BluetoothServiceIndustrial.class);
+            startService(serviceIntent);
+            bindService(serviceIntent, mServiceConnection, Context.BIND_AUTO_CREATE);
+        }
 
         // Botão "Continuar servindo" — só disponível após interrupção parcial
         btnLiberar.setOnClickListener(v -> {

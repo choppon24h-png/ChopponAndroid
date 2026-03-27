@@ -120,6 +120,9 @@ public class BluetoothServiceIndustrial extends Service {
 
     private static final String TAG = "BLE_INDUSTRIAL";
 
+    // FIX: Singleton para evitar múltiplas instâncias
+    private static BluetoothServiceIndustrial sInstance = null;
+
     // ═══════════════════════════════════════════════════════════════════════════
     // REQUISITO 1 — Máquina de estados completa
     // ═══════════════════════════════════════════════════════════════════════════
@@ -408,8 +411,19 @@ public class BluetoothServiceIndustrial extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        Log.i(TAG, "[INDUSTRIAL] onCreate() — BluetoothServiceIndustrial v3.0");
-        criarNotificacaoForeground();
+
+        try {
+            // FIX: Verificar se já existe instância
+            if (sInstance != null) {
+                Log.w(TAG, "[INDUSTRIAL] ⚠️  Serviço BLE já está rodando! Abortando onCreate duplicado.");
+                stopSelf(); // Para o serviço duplicado
+                return;
+            }
+
+            sInstance = this;
+            Log.i(TAG, "[SERVICE] 🟢 SERVICE CREATED - BluetoothServiceIndustrial v3.0 SINGLETON iniciado");
+
+            criarNotificacaoForeground();
 
         BluetoothManager mgr = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
         mBluetoothAdapter = mgr.getAdapter();
@@ -463,6 +477,14 @@ public class BluetoothServiceIndustrial extends Service {
 
         Log.i(TAG, "[INDUSTRIAL] Service iniciado. Iniciando conexão BLE...");
         iniciarConexao();
+        } catch (Exception e) {
+            Log.e(TAG, "[SERVICE] 💥 CRASH no onCreate do Service BLE!");
+            Log.e(TAG, "[SERVICE] Exception: " + e.getClass().getName() + " - " + e.getMessage());
+            Log.e(TAG, "[SERVICE] StackTrace:", e);
+            // Não parar o service - deixar o sistema reiniciar com START_STICKY
+            // Mas limpar a instância para permitir recriação
+            sInstance = null;
+        }
     }
 
     @Override
@@ -472,7 +494,8 @@ public class BluetoothServiceIndustrial extends Service {
 
     @Override
     public void onDestroy() {
-        Log.i(TAG, "[INDUSTRIAL] onDestroy()");
+        Log.i(TAG, "[SERVICE] 🔴 SERVICE DESTROYED - limpando singleton");
+        sInstance = null;
         mAutoReconnect = false;
         pararHeartbeat();
         pararReconexao();
@@ -488,6 +511,26 @@ public class BluetoothServiceIndustrial extends Service {
         }
         transitionTo(State.DISCONNECTED);
         super.onDestroy();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Singleton methods
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Retorna a instância singleton do serviço BLE.
+     * @return instância ativa ou null se não estiver rodando
+     */
+    public static BluetoothServiceIndustrial getInstance() {
+        return sInstance;
+    }
+
+    /**
+     * Verifica se o serviço BLE já está rodando.
+     * @return true se o serviço está ativo
+     */
+    public static boolean isRunning() {
+        return sInstance != null;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -640,6 +683,7 @@ public class BluetoothServiceIndustrial extends Service {
      * Se reconexões >= 3: força closeGatt() antes de tentar novamente.
      */
     private void reconectarComBackoff() {
+        Log.i(TAG, "[RECONNECT] 🔄 Tentativa de reconexão automática iniciada");
         if (!mAutoReconnect) return;
         if (mReconnectRunnable != null) {
             Log.d(TAG, "[INDUSTRIAL] Reconexão já agendada — ignorando duplicata");
