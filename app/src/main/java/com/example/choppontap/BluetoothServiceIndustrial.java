@@ -1265,7 +1265,7 @@ public class BluetoothServiceIndustrial extends Service {
         final long timestampSeg = System.currentTimeMillis() / 1000L;
         
         // Regra: payload = "$timestamp:$sessionId"
-        final String payload = timestampSeg + ":" + sessionId;
+        final String payload = sessionId + ":" + timestampSeg;
         
         // Calcular HMAC-SHA256
         String hmacHex = calcularHmacSha256(payload, AUTH_SECRET_KEY);

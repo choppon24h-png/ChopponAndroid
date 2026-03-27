@@ -164,7 +164,7 @@ class BleManagerV2 {
     fun generateAuthToken(sessionId: String): String {
         return try {
             val timestampSeg = System.currentTimeMillis() / 1000L
-            val payload = "$timestampSeg:$sessionId"
+            val payload = "$sessionId:$timestampSeg"
             val keySpec = SecretKeySpec(HMAC_SECRET_KEY.toByteArray(Charsets.UTF_8), HMAC_ALGORITHM)
             val mac = Mac.getInstance(HMAC_ALGORITHM)
             mac.init(keySpec)
@@ -184,7 +184,7 @@ class BleManagerV2 {
     fun generateAuthToken(command: String, cmdId: String, sessionId: String): String {
         return try {
             val timestampSeg = System.currentTimeMillis() / 1000L
-            val payload = "$timestampSeg:$sessionId"
+            val payload = "$sessionId:$timestampSeg"
             val keySpec = SecretKeySpec(HMAC_SECRET_KEY.toByteArray(Charsets.UTF_8), HMAC_ALGORITHM)
             val mac = Mac.getInstance(HMAC_ALGORITHM)
             mac.init(keySpec)
