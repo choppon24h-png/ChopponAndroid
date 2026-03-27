@@ -14,7 +14,6 @@ import okhttp3.RequestBody;
 
 public class ApiHelper {
     private static final String TAG = "ApiHelper";
-    private static final String BASE_URL = "http://192.168.1.100/choppon/api/";
 
     private final OkHttpClient httpClient;
     private final Context context;
@@ -26,7 +25,7 @@ public class ApiHelper {
 
     public void sendPost(Map<String, String> body, String endpoint, Callback callback) {
         try {
-            String url = BASE_URL + endpoint;
+            String url = ApiConfig.getBaseUrl() + endpoint;
             Log.d(TAG, "[POST] " + url);
 
             FormBody.Builder bodyBuilder = new FormBody.Builder();
@@ -45,7 +44,7 @@ public class ApiHelper {
 
     public void sendGet(String endpoint, Callback callback) {
         try {
-            String url = BASE_URL + endpoint;
+            String url = ApiConfig.getBaseUrl() + endpoint;
             Log.d(TAG, "[GET] " + url);
             Request request = new Request.Builder().url(url).get().build();
             httpClient.newCall(request).enqueue(callback);

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 🔐 DOMÍNIO OFICIAL - HTTPS OBRIGATÓRIO -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">ochoppoficial.com.br</domain>
+        <!-- Força uso de HTTPS -->
+    </domain-config>
+
+    <!-- 🟡 DESENVOLVIMENTO - APENAS IP LOCAL COM CUIDADO -->
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+        <!-- Permite HTTP apenas em debug/emulador para testes -->
+        <domain-config cleartextTrafficPermitted="true">
+            <domain includeSubdomains="true">localhost</domain>
+            <domain includeSubdomains="true">127.0.0.1</domain>
+            <domain includeSubdomains="true">192.168.0.0/16</domain>
+        </domain-config>
+    </debug-overrides>
+
+    <!-- ✅ PADRÃO GLOBAL - HTTPS EM PRODUÇÃO -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">.</domain>
+    </domain-config>
+</network-security-config>
