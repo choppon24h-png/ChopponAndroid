@@ -106,7 +106,6 @@ public class BleConnectionManager extends BleManager {
         return rxChar != null && txChar != null;
     }
 
-    @Override
     protected void onDeviceDisconnected() {
         Log.d(TAG, "[DISCONNECT] OK");
         stateManager.setState(BleState.DISCONNECTED);
