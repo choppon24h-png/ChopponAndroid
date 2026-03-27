@@ -1,5 +1,7 @@
 package com.example.choppontap.ble;
 
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothGattCharacteristic;
 import android.content.Context;
 import android.util.Log;
 
@@ -8,29 +10,23 @@ import androidx.annotation.NonNull;
 import java.util.UUID;
 
 import no.nordicsemi.android.ble.BleManager;
-import no.nordicsemi.android.ble.data.Data;
 
-/**
- * Gerenciador de conexão BLE centralizado
- * Uma única instância por dispositivo
- * Gerencia conexão, notificações, envio de comandos
- */
 public class BleConnectionManager extends BleManager {
     private static final String TAG = "BleConnectionManager";
-
-    // UUIDs do serviço
     private static final UUID SERVICE_UUID = UUID.fromString("7f0a0001-7b6b-4b5f-9d3e-3c7b9f100001");
-    private static final UUID RX_CHARACTERISTIC = UUID.fromString("7f0a0002-7b6b-4b5f-9d3e-3c7b9f100001"); // Write
-    private static final UUID TX_CHARACTERISTIC = UUID.fromString("7f0a0003-7b6b-4b5f-9d3e-3c7b9f100001"); // Notify
+    private static final UUID RX_UUID = UUID.fromString("7f0a0002-7b6b-4b5f-9d3e-3c7b9f100001");
+    private static final UUID TX_UUID = UUID.fromString("7f0a0003-7b6b-4b5f-9d3e-3c7b9f100001");
 
     private final StateManager stateManager = new StateManager();
     private final CommandQueue commandQueue = new CommandQueue();
     private final NotificationCallbackHolder callbackHolder = new NotificationCallbackHolder();
 
-    private static BleConnectionManager instance;
-    private static final Object instanceLock = new Object();
+    private BluetoothGattCharacteristic rxChar;
+    private BluetoothGattCharacteristic txChar;
 
-    // Listeners
+    private static BleConnectionManager instance;
+    private static final Object lock = new Object();
+
     public interface ConnectionListener {
         void onConnected();
         void onDisconnected();
@@ -43,15 +39,12 @@ public class BleConnectionManager extends BleManager {
         void onCommandError(String error);
     }
 
-    private ConnectionListener connectionListener;
-    private CommandListener commandListener;
+    private ConnectionListener connListener;
+    private CommandListener cmdListener;
 
-    /**
-     * Singleton instance
-     */
     public static BleConnectionManager getInstance(Context context) {
         if (instance == null) {
-            synchronized (instanceLock) {
+            synchronized (lock) {
                 if (instance == null) {
                     instance = new BleConnectionManager(context);
                 }
@@ -62,199 +55,7 @@ public class BleConnectionManager extends BleManager {
 
     private BleConnectionManager(Context context) {
         super(context);
-        setupStateListener();
-        setupNotificationListener();
-    }
-
-    /**
-     * Inicializa suporte a notificações
-     */
-    @Override
-    protected void gattClientReady(@NonNull android.bluetooth.BluetoothGatt gatt) {
-        Log.d(TAG, "[GATT] Cliente pronto");
-        stateManager.setState(BleState.READY);
-
-        if (connectionListener != null) {
-            connectionListener.onConnected();
-        }
-
-        // Processa fila de comandos
-        processCommandQueue();
-    }
-
-    /**
-     * Inicializa características
-     */
-    @Override
-    protected void initialize() {
-        Log.d(TAG, "[INIT] Inicializando BleManager");
-
-        // Abilita notificações no TX
-        enableNotifications(TX_CHARACTERISTIC)
-                .done(device -> Log.d(TAG, "[NOTIFY] Notificações habilitadas"))
-                .fail((device, status) -> {
-                    Log.e(TAG, "[NOTIFY] Falha ao habilitar notificações: " + status);
-                    stateManager.setState(BleState.ERROR);
-                })
-                .enqueue();
-
-        // Registra callback (UMA ÚNICA VEZ)
-        setNotificationCallback(TX_CHARACTERISTIC)
-                .with(callbackHolder.getCallback());
-    }
-
-    /**
-     * Valida serviço UART
-     */
-    @Override
-    public boolean isRequiredServiceSupported(@NonNull android.bluetooth.BluetoothGatt gatt) {
-        final android.bluetooth.BluetoothGattService service = gatt.getService(SERVICE_UUID);
-
-        if (service == null) {
-            Log.e(TAG, "[SERVICE] Serviço não encontrado");
-            return false;
-        }
-
-        final android.bluetooth.BluetoothGattCharacteristic rxChar = service.getCharacteristic(RX_CHARACTERISTIC);
-        final android.bluetooth.BluetoothGattCharacteristic txChar = service.getCharacteristic(TX_CHARACTERISTIC);
-
-        if (rxChar == null || txChar == null) {
-            Log.e(TAG, "[SERVICE] Características não encontradas");
-            return false;
-        }
-
-        Log.d(TAG, "[SERVICE] Serviço verificado com sucesso");
-        return true;
-    }
-
-    /**
-     * Handle disconnect
-     */
-    @Override
-    protected void onDeviceDisconnected() {
-        Log.d(TAG, "[DISCONNECT] Dispositivo desconectado");
-        stateManager.setState(BleState.DISCONNECTED);
-        commandQueue.clear();
-        callbackHolder.resetCallback();
-
-        if (connectionListener != null) {
-            connectionListener.onDisconnected();
-        }
-    }
-
-    /**
-     * Conecta a dispositivo BLE
-     */
-    public void connectToDevice(@NonNull android.bluetooth.BluetoothDevice device) {
-        if (stateManager.isState(BleState.CONNECTING) || stateManager.isState(BleState.READY)) {
-            Log.w(TAG, "[CONNECT] Já conectado ou conectando");
-            return;
-        }
-
-        stateManager.setState(BleState.CONNECTING);
-        Log.d(TAG, "[CONNECT] Iniciando conexão com: " + device.getAddress());
-
-        connect(device)
-                .retry(3, 100)
-                .timeout(5000)
-                .done(d -> {
-                    Log.d(TAG, "[CONNECT] Conexão estabelecida");
-                })
-                .fail((d, status) -> {
-                    Log.e(TAG, "[CONNECT] Falha na conexão: " + status);
-                    stateManager.setState(BleState.ERROR);
-                    if (connectionListener != null) {
-                        connectionListener.onError("Falha ao conectar: " + status);
-                    }
-                })
-                .enqueue();
-    }
-
-    /**
-     * Desconecta do dispositivo
-     */
-    public void disconnect() {
-        Log.d(TAG, "[DISCONNECT] Desconectando...");
-        disconnect().enqueue();
-    }
-
-    /**
-     * Envia comando para ESP32
-     */
-    public void sendCommand(String command) {
-        if (!stateManager.canSendCommand()) {
-            String error = "Estado inválido para envio: " + stateManager.getState();
-            Log.e(TAG, "[SEND] " + error);
-            if (commandListener != null) {
-                commandListener.onCommandError(error);
-            }
-            return;
-        }
-
-        if (commandQueue.isProcessing()) {
-            String error = "Já há comando em processamento";
-            Log.e(TAG, "[SEND] " + error);
-            if (commandListener != null) {
-                commandListener.onCommandError(error);
-            }
-            return;
-        }
-
-        BleCommand bleCmd = new BleCommand(command, RX_CHARACTERISTIC);
-        commandQueue.enqueue(bleCmd);
-        Log.d(TAG, "[SEND] Comando enfileirado: " + command);
-
-        processCommandQueue();
-    }
-
-    /**
-     * Processa fila de comandos sequencialmente
-     */
-    private synchronized void processCommandQueue() {
-        if (!stateManager.canSendCommand()) {
-            Log.w(TAG, "[QUEUE] Estado não permite processamento");
-            return;
-        }
-
-        if (commandQueue.isProcessing()) {
-            Log.d(TAG, "[QUEUE] Comando já em processamento");
-            return;
-        }
-
-        BleCommand command = commandQueue.dequeue();
-        if (command == null) {
-            Log.d(TAG, "[QUEUE] Fila vazia");
-            return;
-        }
-
-        stateManager.setState(BleState.PROCESSING);
-        commandQueue.setCurrentCommand(command);
-
-        Log.d(TAG, "[QUEUE] Enviando comando: " + command.getCommand());
-
-        writeCharacteristic(RX_CHARACTERISTIC, command.getData(),
-                android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-                .done(device -> {
-                    Log.d(TAG, "[WRITE] Comando escrito: " + command.getCommand());
-                    if (commandListener != null) {
-                        commandListener.onCommandSent(command.getCommand());
-                    }
-                })
-                .fail((device, status) -> {
-                    Log.e(TAG, "[WRITE] Falha ao escrever: " + status);
-                    stateManager.setState(BleState.ERROR);
-                    commandQueue.clearCurrentCommand();
-                    if (commandListener != null) {
-                        commandListener.onCommandError("Falha ao escrever: " + status);
-                    }
-                })
-                .enqueue();
-    }
-
-    /**
-     * Setup do listener de resposta
-     */
-    private void setupNotificationListener() {
+        stateManager.setStateListener((old, neu) -> Log.d(TAG, "[STATE] " + old + " → " + neu));
         callbackHolder.setResponseListener(new NotificationCallbackHolder.ResponseListener() {
             @Override
             public void onResponseReceived(String response) {
@@ -263,73 +64,175 @@ public class BleConnectionManager extends BleManager {
 
             @Override
             public void onError(Exception e) {
-                Log.e(TAG, "[ERROR] Erro em callback: " + e.getMessage());
-                if (commandListener != null) {
-                    commandListener.onCommandError("Erro ao processar resposta: " + e.getMessage());
+                Log.e(TAG, "[ERROR] " + e.getMessage());
+                if (cmdListener != null) {
+                    cmdListener.onCommandError(e.getMessage());
                 }
             }
         });
     }
 
-    /**
-     * Processa resposta do ESP32
-     */
+    @Override
+    protected void initialize() {
+        if (txChar != null) {
+            enableNotifications(txChar)
+                    .done(device -> {
+                        Log.d(TAG, "[NOTIFY] OK");
+                        stateManager.setState(BleState.READY);
+                        if (connListener != null) {
+                            connListener.onConnected();
+                        }
+                        processQueue();
+                    })
+                    .fail((device, status) -> {
+                        Log.e(TAG, "[NOTIFY] FAIL: " + status);
+                        stateManager.setState(BleState.ERROR);
+                    })
+                    .enqueue();
+
+            setNotificationCallback(txChar).with(callbackHolder.getCallback());
+        }
+    }
+
+    @Override
+    public boolean isRequiredServiceSupported(@NonNull android.bluetooth.BluetoothGatt gatt) {
+        android.bluetooth.BluetoothGattService svc = gatt.getService(SERVICE_UUID);
+        if (svc == null) return false;
+
+        rxChar = svc.getCharacteristic(RX_UUID);
+        txChar = svc.getCharacteristic(TX_UUID);
+
+        Log.d(TAG, "[SERVICE] OK");
+        return rxChar != null && txChar != null;
+    }
+
+    @Override
+    protected void onDeviceDisconnected() {
+        Log.d(TAG, "[DISCONNECT] OK");
+        stateManager.setState(BleState.DISCONNECTED);
+        commandQueue.clear();
+        callbackHolder.resetCallback();
+        rxChar = null;
+        txChar = null;
+
+        if (connListener != null) {
+            connListener.onDisconnected();
+        }
+    }
+
+    public void connectToDevice(@NonNull BluetoothDevice device) {
+        if (stateManager.isState(BleState.CONNECTING) || stateManager.isState(BleState.READY)) {
+            Log.w(TAG, "[CONNECT] BUSY");
+            return;
+        }
+
+        stateManager.setState(BleState.CONNECTING);
+        Log.d(TAG, "[CONNECT] " + device.getAddress());
+
+        connect(device)
+                .retry(3, 100)
+                .timeout(5000)
+                .done(d -> Log.d(TAG, "[CONNECT] OK"))
+                .fail((d, status) -> {
+                    Log.e(TAG, "[CONNECT] FAIL: " + status);
+                    stateManager.setState(BleState.ERROR);
+                    if (connListener != null) {
+                        connListener.onError("Fail: " + status);
+                    }
+                })
+                .enqueue();
+    }
+
+    public void disconnectDevice() {
+        Log.d(TAG, "[DISCONNECT] Requesting...");
+        super.disconnect().enqueue();
+    }
+
+    public void sendCommand(String command) {
+        if (!stateManager.canSendCommand()) {
+            Log.e(TAG, "[SEND] Bad state: " + stateManager.getState());
+            if (cmdListener != null) {
+                cmdListener.onCommandError("Bad state");
+            }
+            return;
+        }
+
+        if (commandQueue.isProcessing()) {
+            Log.e(TAG, "[SEND] Busy");
+            if (cmdListener != null) {
+                cmdListener.onCommandError("Busy");
+            }
+            return;
+        }
+
+        commandQueue.enqueue(new BleCommand(command, RX_UUID));
+        Log.d(TAG, "[SEND] Queued: " + command);
+        processQueue();
+    }
+
+    private synchronized void processQueue() {
+        if (!stateManager.canSendCommand() || commandQueue.isProcessing() || rxChar == null) {
+            return;
+        }
+
+        BleCommand cmd = commandQueue.dequeue();
+        if (cmd == null) {
+            return;
+        }
+
+        stateManager.setState(BleState.PROCESSING);
+        commandQueue.setCurrentCommand(cmd);
+
+        Log.d(TAG, "[QUEUE] Sending: " + cmd.getCommand());
+
+        writeCharacteristic(rxChar, cmd.getData(), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                .done(device -> {
+                    Log.d(TAG, "[WRITE] OK: " + cmd.getCommand());
+                    if (cmdListener != null) {
+                        cmdListener.onCommandSent(cmd.getCommand());
+                    }
+                })
+                .fail((device, status) -> {
+                    Log.e(TAG, "[WRITE] FAIL: " + status);
+                    stateManager.setState(BleState.ERROR);
+                    commandQueue.clearCurrentCommand();
+                    if (cmdListener != null) {
+                        cmdListener.onCommandError("Write fail");
+                    }
+                })
+                .enqueue();
+    }
+
     private void handleResponse(String response) {
-        Log.d(TAG, "[RESPONSE] Recebido: " + response);
+        Log.d(TAG, "[RESPONSE] " + response);
 
         if (!stateManager.isState(BleState.PROCESSING)) {
-            Log.w(TAG, "[RESPONSE] Estado inválido: " + stateManager.getState());
             return;
         }
 
-        BleCommand currentCmd = commandQueue.getCurrentCommand();
-        if (currentCmd == null) {
-            Log.w(TAG, "[RESPONSE] Nenhum comando em processamento");
-            return;
+        if (cmdListener != null) {
+            cmdListener.onResponseReceived(response);
         }
 
-        // Callback de comando
-        if (commandListener != null) {
-            commandListener.onResponseReceived(response);
-        }
-
-        // Completa e próximo comando
         stateManager.setState(BleState.COMPLETED);
         commandQueue.clearCurrentCommand();
-
-        // Voltar para READY e processar fila
         stateManager.setState(BleState.READY);
-        processCommandQueue();
+        processQueue();
     }
 
-    /**
-     * Setup do listener de estado
-     */
-    private void setupStateListener() {
-        stateManager.setStateListener((oldState, newState) -> {
-            Log.d(TAG, "[STATE] " + oldState + " → " + newState);
-        });
+    public void setConnListener(ConnectionListener listener) {
+        this.connListener = listener;
     }
 
-    // Getters para listeners
-
-    public void setConnectionListener(ConnectionListener listener) {
-        this.connectionListener = listener;
-    }
-
-    public void setCommandListener(CommandListener listener) {
-        this.commandListener = listener;
-    }
-
-    public StateManager getStateManager() {
-        return stateManager;
-    }
-
-    public boolean isConnected() {
-        return stateManager.isConnected();
+    public void setCmdListener(CommandListener listener) {
+        this.cmdListener = listener;
     }
 
     public BleState getState() {
         return stateManager.getState();
+    }
+
+    public boolean isConnectedDevice() {
+        return stateManager.isConnected();
     }
 }

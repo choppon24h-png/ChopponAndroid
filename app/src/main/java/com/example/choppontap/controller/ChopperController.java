@@ -76,7 +76,7 @@ public class ChopperController {
      */
     public void disconnect() {
         Log.d(TAG, "[DISCONNECT] Desconectando...");
-        bleManager.disconnect();
+        bleManager.disconnectDevice();
     }
 
     /**
@@ -85,7 +85,7 @@ public class ChopperController {
     public void liberarLiquido(Integer mlRequested, String checkoutId, String androidId) {
         Log.d(TAG, "[LIBERAR] Pedido: " + mlRequested + "ml, checkout=" + checkoutId);
 
-        if (!bleManager.isConnected()) {
+        if (!bleManager.isConnectedDevice()) {
             String error = "Dispositivo não conectado";
             Log.e(TAG, error);
             if (listener != null) {
@@ -115,7 +115,7 @@ public class ChopperController {
     public void liberarContinuo() {
         Log.d(TAG, "[CONTINUO] Iniciando liberação contínua");
 
-        if (!bleManager.isConnected()) {
+        if (!bleManager.isConnectedDevice()) {
             String error = "Dispositivo não conectado";
             Log.e(TAG, error);
             if (listener != null) {
@@ -137,7 +137,7 @@ public class ChopperController {
     public void getPulseCount() {
         Log.d(TAG, "[PULSOS] Consultando...");
 
-        if (!bleManager.isConnected()) {
+        if (!bleManager.isConnectedDevice()) {
             if (listener != null) {
                 listener.onError("Dispositivo não conectado");
             }
@@ -153,7 +153,7 @@ public class ChopperController {
     public void setPulseCount(Integer pulsesPerLiter) {
         Log.d(TAG, "[PULSOS] Configurando para " + pulsesPerLiter + " pulsos/litro");
 
-        if (!bleManager.isConnected()) {
+        if (!bleManager.isConnectedDevice()) {
             if (listener != null) {
                 listener.onError("Dispositivo não conectado");
             }
@@ -167,7 +167,7 @@ public class ChopperController {
      * Setup dos listeners do BLE
      */
     private void setupBleListeners() {
-        bleManager.setConnectionListener(new BleConnectionManager.ConnectionListener() {
+        bleManager.setConnListener(new BleConnectionManager.ConnectionListener() {
             @Override
             public void onConnected() {
                 Log.d(TAG, "[BLE] Conectado com sucesso");
@@ -195,7 +195,7 @@ public class ChopperController {
             }
         });
 
-        bleManager.setCommandListener(new BleConnectionManager.CommandListener() {
+        bleManager.setCmdListener(new BleConnectionManager.CommandListener() {
             @Override
             public void onCommandSent(String command) {
                 Log.d(TAG, "[BLE] Comando enviado: " + command);
@@ -332,6 +332,6 @@ public class ChopperController {
     }
 
     public boolean isConnected() {
-        return bleManager.isConnected();
+        return bleManager.isConnectedDevice();
     }
 }
