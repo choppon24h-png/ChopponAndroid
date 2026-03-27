@@ -199,25 +199,54 @@ try {
             ");
             $stmt->execute([$result['checkout_id'], $result['pix_code'], $result['response'], $order_id]);
 
-            // Gerar QR Code — método da instância SumUpIntegration
-            $qr_code_base64 = '';
-            if (!empty($result['pix_code'])) {
-                $qr_code_base64 = $sumup->generateQRCode($result['pix_code']);
+            // QR code a partir do resultado de createCheckoutPix
+            // (agora createCheckoutPix já pode fornecer qr_code_base64)
+            $qr_code_base64 = trim($result['qr_code_base64'] ?? '');
+            $pix_code = trim($result['pix_code'] ?? '');
+
+            if (empty($qr_code_base64) && !empty($pix_code)) {
+                Logger::warning('create_order: qr_code_base64 ausente, gerando com pix_code', [
+                    'order_id'     => $order_id,
+                    'pix_code_len' => strlen($pix_code),
+                ]);
+                $qr_code_base64 = $sumup->generateQRCode($pix_code);
+            }
+
+            if (empty($qr_code_base64)) {
+                Logger::error('create_order: falha ao gerar qr_code_base64', [
+                    'order_id'   => $order_id,
+                    'checkout_id'=> $result['checkout_id'] ?? null,
+                    'pix_code'   => substr($pix_code, 0, 100),
+                ]);
+
+                $stmt = $conn->prepare("UPDATE `order` SET checkout_status = 'FAILED' WHERE id = ?");
+                $stmt->execute([$order_id]);
+
+                http_response_code(500);
+                echo json_encode([
+                    'success'    => false,
+                    'error'      => 'QR Code não pôde ser gerado',
+                    'error_type' => 'QR_GENERATION_FAILED',
+                    'checkout_id'=> $result['checkout_id'] ?? null,
+                    'pix_code'   => $pix_code,
+                ]);
+                exit;
             }
 
             Logger::info('create_order: PIX criado', [
                 'order_id'       => $order_id,
                 'checkout_id'    => $result['checkout_id'],
-                'pix_code_len'   => strlen($result['pix_code'] ?? ''),
+                'pix_code_len'   => strlen($pix_code),
                 'qr_code_len'    => strlen($qr_code_base64),
                 'qr_code_ok'     => !empty($qr_code_base64),
             ]);
 
             http_response_code(200);
             echo json_encode([
+                'success'     => true,
                 'checkout_id' => $result['checkout_id'],
                 'qr_code'     => $qr_code_base64,
-                'pix_code'    => $result['pix_code'], // código copia-e-cola como fallback
+                'pix_code'    => $pix_code,
             ]);
         } else {
             $stmt = $conn->prepare("UPDATE `order` SET checkout_status = 'FAILED' WHERE id = ?");

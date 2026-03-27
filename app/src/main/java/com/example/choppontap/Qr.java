@@ -1,7 +1,7 @@
 package com.example.choppontap;
 
 /**
- * Modelo de resposta do endpoint create_payment.php
+ * Modelo de resposta do endpoint create_order.php
  *
  * PIX:
  *   {
@@ -50,7 +50,7 @@ public class Qr {
     /**
      * Código EMV "copia e cola" do PIX (apenas PIX).
      * Formato: string começando com "000201..." (padrão EMV Co).
-     * Retornado pela API v3.0.0+ em create_payment.php.
+     * Retornado pela API v3.0.0+ em create_order.php.
      */
     public String pix_code;
 

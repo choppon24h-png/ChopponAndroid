@@ -209,11 +209,27 @@ class SumUpIntegration
                 $pix_code = $checkout_id;
             }
 
+            // Gerar QR code localmente para reduzir pontos de falha no fluxo do backend
+            $qr_code_base64 = '';
+            if (!empty($pix_code)) {
+                $qr_code_base64 = $this->generateQRCode($pix_code);
+                Logger::info('SumUp createCheckoutPix - qr_code_base64 gerado', [
+                    'pix_code_len'    => strlen($pix_code),
+                    'qr_code_b64_len' => strlen($qr_code_base64),
+                    'checkout_id'     => $checkout_id,
+                ]);
+            } else {
+                Logger::warning('SumUp createCheckoutPix - pix_code está vazio após retorno da SumUp', [
+                    'checkout_id' => $checkout_id,
+                ]);
+            }
+
             if ($checkout_id) {
                 return [
-                    'checkout_id' => $checkout_id,
-                    'pix_code'    => $pix_code,
-                    'response'    => $response['body'],
+                    'checkout_id'      => $checkout_id,
+                    'pix_code'         => $pix_code,
+                    'qr_code_base64'   => $qr_code_base64,
+                    'response'         => $response['body'],
                 ];
             }
         }

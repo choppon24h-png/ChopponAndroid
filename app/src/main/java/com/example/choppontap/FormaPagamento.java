@@ -219,7 +219,20 @@ public class FormaPagamento extends AppCompatActivity {
         paymentIdempotencyKey = UUID.randomUUID().toString();
         body.put("idempotency_key", paymentIdempotencyKey);
 
-        new ApiHelper(this).sendPost(body, "create_payment.php", new Callback() {
+        // Validação obrigatória de parâmetros do fluxo PIX
+        if (android_id == null || android_id.isEmpty() || valor == null || valor.isEmpty() ||
+                descricao == null || descricao.isEmpty() || quantidade == null || quantidade.isEmpty() ||
+                method == null || method.isEmpty() || body.get("cpf") == null || body.get("cpf").isEmpty()) {
+            Log.e(TAG, "❌ Parâmetros obrigatórios ausentes para create_order");
+            runOnUiThread(() -> showErrorMessage("Parâmetros de pagamento incompletos."));
+            return;
+        }
+
+        String endpoint = "create_order.php";
+        Log.i(TAG, "📡 Chamando endpoint: " + endpoint);
+        Log.d(TAG, "📤 Payload enviado: " + body.toString());
+
+        new ApiHelper(this).sendPost(body, endpoint, new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
                 Log.e(TAG, "❌ create_payment falhou na rede: " + e.getMessage());
@@ -239,6 +252,30 @@ public class FormaPagamento extends AppCompatActivity {
 
                     Qr qr = new Gson().fromJson(json, Qr.class);
                     if (qr != null && qr.checkout_id != null) {
+                        Log.i(TAG, "✅ create_order.json recebido: success=" + qr.success
+                                + " | checkout_id=" + qr.checkout_id
+                                + " | qr_code_present=" + (qr.qr_code != null && !qr.qr_code.isEmpty())
+                                + " | pix_code_present=" + (qr.pix_code != null && !qr.pix_code.isEmpty()));
+
+                        // Validações obrigatórias para PIX
+                        if (method.equals("pix")) {
+                            if (qr.success == null || !qr.success) {
+                                Log.e(TAG, "❌ create_order retornou success=false ou ausente");
+                                runOnUiThread(() -> showErrorMessage("Erro ao gerar PIX. Tente novamente."));
+                                return;
+                            }
+                            if (qr.qr_code == null || qr.qr_code.isEmpty()) {
+                                Log.e(TAG, "❌ create_order não retornou qr_code válido");
+                                runOnUiThread(() -> showErrorMessage("QR Code não disponível. Tente novamente."));
+                                return;
+                            }
+                            if (qr.pix_code == null || qr.pix_code.isEmpty()) {
+                                Log.e(TAG, "❌ create_order não retornou pix_code válido");
+                                runOnUiThread(() -> showErrorMessage("Código PIX não disponível. Tente novamente."));
+                                return;
+                            }
+                        }
+
                         checkout_id = qr.checkout_id;
                         if (qr.idempotency_key != null && !qr.idempotency_key.isEmpty()) {
                             paymentIdempotencyKey = qr.idempotency_key;
@@ -248,6 +285,20 @@ public class FormaPagamento extends AppCompatActivity {
                         if (method.equals("pix")) {
                             updateUIState(STATE_PIX);
                             updateQrCode(qr);
+                            // Exibir o pix_code em texto, se disponível (debug):
+                            runOnUiThread(() -> {
+                                if (txtPixCode != null) {
+                                    txtPixCode.setText(qr.pix_code);
+                                    txtPixCode.setVisibility(View.VISIBLE);
+                                }
+                                if (txtPixCodeLabel != null) {
+                                    txtPixCodeLabel.setText("PIX Copia e Cola:");
+                                    txtPixCodeLabel.setVisibility(View.VISIBLE);
+                                }
+                                if (btnCopiarPix != null) {
+                                    btnCopiarPix.setVisibility(View.VISIBLE);
+                                }
+                            });
                             startCountDown(180);
                             startVerifing(qr.checkout_id, 180);
                         } else {
@@ -263,6 +314,7 @@ public class FormaPagamento extends AppCompatActivity {
                         }
                     } else {
                         paymentIdempotencyKey = null;
+                        Log.e(TAG, "❌ Resposta inválida no create_order (qr==null ou checkout_id==null): " + json);
                         runOnUiThread(() -> showErrorMessage("Dados inválidos do servidor."));
                     }
                 } catch (Exception e) {
@@ -393,6 +445,8 @@ public class FormaPagamento extends AppCompatActivity {
      */
     public void verifyPayment(String checkout_id) {
         if (checkout_id == null) return;
+
+        Log.i(TAG, "🔄 verifyPayment enviado para checkout_id=" + checkout_id);
 
         Map<String, String> body = new HashMap<>();
         body.put("android_id",  android_id);
