@@ -81,7 +81,6 @@ public class Bluetooth2 extends BleManager {
         return false;
     }
 
-    @Override
     protected void onDeviceDisconnected() {
         rxChar = null;
         txChar = null;
