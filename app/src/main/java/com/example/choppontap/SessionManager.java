@@ -122,6 +122,10 @@ public class SessionManager {
     /**
      * Inicia uma nova sessão de venda.
      *
+     * NOTA DE SINCRONIZAÇÃO: Este método é chamado APENAS após isReadyWithGuardBand()
+     * retornar true em PagamentoConcluido.java. O guard-band (800-1000ms após READY)
+     * é validado antes desta chamada, garantindo sincronização com ESP32.
+     *
      * Chama POST /api/start_session.php e, em caso de sucesso,
      * transiciona para ACTIVE e chama onSessionStarted(sessionId).
      *
@@ -144,6 +148,7 @@ public class SessionManager {
 
         Log.i(TAG, "[SESSION] Iniciando sessão | checkout=" + checkoutId
                 + " | vol=" + volumeMl + "ml | device=" + deviceId);
+        Log.i(TAG, "[SYNC] Sessão iniciada com guard-band já expirado (verificado por PagamentoConcluido)");
 
         Map<String, String> body = new HashMap<>();
         body.put("checkout_id", checkoutId);

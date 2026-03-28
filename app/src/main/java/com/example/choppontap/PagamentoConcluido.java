@@ -84,6 +84,8 @@ public class PagamentoConcluido extends AppCompatActivity {
     // ── Timeouts e delays ─────────────────────────────────────────────────────
     /** Delay de segurança antes de enfileirar $ML após READY (FIX-1) */
     private static final long ML_SEND_DELAY_MS       = 800L;
+    /** Delay máximo para guard-band (variação 800-1000ms) */
+    private static final long ML_SEND_DELAY_MAX_MS   = 1000L;
     /** Delay antes de navegar para Home após dosagem completa (FIX-6) */
     private static final long HOME_NAVIGATE_DELAY_MS = 3_000L;
     /** Watchdog: se VP: não chegar em 30s após DONE, algo errou */
@@ -179,8 +181,21 @@ public class PagamentoConcluido extends AppCompatActivity {
                 // BLE READY: canal autenticado — enfileirar comando
                 // ─────────────────────────────────────────────────────────────
                 case BluetoothServiceIndustrial.ACTION_WRITE_READY:
-                    Log.i(TAG, "[BLE] ACTION_WRITE_READY — canal autenticado (READY). "
-                            + "Aguardando " + ML_SEND_DELAY_MS + "ms antes de enfileirar $ML.");
+                    // ═══════════════════════════════════════════════════════════════════
+                    // GUARD-BAND SYNCHRONIZATION — Respeitar janela do ESP32
+                    // ═══════════════════════════════════════════════════════════════════
+                    long readyTimestamp = System.currentTimeMillis();
+                    long guardBand = mBluetoothService != null
+                            ? mBluetoothService.getGuardBandMs()
+                            : 900L;
+                    long guardBandDelay = Math.min(
+                            ML_SEND_DELAY_MS + (long)(Math.random() * (ML_SEND_DELAY_MAX_MS - ML_SEND_DELAY_MS)),
+                            guardBand
+                    );
+
+                    Log.i(TAG, "[BLE] ACTION_WRITE_READY — ESP32 READY recebido [timestamp=" + readyTimestamp + "]");
+                    Log.i(TAG, "[GUARD-BAND] Guard-band=" + guardBand + "ms — Android aguardará "
+                            + guardBandDelay + "ms antes de enviar SERVE");
                     atualizarStatus("✓ Dispositivo autenticado. Liberando...");
 
                     mMainHandler.postDelayed(() -> {
@@ -190,9 +205,12 @@ public class PagamentoConcluido extends AppCompatActivity {
                             Log.i(TAG, "[QUEUE] Reconexão detectada — CommandQueueManager retomará fila automaticamente");
                         } else {
                             // Primeira vez: chamar start_sale e depois enfileirar
+                            long serveTimestamp = System.currentTimeMillis();
+                            long elapsedSinceReady = serveTimestamp - readyTimestamp;
+                            Log.i(TAG, "[SYNC] READY → SERVE delay: " + elapsedSinceReady + "ms (target: " + guardBandDelay + "ms)");
                             iniciarVendaEEnfileirar();
                         }
-                    }, ML_SEND_DELAY_MS);
+                    }, guardBandDelay);
                     break;
 
                 // ─────────────────────────────────────────────────────────────
@@ -528,10 +546,30 @@ public class PagamentoConcluido extends AppCompatActivity {
             Log.w(TAG, "[PAYMENT] iniciarVendaEEnfileirar() BLOQUEADO — mComandoEnviado=true");
             return;
         }
+
+        // ═════════════════════════════════════════════════════════════════════════════
+        // GUARD-BAND SINCRONIZATION — Respeitar janela de prontidão do ESP32
+        // ═════════════════════════════════════════════════════════════════════════════
         if (mBluetoothService == null || !mBluetoothService.isReady()) {
             Log.e(TAG, "[PAYMENT] iniciarVendaEEnfileirar() BLOQUEADO — BLE não está READY");
             return;
         }
+
+        // Verificar se ainda está dentro do guard-band
+        if (!mBluetoothService.isReadyWithGuardBand()) {
+            long timeSinceReady = mBluetoothService.getTimeSinceReady();
+            long remainingGuardBand = mBluetoothService.getGuardBandMs() - timeSinceReady;
+            Log.w(TAG, "[GUARD-BAND] Dentro do guard-band — " + remainingGuardBand
+                    + "ms restantes. Bloqueando envio de SERVE.");
+            Log.w(TAG, "[GUARD-BAND] Time since READY: " + timeSinceReady + "ms / "
+                    + mBluetoothService.getGuardBandMs() + "ms");
+            atualizarStatus("⏳ Sincronizando com dispositivo...");
+            return; // Bloquear envio até que guard-band expire
+        }
+
+        // Guard-band expirou — OK para enviar
+        long timeSinceReady = mBluetoothService.getTimeSinceReady();
+        Log.i(TAG, "[GUARD-BAND] Guard-band expirado ✓ (time_since_ready=" + timeSinceReady + "ms)");
 
         Log.i(TAG, "[PAYMENT] Iniciando venda v2.3 — checkout_id=" + checkout_id
                 + " | qtd_ml=" + qtd_ml);
@@ -573,6 +611,33 @@ public class PagamentoConcluido extends AppCompatActivity {
         if (mBluetoothService == null) {
             Log.e(TAG, "[QUEUE] enfileirarComandoServe() — BluetoothService nulo!");
             return;
+        }
+
+        // ═════════════════════════════════════════════════════════════════════════════
+        // GUARD-BAND VALIDATION (segunda verificação antes de enfileirar)
+        // ═════════════════════════════════════════════════════════════════════════════
+        if (!mBluetoothService.isReadyWithGuardBand()) {
+            Log.e(TAG, "[GUARD-BAND] SERVE BLOQUEADO em enfileirarComandoServe() — guard-band não expirado");
+            long timeSinceReady = mBluetoothService.getTimeSinceReady();
+            long remainingGuardBand = mBluetoothService.getGuardBandMs() - timeSinceReady;
+            Log.e(TAG, "[GUARD-BAND] Time since READY: " + timeSinceReady + "ms / remaining: "
+                    + remainingGuardBand + "ms");
+            atualizarStatus("⏱ Aguardando sincronização (guard-band)...");
+            mComandoEnviado = false; // Desbloquear para tentar novamente
+            return;
+        }
+
+        // ═════════════════════════════════════════════════════════════════════════════
+        // Guard-band OK — enfileirar SERVE
+        // ═════════════════════════════════════════════════════════════════════════════
+        long readyTimestamp = mBluetoothService.getReadyTimestamp();
+        long timeSinceReady = mBluetoothService.getTimeSinceReady();
+        Log.i(TAG, "[GUARD-BAND] ✓ Guard-band OK — SERVE será enfileirado");
+        Log.i(TAG, "[TIMING] READY timestamp: " + readyTimestamp
+                + " | Time since READY: " + timeSinceReady + "ms");
+        Log.i(TAG, "[TIMING] SERVE send timestamp: " + System.currentTimeMillis());
+        Log.i(TAG, "[TIMESTAMPS] → READY @ " + readyTimestamp + "ms → SERVE @ "
+                + System.currentTimeMillis() + "ms (Δ=" + timeSinceReady + "ms)")
         }
 
         // MUDANÇA 3: usar CommandQueue v2.3 (getCommandQueueV2) — sem CommandQueueManager legado

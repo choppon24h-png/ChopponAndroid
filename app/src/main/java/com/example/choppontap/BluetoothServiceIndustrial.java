@@ -170,6 +170,7 @@ public class BluetoothServiceIndustrial extends Service {
                 mWriteCharacteristic = null;
                 mNotifyCharacteristic = null;
                 mWriteBusy.set(false);
+                mReadyTimestamp = 0; // Reset guard-band timestamp
                 if (mCommandQueueV2 != null) {
                     BleCommand active = mCommandQueueV2.getActiveCommand();
                     if (active != null) {
@@ -191,7 +192,13 @@ public class BluetoothServiceIndustrial extends Service {
                 mReconnectAttempts = 0;
                 mReconnectDelay    = BACKOFF_DELAYS[0];
                 mAuthRetryCount    = 0;
-                Log.i(TAG, "[STATE] READY");
+                // ═══════════════════════════════════════════════════════════════════
+                // GUARD-BAND: Registar timestamp do READY para sincronização do app
+                // ═══════════════════════════════════════════════════════════════════
+                mReadyTimestamp = System.currentTimeMillis();
+                Log.i(TAG, "[STATE] READY [timestamp=" + mReadyTimestamp + "]");
+                Log.i(TAG, "[GUARD-BAND] READY recebido — APP aguardará "
+                        + GUARD_BAND_MS + "ms antes de enviar SERVE");
                 Log.i(TAG, "[FLOW] Aguardando pagamento");
                 iniciarHeartbeat();
                 broadcastWriteReady();
@@ -317,6 +324,20 @@ public class BluetoothServiceIndustrial extends Service {
     private static final long AUTH_TIMEOUT_MS = 8_000L;  // mantém bloqueado se AUTH_OK não chegar
 
     private Runnable mAuthTimeoutRunnable = null;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GUARD-BAND — Sincronização ESP32 após READY (nova especificação)
+    // ═══════════════════════════════════════════════════════════════════════════
+    /**
+     * Guard-band (janela de prontidão) após READY:
+     * APP NÃO deve enviar SERVE até que este tempo tenha passado desde READY.
+     * ESP32 firmware atualizado requer sincronização com esta janela.
+     * Valor recomendado: 800-1000ms. Usando 900ms para estar no meio da janela.
+     */
+    private static final long GUARD_BAND_MS = 900L;
+
+    /** Timestamp (ms) quando READY foi recebido do ESP32. Zero = não recebido. */
+    private volatile long mReadyTimestamp = 0;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Timeouts gerais
@@ -1968,6 +1989,73 @@ public class BluetoothServiceIndustrial extends Service {
      */
     public boolean isReady() {
         return mState == State.READY;
+    }
+
+    /**
+     * ═══════════════════════════════════════════════════════════════════════════
+     * GUARD-BAND — Sincronização com ESP32 (nova especificação)
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
+
+    /**
+     * Retorna o tempo (em ms) depuis que READY foi recebido do ESP32.
+     * Útil para logs de diagóstico e verificação de guard-band.
+     *
+     * @return Tempo em ms desde READY, ou -1 se READY nunca foi ativado.
+     */
+    public long getTimeSinceReady() {
+        if (mReadyTimestamp == 0) {
+            return -1; // READY nunca foi recebido
+        }
+        return System.currentTimeMillis() - mReadyTimestamp;
+    }
+
+    /**
+     * Retorna true se READY foi recebido E o guard-band (800-1000ms) expirou.
+     *
+     * APP DEVE usar este método antes de enfileirar SERVE:
+     *   ```
+     *   if (mBluetoothService.isReadyWithGuardBand()) {
+     *       // OK para enviar SERVE
+     *   } else {
+     *       // BLOQUEAR envio — ainda dentro do guard-band
+     *   }
+     *   ```
+     *
+     * Isto evita race conditions onde APP envia SERVE antes que ESP32
+     * finalize sua janela de prontidão (ARM Cortex M4 @ 240MHz).
+     *
+     * @return true se isReady() E passou do guard-band, false caso contrário
+     */
+    public boolean isReadyWithGuardBand() {
+        if (!isReady()) {
+            return false; // Não está em READY
+        }
+        long timeSinceReady = getTimeSinceReady();
+        if (timeSinceReady < 0) {
+            return false; // READY nunca foi recebido (improvável, mas validar por segurança)
+        }
+        boolean guardBandExpired = timeSinceReady >= GUARD_BAND_MS;
+        if (!guardBandExpired) {
+            Log.w(TAG, "[GUARD-BAND] BLOQUEADO — " + (GUARD_BAND_MS - timeSinceReady)
+                    + "ms faltando. Time since READY: " + timeSinceReady + "ms");
+        }
+        return guardBandExpired;
+    }
+
+    /**
+     * Retorna o timestamp (ms desde epoch) quando READY foi recebido.
+     * Zero = READY nunca foi ativado.
+     */
+    public long getReadyTimestamp() {
+        return mReadyTimestamp;
+    }
+
+    /**
+     * Retorna o guarding-band em ms (ou seja, quanto tempo APP deve aguardar após READY).
+     */
+    public long getGuardBandMs() {
+        return GUARD_BAND_MS;
     }
 
     /**
