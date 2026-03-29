@@ -174,6 +174,10 @@ public class CommandQueue {
                 Log.e(TAG, "[QUEUE] ERROR:NOT_AUTHENTICATED — aguardando AUTH:OK");
                 if (mActive != null) falharComando(mActive, BleCommand.ErrorCode.NOT_AUTHENTICATED);
                 break;
+            case ERROR_NOT_READY:
+                Log.w(TAG, "[QUEUE] ERROR:NOT_READY — ESP32 ainda não pronto para SERVE");
+                handleErrorNotReady();
+                break;
 
             case ERROR_TIMEOUT:
                 Log.e(TAG, "[QUEUE] ERROR:TIMEOUT do ESP32");
@@ -315,6 +319,18 @@ public class CommandQueue {
         Log.e(TAG, "[QUEUE] ERROR:WATCHDOG recebido do ESP32 — placa reiniciando");
         if (mActive != null) {
             falharComando(mActive, BleCommand.ErrorCode.WATCHDOG);
+        }
+    }
+
+    private void handleErrorNotReady() {
+        if (mActive == null) return;
+        cancelAckTimeout();
+        if (mActive.canRetry()) {
+            mActive.retryCount++;
+            mActive.state = BleCommand.State.QUEUED;
+            mHandler.postDelayed(this::processQueue, 1_000L);
+        } else {
+            falharComando(mActive, BleCommand.ErrorCode.BLE_NOT_READY);
         }
     }
 

@@ -76,6 +76,7 @@ public class BleParser {
         // ── Erros do ESP32 v2.0 ──────────────────────────────────────────────
         ERROR_SESSION_MISMATCH,
         ERROR_NOT_AUTHENTICATED,
+        ERROR_NOT_READY,            // ESP32 ainda não pronto para SERVE
         ERROR_VOLUME_EXCEEDED,      // NOVO v2.0
         ERROR_TIMEOUT,
         ERROR_BUSY,
@@ -226,6 +227,9 @@ public class BleParser {
                             s, null, null, 0);
                 case "NOT_AUTHENTICATED":
                     return new ParsedMessage(MessageType.ERROR_NOT_AUTHENTICATED,
+                            s, null, null, 0);
+                case "NOT_READY":
+                    return new ParsedMessage(MessageType.ERROR_NOT_READY,
                             s, null, null, 0);
                 case "VOLUME_EXCEEDED":
                     return new ParsedMessage(MessageType.ERROR_VOLUME_EXCEEDED,
@@ -394,6 +398,7 @@ public class BleParser {
         // Erros v2.0
         validate("ERROR:SESSION_MISMATCH");
         validate("ERROR:NOT_AUTHENTICATED");
+        validate("ERROR:NOT_READY");
         validate("ERROR:VOLUME_EXCEEDED");
         validate("ERROR:TIMEOUT");
         validate("ERROR:BUSY");
