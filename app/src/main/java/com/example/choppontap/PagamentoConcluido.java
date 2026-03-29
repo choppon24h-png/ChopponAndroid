@@ -637,8 +637,7 @@ public class PagamentoConcluido extends AppCompatActivity {
                 + " | Time since READY: " + timeSinceReady + "ms");
         Log.i(TAG, "[TIMING] SERVE send timestamp: " + System.currentTimeMillis());
         Log.i(TAG, "[TIMESTAMPS] → READY @ " + readyTimestamp + "ms → SERVE @ "
-                + System.currentTimeMillis() + "ms (Δ=" + timeSinceReady + "ms)")
-        }
+                + System.currentTimeMillis() + "ms (Δ=" + timeSinceReady + "ms)");
 
         // MUDANÇA 3: usar CommandQueue v2.3 (getCommandQueueV2) — sem CommandQueueManager legado
         CommandQueue queue = mBluetoothService.getCommandQueueV2();
