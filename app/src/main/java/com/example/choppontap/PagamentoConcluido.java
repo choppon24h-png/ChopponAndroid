@@ -150,10 +150,7 @@ public class PagamentoConcluido extends AppCompatActivity {
         mWatchdogActive  = false;
         mValvulaAberta   = false;
         atualizarStatus("⏱ Timeout: fluxo não detectado. Válvula fechada.");
-        if (mBluetoothService != null && mBluetoothService.isReady()) {
-            Log.w(TAG, "[BLE] Enviando $ML:0 para fechar válvula por timeout");
-            mBluetoothService.write("$ML:0");
-        }
+        Log.w(TAG, "[BLE] Watchdog timeout — não enviando comando de fechamento");
         runOnUiThread(() -> {
             if (liberado < qtd_ml) {
                 int restante = qtd_ml - liberado;

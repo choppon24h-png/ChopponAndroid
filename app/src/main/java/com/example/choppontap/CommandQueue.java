@@ -226,7 +226,10 @@ public class CommandQueue {
 
     public synchronized void onBleDisconnected() {
         if (mActive != null) {
-            Log.w(TAG, "[RESET] BLE desconectado — limpando comando ativo: " + mActive.commandId);
+            Log.w(TAG, "[RESET] BLE desconectado durante SERVE — mantendo comando ativo: " + mActive.commandId);
+            cancelAllTimeouts();
+            mPaused = true;
+            return;
         }
         reset();
         mPaused = true;

@@ -174,9 +174,11 @@ public class BluetoothServiceIndustrial extends Service {
                 if (mCommandQueueV2 != null) {
                     BleCommand active = mCommandQueueV2.getActiveCommand();
                     if (active != null) {
-                        Log.w(TAG, "[RESET] BLE desconectado — limpando comando ativo");
+                        Log.w(TAG, "[RESET] BLE desconectado durante SERVE — mantendo comando ativo");
+                        mCommandQueueV2.onBleDisconnected();
+                    } else {
+                        mCommandQueueV2.onBleDisconnected();
                     }
-                    mCommandQueueV2.onBleDisconnected();
                 }
                 break;
             case SCANNING:
