@@ -73,6 +73,12 @@ public class SessionManager {
     private String mCommandId  = null;
     private int    mVolumeMl   = 0;
 
+    // v2.3.0 FIX: Rastrear se session_id veio da API ou é fallback local
+    private boolean mIsLocalFallback = false;
+    // v2.3.0 FIX: Contar tentativas de API antes de gerar local
+    private int mApiRetryAttempts = 0;
+    private static final int MAX_API_RETRY = 2;
+
     private final Handler mMainHandler = new Handler(Looper.getMainLooper());
 
     // ── Callbacks ─────────────────────────────────────────────────────────────
@@ -103,6 +109,9 @@ public class SessionManager {
 
     /** Retorna true se há uma sessão ativa (ACTIVE). */
     public synchronized boolean isActive() { return mState == State.ACTIVE; }
+
+    /** v2.3.0 FIX: Retorna true se session_id é local (SES_LOCAL_*) — incompatível com ESP32. */
+    public synchronized boolean isLocalFallback() { return mIsLocalFallback; }
 
     /** Retorna o SESSION_ID atual (null se não houver sessão). */
     public synchronized String getSessionId() { return mSessionId; }
@@ -347,6 +356,8 @@ public class SessionManager {
         mDeviceId   = null;
         mCommandId  = null;
         mVolumeMl   = 0;
+        mIsLocalFallback = false;
+        mApiRetryAttempts = 0;
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -454,13 +465,33 @@ public class SessionManager {
     }
 
     /**
-     * Gera um SESSION_ID local quando a API não retorna um.
-     * Garante que o fluxo continue mesmo sem conectividade.
+     * Gera um SESSION_ID local como último recurso quando a API não responde.
+     * v2.3.0 FIX: Apenas após MAX_API_RETRY tentativas.
+     *
+     * IMPORTANTE: SESSION_ID local (SES_LOCAL_*) é incompatível com ESP32 em produção.
+     * Use apenas em modo offline - em produção, forçar recusa de venda sem API confirmada.
      */
     private void gerarSessionIdLocal(String checkoutId) {
+        mApiRetryAttempts++;
+        if (mApiRetryAttempts < MAX_API_RETRY) {
+            Log.w(TAG, "[SESSION] API tentativa #" + mApiRetryAttempts + "/" + MAX_API_RETRY
+                    + " falhou — agendando retry antes do fallback local");
+            mMainHandler.postDelayed(() -> {
+                if (mState == State.STARTING) {
+                    startSession(checkoutId, mVolumeMl, mDeviceId);
+                }
+            }, 2_000L);
+            return;
+        }
+
+        // Último recurso: gerar SES_LOCAL
         String localId = "SES_LOCAL_" + checkoutId + "_"
                 + Long.toHexString(System.currentTimeMillis()).toUpperCase();
-        Log.w(TAG, "[SESSION] Usando SESSION_ID local: " + localId);
+        Log.w(TAG, "[SESSION] ⚠️  API indisponível após " + MAX_API_RETRY
+                + " tentativas — GERANDO SESSION_ID LOCAL (compatibilidade offline): " + localId);
+        Log.w(TAG, "[SESSION] ⚠️  AVISO: SES_LOCAL_* é rejeitado pelo ESP32 em produção!");
+
+        mIsLocalFallback = true;
         mMainHandler.post(() -> {
             synchronized (SessionManager.this) {
                 mSessionId = localId;

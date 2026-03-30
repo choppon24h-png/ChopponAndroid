@@ -643,6 +643,26 @@ public class PagamentoConcluido extends AppCompatActivity {
         Log.i(TAG, "[TIMESTAMPS] → READY @ " + readyTimestamp + "ms → SERVE @ "
                 + System.currentTimeMillis() + "ms (Δ=" + timeSinceReady + "ms)");
 
+        // v2.3.0 FIX: Validar que a sessão é de produção (não SES_LOCAL_*)
+        if (mSessionManager != null && mSessionManager.isLocalFallback()) {
+            Log.e(TAG, "[SECURITY] ❌ BLOQUEADO: Sessão local (SES_LOCAL_*) incompatível com ESP32");
+            Log.e(TAG, "[SECURITY] Motivo: Fallback sem validação de API — rejeitar SERVE");
+            atualizarStatus("❌ Erro: Sem sincronização com servidor. Tente novamente.");
+            Toast.makeText(this, "Operação bloqueada: sessão local não validada",
+                    Toast.LENGTH_LONG).show();
+            runOnUiThread(() -> {
+                btnLiberar.setText("Tentar novamente (" + (qtd_ml - liberado) + "ml)");
+                btnLiberar.setEnabled(true);
+                btnLiberar.setVisibility(View.VISIBLE);
+            });
+            mComandoEnviado = false;
+            cancelarWatchdog();
+            if (mSessionManager != null) {
+                mSessionManager.failSession("Sessão SES_LOCAL_* bloqueada por segurança", liberado);
+            }
+            return;
+        }
+
         // MUDANÇA 3: usar CommandQueue v2.3 (getCommandQueueV2) — sem CommandQueueManager legado
         CommandQueue queue = mBluetoothService.getCommandQueueV2();
         if (queue == null) {

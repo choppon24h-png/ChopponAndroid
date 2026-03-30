@@ -1226,8 +1226,8 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     /**
-     * Chamado quando GATT desconecta.
-     * REQUISITO 4 — Decide se fecha GATT baseado no status.
+     * Chamado quando GATT reconecta após desconexão.
+     * v2.3.0 FIX: Revalidar estado e resincronizar com ESP32.
      */
     private void handleGattDisconnected(BluetoothGatt gatt, int status) {
         Log.i(TAG, "[GATT] DESCONECTADO | status=" + status
@@ -1264,8 +1264,11 @@ public class BluetoothServiceIndustrial extends Service {
                 || status == STATUS_CONN_257         // 257
                 || status == STATUS_CONN_TERMINATE   // 19
                 || status == STATUS_CONN_FAIL) {     // 62
-            // NÃO fechar GATT — reconectar imediatamente preservando cache
-            Log.i(TAG, "[GATT] status=" + status + " → NÃO fechando GATT (preservando cache)");
+            // v2.3.0 FIX: NÃO fechar GATT — reconectar imediatamente preservando cache
+            // Mas sinalizar que precisa revalidação
+            Log.i(TAG, "[GATT] status=" + status + " → NÃO fechando GATT");
+            Log.i(TAG, "[GATT] v2.3.0 FIX: Marcando para revalidação de estado em reconexão");
+            mAuthRetryCount = 0; // Reset AUTH retries para nova sincronização
             reconectarComBackoff();
 
         } else {

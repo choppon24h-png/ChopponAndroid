@@ -223,12 +223,20 @@ public class BleParser {
             String err = s.substring(6).trim();
             switch (err) {
                 case "SESSION_MISMATCH":
+                    // v2.3.0 FIX: Log detalhado para SESSION_MISMATCH
+                    Log.e(TAG, "[SECURITY] ERROR:SESSION_MISMATCH recebido do ESP32");
+                    Log.e(TAG, "[SESSION] ⚠️  POSSÍVEL CAUSA 1: SES_LOCAL_* (fallback local) enviado");
+                    Log.e(TAG, "[SESSION] ⚠️  POSSÍVEL CAUSA 2: API não confirmou session_id antes de SERVE");
+                    Log.e(TAG, "[SESSION] ⚠️  POSSÍVEL CAUSA 3: Reconexão com SESSION_ID antigo");
+                    Log.e(TAG, "[RECOVERY] Retry automático: CommandQueueManager reenviará comando");
                     return new ParsedMessage(MessageType.ERROR_SESSION_MISMATCH,
                             s, null, null, 0);
                 case "NOT_AUTHENTICATED":
                     return new ParsedMessage(MessageType.ERROR_NOT_AUTHENTICATED,
                             s, null, null, 0);
                 case "NOT_READY":
+                    // v2.3.0 FIX: Log para NOT_READY
+                    Log.w(TAG, "[SYNC] ERROR:NOT_READY — ESP32 ainda sincronizando");
                     return new ParsedMessage(MessageType.ERROR_NOT_READY,
                             s, null, null, 0);
                 case "VOLUME_EXCEEDED":

@@ -126,6 +126,8 @@ public class CommandQueueManager {
      *   DONE|<id>|<ml>|<session>
      *   DONE (sem ID — legado)
      *   DUPLICATE / ML:DUPLICATE
+     *   ERROR:SESSION_MISMATCH  ← v2.3.0 FIX: NOVO
+     *   ERROR:NOT_READY         ← v2.3.0 FIX: NOVO
      *   ERROR:BUSY
      *   ERROR:WATCHDOG
      *   PONG
@@ -134,6 +136,42 @@ public class CommandQueueManager {
         if (response == null || response.isEmpty()) return;
 
         Log.d(TAG, "[BLE_CMD] resposta recebida: [" + response + "] | ativo=" + mActive);
+
+        // ── v2.3.0 FIX: ERROR:SESSION_MISMATCH ───────────────────────────────
+        // Sessão não confere no ESP32 — tentar reenviar com mesmo ID
+        if (response.equalsIgnoreCase("ERROR:SESSION_MISMATCH")) {
+            Log.e(TAG, "[BLE_CMD] ERROR:SESSION_MISMATCH recebido — comando SERVE foi rejeitado");
+            Log.e(TAG, "[BLE_CMD] ⚠️  POSSÍVEL CAUSA: SES_LOCAL_* usado em produção (incompatível com ESP32)");
+            if (mActive != null && mActive.canRetry()) {
+                mActive.retryCount++;
+                mActive.state = BleCommand.State.QUEUED;
+                cancelAllTimeouts();
+                Log.i(TAG, "[BLE_CMD] retry SESSION_MISMATCH → " + mActive.commandId
+                        + " (tentativa " + mActive.retryCount + "/" + BleCommand.MAX_RETRIES + ")");
+                mHandler.postDelayed(this::processQueue, 3_000L); // Delay maior: 3s
+            } else if (mActive != null) {
+                falharComando(mActive, "ERROR:SESSION_MISMATCH — máximo de retries atingido");
+            }
+            return;
+        }
+
+        // ── v2.3.0 FIX: ERROR:NOT_READY ──────────────────────────────────────
+        // ESP32 não está pronto — reenviar com delay para sincronizar
+        if (response.equalsIgnoreCase("ERROR:NOT_READY")) {
+            Log.w(TAG, "[BLE_CMD] ERROR:NOT_READY recebido — ESP32 ainda sincronizando");
+            if (mActive != null && mActive.canRetry()) {
+                mActive.retryCount++;
+                mActive.state = BleCommand.State.QUEUED;
+                cancelAllTimeouts();
+                Log.i(TAG, "[BLE_CMD] retry NOT_READY → " + mActive.commandId
+                        + " (tentativa " + mActive.retryCount + "/" + BleCommand.MAX_RETRIES + ")");
+                // Delay: dar tempo ao ESP32 para sincronizar
+                mHandler.postDelayed(this::processQueue, 2_500L);
+            } else if (mActive != null) {
+                falharComando(mActive, "ERROR:NOT_READY — máximo de retries atingido");
+            }
+            return;
+        }
 
         // ── ML:ACK (protocolo real ESP32) ou ACK|<id> (formato v2.3 doc) ───────────
         if (response.equalsIgnoreCase("ML:ACK") || response.startsWith("ACK|")) {
