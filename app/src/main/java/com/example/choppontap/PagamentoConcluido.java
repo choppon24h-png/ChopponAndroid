@@ -32,8 +32,6 @@ import androidx.core.view.WindowInsetsControllerCompat;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import com.google.android.material.snackbar.Snackbar;
-
-import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -43,6 +41,7 @@ import java.util.concurrent.Future;
 import okhttp3.Call;
 import okhttp3.Callback;
 import okhttp3.Response;
+import com.example.choppontap.BleCommand;
 
 /**
  * PagamentoConcluido — Tela de liberação do chopp após pagamento confirmado.
@@ -611,6 +610,35 @@ public class PagamentoConcluido extends AppCompatActivity {
      * Enfileira um BleCommand SERVE via CommandQueue v2.3 (getCommandQueueV2).
      * Deve ser chamado APÓS start_session/start_sale retornar sucesso.
      */
+
+    /**
+     * CORREÇÃO 3: Método alternativo direto para garantir envio de SERVE
+     * conforme protocolo BLE v2.0 com HMAC.
+     */
+    private void enfileirarSERVE(int volumeMl, String checkoutId, String sessionId) {
+        // Construir comando SERVE conforme protocolo BLE v2.0
+        String cmdId = BleCommand.generateCmdId();
+        BleCommand cmd = new BleCommand(BleCommand.Type.SERVE, cmdId, sessionId, volumeMl);
+        String hmac = cmd.generateHmacToken();
+        String serve = "SERVE|" + volumeMl + "|" + cmdId + "|" + sessionId + "|" + hmac;
+
+        Log.i(TAG, "[SERVE] Enfileirando: " + serve);
+        // Usar envio direto via BluetoothService como fallback
+        if (mBluetoothService != null) {
+            mComandoEnviado = true;
+            mActiveCommandId = cmdId;
+            mActiveSessionId = sessionId;
+            // Registra o command_id no SessionManager para envio ao ERP
+            if (mSessionManager != null) mSessionManager.setCommandId(mActiveCommandId);
+
+            mBluetoothService.write(serve);
+            Log.i(TAG, "[SERVE] Comando enviado diretamente: " + serve);
+            atualizarStatus("⏳ Aguardando abertura da válvula...");
+        } else {
+            Log.e(TAG, "[SERVE] BluetoothService nulo — não foi possível enviar SERVE");
+        }
+    }
+
     private void enfileirarComandoServe(int volumeMl) {
         if (mBluetoothService == null) {
             Log.e(TAG, "[QUEUE] enfileirarComandoServe() — BluetoothService nulo!");
@@ -710,8 +738,8 @@ public class PagamentoConcluido extends AppCompatActivity {
                     public void onSessionStarted(String sessionId, String checkoutId) {
                         Log.i(TAG, "[SESSION] Sessão iniciada | session_id=" + sessionId);
                         mActiveSessionId = sessionId;
-                        // Enfileira o comando BLE com o session_id da sessão
-                        enfileirarComandoServe(qtd_ml);
+                        // CORREÇÃO 3: Usar método direto para garantir envio de SERVE
+                        enfileirarSERVE(qtd_ml, checkoutId, sessionId);
                     }
                     @Override
                     public void onSessionFinished(String sessionId, int mlReal) {

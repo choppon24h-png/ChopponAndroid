@@ -78,6 +78,7 @@ public class SessionManager {
     // v2.3.0 FIX: Contar tentativas de API antes de gerar local
     private int mApiRetryAttempts = 0;
     private static final int MAX_API_RETRY = 2;
+    private static final int MAX_SESSION_RETRIES = 2;
 
     private final Handler mMainHandler = new Handler(Looper.getMainLooper());
 
@@ -206,24 +207,17 @@ public class SessionManager {
                     if (sessionId != null && !sessionId.isEmpty()) {
                         final String finalSessionId = sessionId;
                         Log.i(TAG, "[SESSION] ✅ HTTP 200 | session_id=" + finalSessionId + " | status=" + status);
-                        mMainHandler.post(() -> {
-                            synchronized (SessionManager.this) {
-                                mSessionId = finalSessionId;
-                                mState     = State.ACTIVE;
-                                Log.i(TAG, "[SESSION] Estado → ACTIVE | session_id=" + finalSessionId);
-                                if (mCallback != null) {
-                                    mCallback.onSessionStarted(finalSessionId, checkoutId);
-                                }
-                            }
-                        });
+                        onSessionReady(checkoutId, finalSessionId, false);
                     } else {
-                        // Sem session_id na resposta — gera um local como fallback
+                        // Sem session_id na resposta — fallback local com retry controlado
                         Log.w(TAG, "[SESSION] HTTP 200 mas session_id ausente → fallback local");
-                        gerarSessionIdLocal(checkoutId);
+                        mState = State.IDLE; // reset ANTES de tentar fallback para evitar deadlock
+                        onSessionFallback(checkoutId);
                     }
                 } catch (Exception e) {
                     Log.e(TAG, "[SESSION] Erro ao parsear JSON: " + e.getMessage());
-                    gerarSessionIdLocal(checkoutId);
+                    mState = State.IDLE;
+                    onSessionFallback(checkoutId);
                 }
             }
         });
@@ -472,34 +466,46 @@ public class SessionManager {
      * Use apenas em modo offline - em produção, forçar recusa de venda sem API confirmada.
      */
     private void gerarSessionIdLocal(String checkoutId) {
+        Log.w(TAG, "[SESSION] gerarSessionIdLocal() chamado → delegando para onSessionFallback");
+        onSessionFallback(checkoutId);
+    }
+
+    private void onSessionFallback(String checkoutId) {
         mApiRetryAttempts++;
-        Log.w(TAG, "[SESSION] FALLBACK LOCAL → Tentativa #" + mApiRetryAttempts + "/" + MAX_API_RETRY);
-        if (mApiRetryAttempts < MAX_API_RETRY) {
-            Log.w(TAG, "[SESSION] Agendando retry de API em 2s (máx " + MAX_API_RETRY + " tentativas)");
-            mMainHandler.postDelayed(() -> {
-                if (mState == State.STARTING) {
-                    Log.w(TAG, "[SESSION] Retry #" + mApiRetryAttempts + ": reiniciando startSession()");
-                    startSession(checkoutId, mVolumeMl, mDeviceId);
-                }
-            }, 2_000L);
+        Log.w(TAG, "[SESSION] FALLBACK LOCAL → Tentativa #" + mApiRetryAttempts + "/" + MAX_SESSION_RETRIES);
+
+        if (mApiRetryAttempts >= MAX_SESSION_RETRIES) {
+            String localId = "SES_LOCAL_" + checkoutId + "_"
+                    + Long.toHexString(System.currentTimeMillis()).toUpperCase();
+            Log.w(TAG, "[SESSION] Máx retries atingido → usando session_id LOCAL: " + localId);
+            Log.e(TAG, "[SESSION] 🚫 AVISO CRÍTICO: SES_LOCAL_* é rejeitado pelo ESP32 em produção!");
+            Log.e(TAG, "[SESSION] SERVE será BLOQUEADO por validação de segurança em PagamentoConcluido");
+
+            onSessionReady(checkoutId, localId, true);
             return;
         }
 
-        // Último recurso: gerar SES_LOCAL
-        String localId = "SES_LOCAL_" + checkoutId + "_"
-                + Long.toHexString(System.currentTimeMillis()).toUpperCase();
-        Log.w(TAG, "[SESSION] ⚠️  API indisponível após " + MAX_API_RETRY
-                + " tentativas — GERANDO SESSION_ID LOCAL: " + localId);
-        Log.e(TAG, "[SESSION] 🚫 AVISO CRÍTICO: SES_LOCAL_* é rejeitado pelo ESP32 em produção!");
-        Log.e(TAG, "[SESSION] SERVE será BLOQUEADO por validação de segurança em PagamentoConcluido");
+        // Resetar estado ANTES do retry para não ser ignorado
+        Log.w(TAG, "[SESSION] Resetando estado para IDLE antes do retry");
+        mState = State.IDLE;
 
-        mIsLocalFallback = true;
+        mMainHandler.postDelayed(() -> {
+            Log.i(TAG, "[SESSION] Retry #" + mApiRetryAttempts + ": reiniciando startSession()");
+            startSession(checkoutId, mVolumeMl, mDeviceId);
+        }, 2_000L);
+    }
+
+    private void onSessionReady(String checkoutId, String sessionId, boolean localFallback) {
         mMainHandler.post(() -> {
             synchronized (SessionManager.this) {
-                mSessionId = localId;
-                mState     = State.ACTIVE;
-                Log.i(TAG, "[SESSION] Estado → ACTIVE (local fallback, bloqueado em produção)");
-                if (mCallback != null) mCallback.onSessionStarted(localId, checkoutId);
+                mSessionId = sessionId;
+                mState = State.ACTIVE;
+                mIsLocalFallback = localFallback;
+                Log.i(TAG, "[SESSION] STATE: STARTING → ACTIVE | session_id=" + sessionId
+                        + (localFallback ? " (local fallback)" : ""));
+                if (mCallback != null) {
+                    mCallback.onSessionStarted(sessionId, checkoutId);
+                }
             }
         });
     }
