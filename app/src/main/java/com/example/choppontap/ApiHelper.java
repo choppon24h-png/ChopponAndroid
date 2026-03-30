@@ -279,6 +279,7 @@ public class ApiHelper {
             if (!base.endsWith(".php")) base = base + ".php";
             String fullUrl = api + base + query;
 
+            Log.i(TAG, "[API] 🌐 URL Montada: " + fullUrl);
             String partialToken = token.length() > 10 ? token.substring(0, 10) : token;
             Log.d(TAG, "[API] Header Authorization: Bearer " + partialToken + "...");
 

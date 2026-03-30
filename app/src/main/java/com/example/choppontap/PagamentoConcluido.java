@@ -925,7 +925,7 @@ public class PagamentoConcluido extends AppCompatActivity {
         if (mActiveCommandId != null) body.put("command_id", mActiveCommandId);
         if (mActiveSessionId != null) body.put("session_id", mActiveSessionId);
 
-        new ApiHelper(this).sendPost(body, "api/start_sale.php", new Callback() {
+        new ApiHelper(this).sendPost(body, "start_sale.php", new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
                 Log.w(TAG, "[API] start_sale FALHOU (rede): " + e.getMessage()
@@ -972,7 +972,7 @@ public class PagamentoConcluido extends AppCompatActivity {
         if (mActiveCommandId != null) body.put("command_id", mActiveCommandId);
         if (mActiveSessionId != null) body.put("session_id", mActiveSessionId);
 
-        new ApiHelper(this).sendPost(body, "api/finish_sale.php", new Callback() {
+        new ApiHelper(this).sendPost(body, "finish_sale.php", new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
                 Log.w(TAG, "[API] finish_sale FALHOU (rede): " + e.getMessage());
@@ -1013,7 +1013,7 @@ public class PagamentoConcluido extends AppCompatActivity {
         if (mActiveCommandId != null) body.put("command_id", mActiveCommandId);
         if (mActiveSessionId != null) body.put("session_id", mActiveSessionId);
 
-        new ApiHelper(this).sendPost(body, "api/fail_sale.php", new Callback() {
+        new ApiHelper(this).sendPost(body, "fail_sale.php", new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
                 Log.w(TAG, "[API] fail_sale FALHOU (rede): " + e.getMessage());

@@ -173,7 +173,7 @@ public class SessionManager {
         body.put("device_id",   deviceId);
         body.put("android_id",  deviceId);
 
-        mApiHelper.sendPost(body, "api/start_session.php", new okhttp3.Callback() {
+        mApiHelper.sendPost(body, "start_session.php", new okhttp3.Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
                 Log.e(TAG, "[SESSION] start_session falhou (rede): " + e.getMessage());
@@ -184,11 +184,11 @@ public class SessionManager {
             @Override
             public void onResponse(Call call, Response response) throws IOException {
                 String bodyStr = response.body() != null ? response.body().string() : "";
-                Log.i(TAG, "[SESSION] start_session HTTP " + response.code() + " | body=" + bodyStr);
+                Log.i(TAG, "[SESSION] HTTP " + response.code() + " | start_session.php");
+                Log.d(TAG, "[SESSION] Response body: " + (bodyStr.length() > 200 ? bodyStr.substring(0, 200) + "..." : bodyStr));
 
                 if (!response.isSuccessful()) {
-                    Log.w(TAG, "[SESSION] start_session HTTP " + response.code()
-                            + " — tentando start_sale.php como fallback");
+                    Log.w(TAG, "[SESSION] ❌ HTTP " + response.code() + " — fallback para start_sale.php");
                     chamarStartSaleFallback(checkoutId, volumeMl, deviceId);
                     return;
                 }
@@ -205,12 +205,12 @@ public class SessionManager {
 
                     if (sessionId != null && !sessionId.isEmpty()) {
                         final String finalSessionId = sessionId;
+                        Log.i(TAG, "[SESSION] ✅ HTTP 200 | session_id=" + finalSessionId + " | status=" + status);
                         mMainHandler.post(() -> {
                             synchronized (SessionManager.this) {
                                 mSessionId = finalSessionId;
                                 mState     = State.ACTIVE;
-                                Log.i(TAG, "[SESSION] ACTIVE | session_id=" + finalSessionId
-                                        + " | status=" + status);
+                                Log.i(TAG, "[SESSION] Estado → ACTIVE | session_id=" + finalSessionId);
                                 if (mCallback != null) {
                                     mCallback.onSessionStarted(finalSessionId, checkoutId);
                                 }
@@ -218,11 +218,11 @@ public class SessionManager {
                         });
                     } else {
                         // Sem session_id na resposta — gera um local como fallback
-                        Log.w(TAG, "[SESSION] session_id ausente na resposta — gerando local");
+                        Log.w(TAG, "[SESSION] HTTP 200 mas session_id ausente → fallback local");
                         gerarSessionIdLocal(checkoutId);
                     }
                 } catch (Exception e) {
-                    Log.e(TAG, "[SESSION] Erro ao parsear resposta: " + e.getMessage());
+                    Log.e(TAG, "[SESSION] Erro ao parsear JSON: " + e.getMessage());
                     gerarSessionIdLocal(checkoutId);
                 }
             }
@@ -260,7 +260,7 @@ public class SessionManager {
         final int    mlRealSnapshot    = mlReal;
 
         // Tenta finish_session.php primeiro, depois finish_sale.php como fallback
-        mApiHelper.sendPost(body, "api/finish_session.php", new okhttp3.Callback() {
+        mApiHelper.sendPost(body, "finish_session.php", new okhttp3.Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
                 Log.w(TAG, "[SESSION] finish_session falhou (rede) — tentando finish_sale.php");
@@ -321,7 +321,7 @@ public class SessionManager {
         final String sessionIdSnapshot = mSessionId;
 
         // Tenta fail_session.php, depois fail_sale.php como fallback
-        mApiHelper.sendPost(body, "api/fail_session.php", new okhttp3.Callback() {
+        mApiHelper.sendPost(body, "fail_session.php", new okhttp3.Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
                 Log.w(TAG, "[SESSION] fail_session falhou — tentando fail_sale.php");
@@ -365,7 +365,7 @@ public class SessionManager {
     // ═════════════════════════════════════════════════════════════════════════
 
     private void chamarStartSaleFallback(String checkoutId, int volumeMl, String deviceId) {
-        Log.i(TAG, "[SESSION] Fallback → start_sale.php");
+        Log.i(TAG, "[SESSION] Fallback → start_sale.php após start_session.php falhar");
         Map<String, String> body = new HashMap<>();
         body.put("checkout_id", checkoutId);
         body.put("volume_ml",   String.valueOf(volumeMl));
@@ -373,7 +373,7 @@ public class SessionManager {
         body.put("device_id",   deviceId);
         body.put("android_id",  deviceId);
 
-        mApiHelper.sendPost(body, "api/start_sale.php", new okhttp3.Callback() {
+        mApiHelper.sendPost(body, "start_sale.php", new okhttp3.Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
                 Log.e(TAG, "[SESSION] start_sale fallback também falhou: " + e.getMessage());
@@ -410,7 +410,7 @@ public class SessionManager {
 
     private void chamarFinishSaleFallback(Map<String, String> body,
                                           String sessionId, int mlReal) {
-        mApiHelper.sendPost(body, "api/finish_sale.php", new okhttp3.Callback() {
+        mApiHelper.sendPost(body, "finish_sale.php", new okhttp3.Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
                 Log.e(TAG, "[SESSION] finish_sale fallback falhou: " + e.getMessage());
@@ -441,7 +441,7 @@ public class SessionManager {
 
     private void chamarFailSaleFallback(Map<String, String> body,
                                         String sessionId, String motivo) {
-        mApiHelper.sendPost(body, "api/fail_sale.php", new okhttp3.Callback() {
+        mApiHelper.sendPost(body, "fail_sale.php", new okhttp3.Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
                 Log.e(TAG, "[SESSION] fail_sale fallback falhou: " + e.getMessage());
@@ -473,11 +473,12 @@ public class SessionManager {
      */
     private void gerarSessionIdLocal(String checkoutId) {
         mApiRetryAttempts++;
+        Log.w(TAG, "[SESSION] FALLBACK LOCAL → Tentativa #" + mApiRetryAttempts + "/" + MAX_API_RETRY);
         if (mApiRetryAttempts < MAX_API_RETRY) {
-            Log.w(TAG, "[SESSION] API tentativa #" + mApiRetryAttempts + "/" + MAX_API_RETRY
-                    + " falhou — agendando retry antes do fallback local");
+            Log.w(TAG, "[SESSION] Agendando retry de API em 2s (máx " + MAX_API_RETRY + " tentativas)");
             mMainHandler.postDelayed(() -> {
                 if (mState == State.STARTING) {
+                    Log.w(TAG, "[SESSION] Retry #" + mApiRetryAttempts + ": reiniciando startSession()");
                     startSession(checkoutId, mVolumeMl, mDeviceId);
                 }
             }, 2_000L);
@@ -488,14 +489,16 @@ public class SessionManager {
         String localId = "SES_LOCAL_" + checkoutId + "_"
                 + Long.toHexString(System.currentTimeMillis()).toUpperCase();
         Log.w(TAG, "[SESSION] ⚠️  API indisponível após " + MAX_API_RETRY
-                + " tentativas — GERANDO SESSION_ID LOCAL (compatibilidade offline): " + localId);
-        Log.w(TAG, "[SESSION] ⚠️  AVISO: SES_LOCAL_* é rejeitado pelo ESP32 em produção!");
+                + " tentativas — GERANDO SESSION_ID LOCAL: " + localId);
+        Log.e(TAG, "[SESSION] 🚫 AVISO CRÍTICO: SES_LOCAL_* é rejeitado pelo ESP32 em produção!");
+        Log.e(TAG, "[SESSION] SERVE será BLOQUEADO por validação de segurança em PagamentoConcluido");
 
         mIsLocalFallback = true;
         mMainHandler.post(() -> {
             synchronized (SessionManager.this) {
                 mSessionId = localId;
                 mState     = State.ACTIVE;
+                Log.i(TAG, "[SESSION] Estado → ACTIVE (local fallback, bloqueado em produção)");
                 if (mCallback != null) mCallback.onSessionStarted(localId, checkoutId);
             }
         });
