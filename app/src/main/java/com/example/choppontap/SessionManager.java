@@ -134,6 +134,13 @@ public class SessionManager {
      * @param deviceId    android_id do tablet
      */
     public synchronized void startSession(String checkoutId, int volumeMl, String deviceId) {
+        if (mState == State.ACTIVE) {
+            Log.w(TAG, "[SESSION] startSession() — sessão já ACTIVE, reaproveitando session_id existente");
+            if (mCallback != null && mSessionId != null) {
+                mCallback.onSessionStarted(mSessionId, mCheckoutId != null ? mCheckoutId : checkoutId);
+            }
+            return;
+        }
         if (mState != State.IDLE && mState != State.FAILED && mState != State.COMPLETED) {
             Log.w(TAG, "[SESSION] startSession() ignorado — estado=" + mState);
             return;

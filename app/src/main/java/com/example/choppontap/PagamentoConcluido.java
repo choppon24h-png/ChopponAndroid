@@ -191,6 +191,13 @@ public class PagamentoConcluido extends AppCompatActivity {
                     );
 
                     Log.i(TAG, "[BLE] ACTION_WRITE_READY — ESP32 READY recebido [timestamp=" + readyTimestamp + "]");
+                    CommandQueue queue = mBluetoothService != null ? mBluetoothService.getCommandQueueV2() : null;
+                    BleCommand activeCmd = queue != null ? queue.getActiveCommand() : null;
+                    if (activeCmd != null && activeCmd.type == BleCommand.Type.SERVE) {
+                        Log.i(TAG, "[WATCHDOG] Reconexão com SERVE ativo — reiniciando watchdog (45s)");
+                        cancelarWatchdog();
+                        iniciarWatchdog(45_000L);
+                    }
                     Log.i(TAG, "[GUARD-BAND] Guard-band=" + guardBand + "ms — Android aguardará "
                             + guardBandDelay + "ms antes de enviar SERVE");
                     atualizarStatus("✓ Dispositivo autenticado. Liberando...");
@@ -1079,10 +1086,14 @@ public class PagamentoConcluido extends AppCompatActivity {
     // ═════════════════════════════════════════════════════════════════════════
 
     private void iniciarWatchdog() {
+        iniciarWatchdog(WATCHDOG_TIMEOUT_MS);
+    }
+
+    private void iniciarWatchdog(long timeoutMs) {
         cancelarWatchdog();
         mWatchdogActive = true;
-        mWatchdogHandler.postDelayed(mWatchdogRunnable, WATCHDOG_TIMEOUT_MS);
-        Log.d(TAG, "[APP] Watchdog iniciado (" + WATCHDOG_TIMEOUT_MS / 1000 + "s)");
+        mWatchdogHandler.postDelayed(mWatchdogRunnable, timeoutMs);
+        Log.d(TAG, "[APP] Watchdog iniciado (" + (timeoutMs / 1000) + "s)");
     }
 
     private void resetarWatchdog() {
