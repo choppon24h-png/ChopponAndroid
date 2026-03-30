@@ -41,12 +41,17 @@ import java.util.UUID;
 public class CommandQueueManager {
 
     private static final String TAG = "BLE_CMD_QUEUE";
+    // v2.3.0 FIX: Versão para rastreamento de release
+    public static final String VERSION = "2.3.0";
 
     // ── Timeouts ──────────────────────────────────────────────────────────────
     /** Timeout para receber ACK após envio (ms). Firmware garante ACK em < 100ms. */
-    private static final long ACK_TIMEOUT_MS  = 5_000L;
+    // v2.3.0 FIX: 8s — ESP32-C3 single-core pode demorar para processar
+    // o SERVE quando o taskDispensacao está rodando. 5s era muito curto.
+    private static final long ACK_TIMEOUT_MS  = 8_000L;
     /** Timeout para receber DONE após ACK (ms). Operação máxima: 10s no firmware. */
-    private static final long DONE_TIMEOUT_MS = 45_000L; // v2.2.0: estendido para permitir reconexões BLE
+    // v2.3.0 FIX: 60s — cobre dispensação longa + reconexão BLE
+    private static final long DONE_TIMEOUT_MS = 60_000L;
 
     // ── Estado interno ────────────────────────────────────────────────────────
     private final Queue<BleCommand> mQueue   = new LinkedList<>();
@@ -221,9 +226,13 @@ public class CommandQueueManager {
                 (mActive.state == BleCommand.State.SENT ||
                  mActive.state == BleCommand.State.ACKED)) {
             mActive.state = BleCommand.State.QUEUED;
-            Log.i(TAG, "[BLE_CMD] v2.2.0 retry → " + mActive.commandId
-                    + " | estado=" + mActive.state
-                    + " | mesmo cmdId para deduplicacao no ESP32");
+            // v2.3.0 FIX: resetar retryCount na desconexão.
+            // O retry é por tentativa de write, não por reconexão.
+            // Sem este reset, após 3 writes falhos o comando fica preso
+            // em canRetry()=false e nunca é reenviado após reconexão.
+            mActive.retryCount = 0;
+            Log.i(TAG, "[BLE_CMD] v2.3.0 retry → " + mActive.commandId
+                    + " | retryCount resetado para nova tentativa após reconexão");
         }
     }
 

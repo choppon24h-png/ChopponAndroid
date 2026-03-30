@@ -1206,9 +1206,12 @@ public class BluetoothServiceIndustrial extends Service {
         transitionTo(State.CONNECTED);
         broadcastConnectionStatus("connected");
 
-        // REQUISITO 10 — Prioridade de conexão HIGH (reduz interval e supervision timeout)
-        boolean priOk = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
-        Log.i(TAG, "[GATT] requestConnectionPriority(HIGH) → " + (priOk ? "OK" : "FALHOU"));
+        // v2.3.0 FIX: HIGH (timeout=5000ms) derruba o BLE no ESP32-C3 single-core
+        // durante dispensação. BALANCED usa timeout=6000ms e interval=30-50ms,
+        // suficiente para manter link estável sem saturar o single-core.
+        boolean priOk = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED);
+        Log.i(TAG, "[GATT] requestConnectionPriority(BALANCED) → " + (priOk ? "OK" : "FALHOU"));
+        Log.i(TAG, "[GATT] timeout=6000ms para ESP32-C3 single-core");
 
         // REQUISITO 10 — MTU 512 (necessário para comandos longos)
         boolean mtuOk = gatt.requestMtu(512);
