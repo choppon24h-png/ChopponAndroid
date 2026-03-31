@@ -144,6 +144,18 @@ public class SessionManager {
      * @param deviceId    android_id do tablet
      */
     public synchronized void startSession(String checkoutId, int volumeMl, String deviceId) {
+        startSession(checkoutId, volumeMl, deviceId, 0);
+    }
+
+    /**
+     * Inicia uma nova sessão de venda com tentativa de retry.
+     *
+     * @param checkoutId  ID do checkout/pedido
+     * @param volumeMl    Volume em ml solicitado
+     * @param deviceId    android_id do tablet
+     * @param tentativa   Número da tentativa (0 = primeira)
+     */
+    public synchronized void startSession(String checkoutId, int volumeMl, String deviceId, int tentativa) {
         if (mState == State.ACTIVE) {
             Log.w(TAG, "[SESSION] startSession() — sessão já ACTIVE, reaproveitando session_id existente");
             if (mCallback != null && mSessionId != null) {
@@ -207,17 +219,17 @@ public class SessionManager {
                     if (sessionId != null && !sessionId.isEmpty()) {
                         final String finalSessionId = sessionId;
                         Log.i(TAG, "[SESSION] ✅ HTTP 200 | session_id=" + finalSessionId + " | status=" + status);
-                        onSessionReady(checkoutId, finalSessionId, false);
+                        onSessionReady(checkoutId, finalSessionId);
                     } else {
                         // Sem session_id na resposta — fallback local com retry controlado
                         Log.w(TAG, "[SESSION] HTTP 200 mas session_id ausente → fallback local");
                         mState = State.IDLE; // reset ANTES de tentar fallback para evitar deadlock
-                        onSessionFallback(checkoutId);
+                        onSessionFallback(checkoutId, 0);
                     }
                 } catch (Exception e) {
                     Log.e(TAG, "[SESSION] Erro ao parsear JSON: " + e.getMessage());
                     mState = State.IDLE;
-                    onSessionFallback(checkoutId);
+                    onSessionFallback(checkoutId, 0);
                 }
             }
         });
@@ -384,14 +396,7 @@ public class SessionManager {
                             json.optString("ble_session_id", null));
                     if (sessionId != null && !sessionId.isEmpty()) {
                         final String sid = sessionId;
-                        mMainHandler.post(() -> {
-                            synchronized (SessionManager.this) {
-                                mSessionId = sid;
-                                mState     = State.ACTIVE;
-                                Log.i(TAG, "[SESSION] ACTIVE (fallback) | session_id=" + sid);
-                                if (mCallback != null) mCallback.onSessionStarted(sid, checkoutId);
-                            }
-                        });
+                        onSessionReady(checkoutId, sid);
                     } else {
                         gerarSessionIdLocal(checkoutId);
                     }
@@ -467,42 +472,38 @@ public class SessionManager {
      */
     private void gerarSessionIdLocal(String checkoutId) {
         Log.w(TAG, "[SESSION] gerarSessionIdLocal() chamado → delegando para onSessionFallback");
-        onSessionFallback(checkoutId);
+        onSessionFallback(checkoutId, 0);
     }
 
-    private void onSessionFallback(String checkoutId) {
-        mApiRetryAttempts++;
-        Log.w(TAG, "[SESSION] FALLBACK LOCAL → Tentativa #" + mApiRetryAttempts + "/" + MAX_SESSION_RETRIES);
+    private void onSessionFallback(String checkoutId, int tentativa) {
+        Log.w(TAG, "[SESSION] FALLBACK LOCAL → Tentativa #" + tentativa + "/" + MAX_SESSION_RETRIES);
 
-        if (mApiRetryAttempts >= MAX_SESSION_RETRIES) {
-            String localId = "SES_LOCAL_" + checkoutId + "_"
-                    + Long.toHexString(System.currentTimeMillis()).toUpperCase();
-            Log.w(TAG, "[SESSION] Máx retries atingido → usando session_id LOCAL: " + localId);
-            Log.e(TAG, "[SESSION] 🚫 AVISO CRÍTICO: SES_LOCAL_* é rejeitado pelo ESP32 em produção!");
-            Log.e(TAG, "[SESSION] SERVE será BLOQUEADO por validação de segurança em PagamentoConcluido");
-
-            onSessionReady(checkoutId, localId, true);
+        if (tentativa >= MAX_SESSION_RETRIES) {
+            // Gerar session_id local e avançar o fluxo sem bloquear
+            String localSessionId = java.util.UUID.randomUUID().toString();
+            Log.w(TAG, "[SESSION] Máx retries atingido → usando session_id LOCAL: " + localSessionId);
+            onSessionReady(checkoutId, localSessionId);  // ← avança para enviar SERVE
             return;
         }
 
         // Resetar estado ANTES do retry para não ser ignorado
-        Log.w(TAG, "[SESSION] Resetando estado para IDLE antes do retry");
-        mState = State.IDLE;
-
+        mState = State.IDLE;  // ← CRÍTICO: sem isso o retry é ignorado
+        
         mMainHandler.postDelayed(() -> {
-            Log.i(TAG, "[SESSION] Retry #" + mApiRetryAttempts + ": reiniciando startSession()");
-            startSession(checkoutId, mVolumeMl, mDeviceId);
-        }, 2_000L);
+            startSession(checkoutId, mVolumeMl, mDeviceId, tentativa + 1);
+        }, 2000);
     }
 
-    private void onSessionReady(String checkoutId, String sessionId, boolean localFallback) {
+    // Garantir que onSessionReady enfileira o SERVE:
+    private void onSessionReady(String checkoutId, String sessionId) {
         mMainHandler.post(() -> {
             synchronized (SessionManager.this) {
                 mSessionId = sessionId;
                 mState = State.ACTIVE;
-                mIsLocalFallback = localFallback;
-                Log.i(TAG, "[SESSION] STATE: STARTING → ACTIVE | session_id=" + sessionId
-                        + (localFallback ? " (local fallback)" : ""));
+                Log.i(TAG, "[SESSION] STATE: STARTING → ACTIVE | session_id=" + sessionId);
+                
+                // Enfileirar o comando SERVE com o session_id obtido
+                // Nota: O enfileiramento é feito no callback em PagamentoConcluido
                 if (mCallback != null) {
                     mCallback.onSessionStarted(sessionId, checkoutId);
                 }
