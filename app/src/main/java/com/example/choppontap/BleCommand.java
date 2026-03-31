@@ -85,6 +85,9 @@ public class BleCommand {
         ERROR     // Erro (timeout, BUSY, watchdog, HMAC inválido, etc.)
     }
 
+    public static final String CMD_READY = "READY";
+    public static final String RESP_READY_OK = "READY_OK";
+
     // ── Códigos de erro do protocolo v2.0 ────────────────────────────────────
     public static final class ErrorCode {
         public static final String SESSION_MISMATCH   = "SESSION_MISMATCH";
@@ -190,6 +193,25 @@ public class BleCommand {
                 .replace("-", "")
                 .substring(0, 8)
                 .toUpperCase();
+    }
+
+    /**
+     * Gera o comando READY para inicializar emissões de SERVE.
+     * Formato: READY|<cmdId>|<sessionId>
+     */
+    public static String buildReady(String cmdId, String sessionId) {
+        if (cmdId == null) cmdId = generateCmdId();
+        if (sessionId == null) sessionId = "";
+        return CMD_READY + "|" + cmdId + "|" + sessionId;
+    }
+
+    /**
+     * Retorna o cmdId de mensagens em formato PIPE-separated.
+     */
+    public static String parseCmdId(String message) {
+        if (message == null) return null;
+        String[] parts = message.split("\\|");
+        return parts.length > 1 ? parts[1] : null;
     }
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -1467,6 +1467,13 @@ public class BluetoothServiceIndustrial extends Service {
             return;
         }
 
+        // ── READY_OK — pronto para SERVE (após READY + guard-band prévio no firmware) ─
+        if (data.startsWith("READY_OK")) {
+            Log.i(TAG, "[BLE] ESP32 reportou READY_OK");
+            broadcastData(data);
+            return;
+        }
+
         // ── BUSY — ESP32 ocupado ─────────────────────────────────────────────
         if (data.equals("BUSY") || data.startsWith("BUSY")) {
             Log.w(TAG, "[BLE] ESP32 BUSY — aguardando liberação");

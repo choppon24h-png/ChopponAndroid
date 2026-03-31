@@ -74,6 +74,13 @@ public class PagamentoConcluido extends AppCompatActivity {
     private String mActiveCommandId = null;
     private String mActiveSessionId = null;
 
+    // ── READY/SERVE pending state ─────────────────────────────────────────────
+    private int    mPendingVolumeMl = 0;
+    private String mPendingCmdId = null;
+    private String mPendingReadyCmdId = null;
+    private String mPendingSessionId = null;
+    private Runnable mReadyTimeoutRunnable = null;
+
     // ── Dados do pedido ───────────────────────────────────────────────────────
     private String checkout_id;
     private String android_id;
@@ -146,6 +153,13 @@ public class PagamentoConcluido extends AppCompatActivity {
 
     private void processarMensagem(String msg) {
         Log.d(TAG, "[ESP32] " + msg);
+
+        if (msg.startsWith("READY_OK")) {
+            String readyCmdId = BleCommand.parseCmdId(msg);
+            onReadyOk(readyCmdId);
+            return;
+        }
+
         if (msg.startsWith("QUEUE:")) {
             processarMensagemFila(msg);
             return;
@@ -184,30 +198,80 @@ public class PagamentoConcluido extends AppCompatActivity {
     }
 
     /**
-     * CORREÇÃO 3: Método alternativo direto para garantir envio de SERVE
-     * conforme protocolo BLE v2.0 com HMAC.
+     * CORREÇÃO 3: Envia READY primeiro e aguarda READY_OK antes do SERVE.
      */
     private void enfileirarSERVE(int volumeMl, String checkoutId, String sessionId) {
-        // Construir comando SERVE conforme protocolo BLE v2.0
         String cmdId = BleCommand.generateCmdId();
-        BleCommand cmd = new BleCommand(BleCommand.Type.SERVE, cmdId, sessionId, volumeMl);
-        String serve = "SERVE|" + volumeMl + "|" + cmdId + "|" + sessionId;
+        String readyCmdId = cmdId + "_RDY";
 
-        Log.i(TAG, "[SERVE] Enfileirando: " + serve);
-        // Usar envio direto via BluetoothService como fallback
+        mPendingVolumeMl = volumeMl;
+        mPendingCmdId = cmdId;
+        mPendingReadyCmdId = readyCmdId;
+        mPendingSessionId = sessionId;
+
+        mActiveCommandId = cmdId;
+        mActiveSessionId = sessionId;
+        if (mSessionManager != null) mSessionManager.setCommandId(mActiveCommandId);
+
+        String ready = BleCommand.buildReady(readyCmdId, sessionId);
+        Log.i(TAG, "[READY] Enviando: " + ready);
+
         if (mBluetoothService != null) {
-            mComandoEnviado = true;
-            mActiveCommandId = cmdId;
-            mActiveSessionId = sessionId;
-            // Registra o command_id no SessionManager para envio ao ERP
-            if (mSessionManager != null) mSessionManager.setCommandId(mActiveCommandId);
-
-            mBluetoothService.write(serve);
-            Log.i(TAG, "[SERVE] Comando enviado diretamente: " + serve);
-            atualizarStatus("⏳ Aguardando abertura da válvula...");
+            mBluetoothService.write(ready);
+            scheduleReadyOkTimeout();
+            atualizarStatus("⏳ Enviado READY, aguardando READY_OK...");
         } else {
-            Log.e(TAG, "[SERVE] BluetoothService nulo — não foi possível enviar SERVE");
+            Log.e(TAG, "[READY] BluetoothService nulo — Não foi possível enviar READY");
         }
+    }
+
+    private void scheduleReadyOkTimeout() {
+        cancelReadyOkTimeout();
+        mReadyTimeoutRunnable = () -> {
+            Log.e(TAG, "[READY_OK] Timeout de 3s atingido sem READY_OK");
+            atualizarStatus("❌ Timeout READY_OK");
+            mPendingReadyCmdId = null;
+            mPendingCmdId = null;
+            mPendingSessionId = null;
+            mComandoEnviado = false;
+        };
+        mMainHandler.postDelayed(mReadyTimeoutRunnable, 3000L);
+    }
+
+    private void cancelReadyOkTimeout() {
+        if (mReadyTimeoutRunnable != null) {
+            mMainHandler.removeCallbacks(mReadyTimeoutRunnable);
+            mReadyTimeoutRunnable = null;
+        }
+    }
+
+    private void onReadyOk(String readyCmdId) {
+        if (readyCmdId == null || mPendingReadyCmdId == null || !readyCmdId.equals(mPendingReadyCmdId)) {
+            Log.w(TAG, "[READY_OK] Ignorado: cmd mismatch (received=" + readyCmdId
+                    + ", pending=" + mPendingReadyCmdId + ")");
+            return;
+        }
+
+        cancelReadyOkTimeout();
+        Log.i(TAG, "[READY_OK] Recebido. Aguardando guard-band de 950ms...");
+
+        mMainHandler.postDelayed(() -> {
+            if (mPendingCmdId != null && mPendingSessionId != null) {
+                String serve = "SERVE|" + mPendingVolumeMl + "|" + mPendingCmdId + "|" + mPendingSessionId;
+                Log.i(TAG, "[SERVE] Enviando após READY_OK: " + serve);
+
+                if (mBluetoothService != null) {
+                    mComandoEnviado = true;
+                    mBluetoothService.write(serve);
+                    atualizarStatus("⏳ Aguardando ACK (válvula abrindo)...");
+                } else {
+                    Log.e(TAG, "[SERVE] BluetoothService nulo — não foi possível enviar SERVE");
+                }
+            }
+            mPendingReadyCmdId = null;
+            mPendingCmdId = null;
+            mPendingSessionId = null;
+        }, 950L);
     }
 
     private void iniciarVendaEEnfileirar() {
