@@ -141,7 +141,7 @@ public class ApiHelper {
     }
 
     // ── Configuração da API ───────────────────────────────────────────────────
-    private final String api = "https://ochoppoficial.com.br/api/";
+    private final String api = ApiConfig.getBaseUrl();
     // Chave JWT — DEVE ser idêntica a JWT_SECRET em php/includes/config.php
     private static final String JWT_SECRET = "teaste";
 

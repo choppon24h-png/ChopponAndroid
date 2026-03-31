@@ -15,10 +15,8 @@ import java.util.ArrayList;
 
 public class Sqlite  extends SQLiteOpenHelper {
     public static final String DB_NAME = "app.sqlite";
-    SQLiteDatabase db;
     public  Sqlite(@Nullable Context context) {
         super(context,DB_NAME,null,1);
-        db = getWritableDatabase();
     }
     @Override
     public void onCreate(SQLiteDatabase db) {
@@ -46,7 +44,7 @@ public class Sqlite  extends SQLiteOpenHelper {
 
     }
     public boolean insert(String table, String imagePath, Bitmap bmp) {
-        db = getWritableDatabase();
+        SQLiteDatabase db = getWritableDatabase();
 
         try {
             // Redimensionar imagem se muito grande (evita SQLiteBlobTooBigException)
@@ -87,31 +85,26 @@ public class Sqlite  extends SQLiteOpenHelper {
 
             Integer count = db.update(table, valueFalse, whereClauseDifferent, whereArgs);
 
-            db.close();
-
             Log.d("Sqlite_Insert", "Inserção bem-sucedida!");
             return insertResult;
 
         } catch (Exception e) {
             Log.e("Sqlite_Insert", "Erro ao inserir imagem: " + e.getMessage(), e);
-            db.close();
             return false;
         }
     }
     public boolean insertLog(String tipoLog, String log){
-        db = getWritableDatabase();
+        SQLiteDatabase db = getWritableDatabase();
 
         ContentValues value =  new ContentValues();
         value.put("tipo_log",tipoLog);
         value.put("log",log);
         value.put("enviado",false);
         Boolean insertResult =db.insert("logs",null,value) > 0;
-        db.close();
         return insertResult;
     }
     public boolean updateLog(Integer logId){
-        Boolean result = false;
-        db = getWritableDatabase();
+        SQLiteDatabase db = getWritableDatabase();
 
         ContentValues value =  new ContentValues();
         value.put("enviado",true);
@@ -120,13 +113,12 @@ public class Sqlite  extends SQLiteOpenHelper {
         String[] whereArgs = {String.valueOf(logId)};
         Integer count = db.update("logs",value,whereClause,whereArgs);
         if(count > 0){
-            result = true;
+            return true;
         }
-        db.close();
-        return result;
+        return false;
     }
     public ArrayList<Logs> getLogs(){
-        db = getWritableDatabase();
+        SQLiteDatabase db = getWritableDatabase();
         Cursor cursor = db.query("logs", new String[]{"id","tipo_log","log","created_at"},
                 "enviado = ?", new String[]{"0"},
                 null, null, null);
@@ -145,6 +137,9 @@ public class Sqlite  extends SQLiteOpenHelper {
 
             } while (cursor.moveToNext());
         }
+        if (cursor != null) {
+            cursor.close();
+        }
         if(dataList.size() > 0)
         {
             return dataList;
@@ -153,7 +148,7 @@ public class Sqlite  extends SQLiteOpenHelper {
     }
     public boolean update(String table,String imagePath, Boolean ativo) {
 
-        db = getWritableDatabase();
+        SQLiteDatabase db = getWritableDatabase();
         String whereClause = "file_name = ?";
         String whereClauseDifferent = "file_name <> ?";
         String[] whereArgs = {String.valueOf(imagePath)};
@@ -164,13 +159,12 @@ public class Sqlite  extends SQLiteOpenHelper {
         valueFalse.put("ativo",false);
         Integer count = db.update(table,valueFalse,whereClauseDifferent,whereArgs);
         Integer insertResult =db.update(table,value,whereClause,whereArgs);
-        db.close();
         return insertResult > 0;
     }
 
     public boolean tapCartao(Boolean ativo){
         Log.d("SQLITE_CARTAO", "=== tapCartao() chamado com ativo=" + ativo + " ===");
-        db = getWritableDatabase();
+        SQLiteDatabase db = getWritableDatabase();
 
         Cursor cursor = db.query("tapCartao", new String[]{"ativo"},
                 "", null,
@@ -202,13 +196,12 @@ public class Sqlite  extends SQLiteOpenHelper {
             Log.i("SQLITE_CARTAO", "UPDATE executado. Linhas afetadas: " + count + ", result=" + result);
         }
 
-        db.close();
         Log.d("SQLITE_CARTAO", "=== tapCartao() finalizado. Retornando: " + result + " ===");
         return result;
     }
 
     public boolean getCartaoEnabled(){
-        db = getWritableDatabase();
+        SQLiteDatabase db = getWritableDatabase();
         Cursor cursor = db.query("tapCartao", new String[]{"ativo"},
                 "", null,
                 null, null, null);
@@ -263,8 +256,6 @@ public class Sqlite  extends SQLiteOpenHelper {
         } catch (Exception e) {
             Log.e("Sqlite_Read", "Erro ao ler imagem: " + e.getMessage(), e);
             imageData = null;
-        } finally {
-            db.close();
         }
 
         return imageData;
@@ -296,7 +287,6 @@ public class Sqlite  extends SQLiteOpenHelper {
         } catch (Exception e) {
             Log.e("Sqlite_ActiveRead", "Erro geral: " + e.getMessage(), e);
         }
-        db.close();
         return imageData;
     }
 }

@@ -215,23 +215,23 @@ public class CalibrarPulsos extends AppCompatActivity {
             }
         });
 
-        // Liberar líquido: envia $ML:100 (libera 100ml para teste)
+        // Liberar líquido: envia SERVE|100|CALIBRATE|DUMMY (libera 100ml para teste)
         btnLiberar.setOnClickListener(v -> {
-            Log.d(TAG, "Enviando $ML:100 para teste de fluxo");
-            if (mBluetoothService != null) mBluetoothService.write("$ML:100");
+            Log.d(TAG, "Enviando SERVE|100|CALIBRATE|DUMMY para teste de fluxo");
+            if (mBluetoothService != null) mBluetoothService.write("SERVE|100|CALIBRATE|DUMMY");
         });
 
-        // Liberação contínua: alterna entre iniciar ($ML:9999) e parar ($ML:0)
+        // Liberação contínua: alterna entre iniciar (SERVE|9999|CALIBRATE|DUMMY) e parar (SERVE|0|CALIBRATE|DUMMY)
         btnLiberacaoContinua.setOnClickListener(v -> {
             if (mBluetoothService == null) return;
             if (!mLiberacaoContinuaAtiva) {
                 Log.d(TAG, "Iniciando liberação contínua");
-                mBluetoothService.write("$ML:9999");
+                mBluetoothService.write("SERVE|9999|CALIBRATE|DUMMY");
                 mLiberacaoContinuaAtiva = true;
                 btnLiberacaoContinua.setText("Parar liberação");
             } else {
                 Log.d(TAG, "Parando liberação contínua");
-                mBluetoothService.write("$ML:0");
+                mBluetoothService.write("SERVE|0|CALIBRATE|DUMMY");
                 mLiberacaoContinuaAtiva = false;
                 btnLiberacaoContinua.setText("Liberação continua");
             }

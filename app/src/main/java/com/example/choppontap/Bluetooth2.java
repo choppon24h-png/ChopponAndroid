@@ -141,7 +141,7 @@ public class Bluetooth2 extends BleManager {
 
         if (!connectedGattDevices.isEmpty()) {
             final Integer mlsSolicitado = qtd_ml;
-            String command = "$ML:" + qtd_ml.toString();
+            String command = "SERVE|" + qtd_ml.toString() + "|DUMMY|DUMMY";
             byte[] messageBytes = command.getBytes();
 
             BluetoothDevice device = connectedGattDevices.get(0);
@@ -282,7 +282,7 @@ public class Bluetooth2 extends BleManager {
         List<BluetoothDevice> connectedGattDevices = manager.getConnectedDevices(BluetoothProfile.GATT);
 
         if (!connectedGattDevices.isEmpty()) {
-            String command = "$ML:" + qtd_ml.toString();
+            String command = "SERVE|" + qtd_ml.toString() + "|DUMMY|DUMMY";
             byte[] messageBytes = command.getBytes();
 
             connect(connectedGattDevices.get(0)).done(d -> {

@@ -200,15 +200,16 @@ public class BleCommand {
      * Gera a string de comando BLE para envio ao ESP32 (protocolo v2.0).
      *
      * Formatos:
-     *   SERVE:   SERVE|<ml>|<CMD_ID>|<SESSION_ID>|<HMAC>
+     *   SERVE:   SERVE|<ml>|<CMD_ID>|<SESSION_ID>
      *   AUTH:    AUTH|<CMD_ID>|<SESSION_ID>|<HMAC>
      *   STOP:    STOP|<CMD_ID>|<SESSION_ID>|<HMAC>
      *   STATUS:  STATUS|<CMD_ID>
      *   PING:    PING|<CMD_ID>
      *
      * Compatibilidade retroativa:
-     *   O firmware ESP32 v2.0 aceita tanto o formato novo (com HMAC)
+     *   O firmware ESP32 v2.0 aceita tanto o formato novo (com HMAC para AUTH/STOP)
      *   quanto o formato legado (SERVE|<ml>|ID=<id>|SESSION=<session>).
+     *   Para SERVE, HMAC não é validado, então usa-se sem HMAC.
      *   Recomenda-se sempre usar o formato novo para segurança máxima.
      */
     public String toBleString() {
@@ -216,8 +217,8 @@ public class BleCommand {
 
         switch (type) {
             case SERVE:
-                // Protocolo v2.0: SERVE|<ml>|<CMD_ID>|<SESSION_ID>|<HMAC>
-                return "SERVE|" + volumeMl + "|" + commandId + "|" + sessionId + "|" + hmac;
+                // Protocolo v2.0: SERVE|<ml>|<CMD_ID>|<SESSION_ID>
+                return "SERVE|" + volumeMl + "|" + commandId + "|" + sessionId;
 
             case AUTH:
                 // Protocolo v2.0: AUTH|<CMD_ID>|<SESSION_ID>|<HMAC>

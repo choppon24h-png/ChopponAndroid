@@ -191,8 +191,7 @@ public class PagamentoConcluido extends AppCompatActivity {
         // Construir comando SERVE conforme protocolo BLE v2.0
         String cmdId = BleCommand.generateCmdId();
         BleCommand cmd = new BleCommand(BleCommand.Type.SERVE, cmdId, sessionId, volumeMl);
-        String hmac = cmd.generateHmacToken();
-        String serve = "SERVE|" + volumeMl + "|" + cmdId + "|" + sessionId + "|" + hmac;
+        String serve = "SERVE|" + volumeMl + "|" + cmdId + "|" + sessionId;
 
         Log.i(TAG, "[SERVE] Enfileirando: " + serve);
         // Usar envio direto via BluetoothService como fallback
@@ -343,7 +342,7 @@ public class PagamentoConcluido extends AppCompatActivity {
         Map<String, String> body = new HashMap<>();
         body.put("checkout_id", checkoutId);
         body.put("volume_ml", String.valueOf(volumeMl));
-        new ApiHelper(this).sendPost(body, "api/start_sale.php", new Callback() {
+        new ApiHelper(this).sendPost(body, "start_sale.php", new Callback() {
             @Override public void onFailure(Call call, IOException e) { mMainHandler.post(onSuccess); }
             @Override public void onResponse(Call call, Response response) throws IOException {
                 response.close();
@@ -356,7 +355,7 @@ public class PagamentoConcluido extends AppCompatActivity {
         Map<String, String> body = new HashMap<>();
         body.put("checkout_id", checkout_id);
         body.put("ml_dispensado", String.valueOf(mlDispensado));
-        new ApiHelper(this).sendPost(body, "api/finish_sale.php", new Callback() {
+        new ApiHelper(this).sendPost(body, "finish_sale.php", new Callback() {
             @Override public void onFailure(Call call, IOException e) {}
             @Override public void onResponse(Call call, Response response) throws IOException { response.close(); }
         });
