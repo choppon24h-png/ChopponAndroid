@@ -202,7 +202,8 @@ public class BluetoothServiceIndustrial extends Service {
                 Log.i(TAG, "[GUARD-BAND] READY recebido — APP aguardará "
                         + GUARD_BAND_MS + "ms antes de enviar SERVE");
                 Log.i(TAG, "[FLOW] Aguardando pagamento");
-                iniciarHeartbeat();
+                // Heartbeat só inicia quando sessão estiver disponível
+                // iniciarHeartbeat() será chamado em PagamentoConcluido.onReadyOk()
                 broadcastWriteReady();
                 // Drena fila de comandos pendentes (fila string interna)
                 mMainHandler.post(this::drainCommandQueue);
@@ -314,6 +315,7 @@ public class BluetoothServiceIndustrial extends Service {
     private static final long HEARTBEAT_INTERVAL_MS = 2_000L;  // PING a cada 2s
     private static final long HEARTBEAT_TIMEOUT_MS  = 10_000L; // timeout de resposta 10s
 
+    private String mHeartbeatSessionId = null;
     private Runnable mHeartbeatRunnable = null;
     private Runnable mHeartbeatTimeoutRunnable = null;
     private volatile boolean mWaitingPong = false;
@@ -1597,7 +1599,6 @@ public class BluetoothServiceIndustrial extends Service {
     // ═══════════════════════════════════════════════════════════════════════════
 
     private Runnable mHeartbeatTimeoutRunnableRef = null;
-    private String mHeartbeatSessionId = "";
 
     public void setHeartbeatSessionId(String sessionId) {
         mHeartbeatSessionId = sessionId != null ? sessionId : "";
@@ -1607,13 +1608,24 @@ public class BluetoothServiceIndustrial extends Service {
      * Inicia heartbeat: envia PING a cada 2s.
      * Se PONG não chegar em 10s: reconecta automaticamente.
      */
+    public void iniciarHeartbeat(String sessionId) {
+        mHeartbeatSessionId = sessionId;
+        Log.d(TAG, "[HEARTBEAT] Iniciando para sessão: " + sessionId);
+        iniciarHeartbeat();
+    }
+
     private void iniciarHeartbeat() {
         pararHeartbeat();
         if (!ENABLE_HEARTBEAT) {
             Log.i(TAG, "[HEARTBEAT] Desabilitado - ESP32 nao suporta PING");
             return;
         }
-        Log.d(TAG, "[HEARTBEAT] Iniciando heartbeat (interval=" + HEARTBEAT_INTERVAL_MS + "ms)");
+        if (mHeartbeatSessionId == null || mHeartbeatSessionId.isEmpty()) {
+            Log.d(TAG, "[HEARTBEAT] Sem sessão ativa — PING suprimido");
+            return;
+        }
+        Log.d(TAG, "[HEARTBEAT] Iniciando heartbeat (interval=" + HEARTBEAT_INTERVAL_MS + "ms) session=" + mHeartbeatSessionId);
+
         mHeartbeatRunnable = new Runnable() {
             @Override
             public void run() {
@@ -1653,13 +1665,15 @@ public class BluetoothServiceIndustrial extends Service {
         mMainHandler.postDelayed(mHeartbeatRunnable, HEARTBEAT_INTERVAL_MS);
     }
 
-    private void pararHeartbeat() {
+    public void pararHeartbeat() {
+        mHeartbeatSessionId = null;
         if (mHeartbeatRunnable != null) {
             mMainHandler.removeCallbacks(mHeartbeatRunnable);
             mHeartbeatRunnable = null;
         }
         cancelarHeartbeatTimeout();
         mWaitingPong = false;
+        Log.i(TAG, "[HEARTBEAT] Parado");
     }
 
     private void cancelarHeartbeatTimeout() {

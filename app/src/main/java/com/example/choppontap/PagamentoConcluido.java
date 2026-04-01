@@ -142,6 +142,7 @@ public class PagamentoConcluido extends AppCompatActivity {
                         atualizarStatus("🔄 Reconectando...");
                         cancelarWatchdog();
                         cancelarKeepalive();
+                        if (mBluetoothService != null) mBluetoothService.pararHeartbeat();
                     } else if ("connected".equals(status)) {
                         atualizarStatus("⏳ Autenticando...");
                     }
@@ -160,6 +161,9 @@ public class PagamentoConcluido extends AppCompatActivity {
 
         if (msg.startsWith("READY_OK")) {
             String readyCmdId = BleCommand.parseCmdId(msg);
+            if (mBluetoothService != null && mPendingSessionId != null) {
+                mBluetoothService.iniciarHeartbeat(mPendingSessionId);
+            }
             onReadyOk(readyCmdId);
             return;
         }
@@ -179,6 +183,7 @@ public class PagamentoConcluido extends AppCompatActivity {
         if (msg.startsWith("WARN:FLOW_TIMEOUT") || msg.startsWith("ERROR:FLOW_TIMEOUT")) {
             Log.w(TAG, "[KEEPALIVE] Fluxo timeout detectado, cancelando keepalive");
             cancelarKeepalive();
+            if (mBluetoothService != null) mBluetoothService.pararHeartbeat();
             return;
         }
 
@@ -203,6 +208,7 @@ public class PagamentoConcluido extends AppCompatActivity {
         if ("DONE".equals(parts[1])) {
             cancelarWatchdog();
             cancelarKeepalive();
+            if (mBluetoothService != null) mBluetoothService.pararHeartbeat();
             mLiberacaoFinalizada = true;
             mComandoEnviado = false;
             chamarFinishSale(liberado);
@@ -443,6 +449,14 @@ public class PagamentoConcluido extends AppCompatActivity {
         super.onPause();
         LocalBroadcastManager.getInstance(this).unregisterReceiver(mServiceUpdateReceiver);
         cancelarKeepalive();
+        if (mBluetoothService != null) mBluetoothService.pararHeartbeat();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        cancelarKeepalive();
+        if (mBluetoothService != null) mBluetoothService.pararHeartbeat();
     }
 
     @Override
