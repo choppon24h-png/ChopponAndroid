@@ -74,6 +74,9 @@ public class PagamentoConcluido extends AppCompatActivity {
     private String mActiveCommandId = null;
     private String mActiveSessionId = null;
 
+    private boolean mKeepaliveActive = false;
+    private Runnable mKeepaliveRunnable = null;
+
     // ── READY/SERVE pending state ─────────────────────────────────────────────
     private int    mPendingVolumeMl = 0;
     private String mPendingCmdId = null;
@@ -138,6 +141,7 @@ public class PagamentoConcluido extends AppCompatActivity {
                     if ("disconnected".equals(status)) {
                         atualizarStatus("🔄 Reconectando...");
                         cancelarWatchdog();
+                        cancelarKeepalive();
                     } else if ("connected".equals(status)) {
                         atualizarStatus("⏳ Autenticando...");
                     }
@@ -164,6 +168,20 @@ public class PagamentoConcluido extends AppCompatActivity {
             processarMensagemFila(msg);
             return;
         }
+
+        if (msg.startsWith("ACK|")) {
+            String ackCmdId = msg.substring(4).trim();
+            Log.i(TAG, "[ACK] Recebido cmd=" + ackCmdId + ", iniciando keepalive PING");
+            iniciarKeepalive();
+            return;
+        }
+
+        if (msg.startsWith("WARN:FLOW_TIMEOUT") || msg.startsWith("ERROR:FLOW_TIMEOUT")) {
+            Log.w(TAG, "[KEEPALIVE] Fluxo timeout detectado, cancelando keepalive");
+            cancelarKeepalive();
+            return;
+        }
+
         if (msg.startsWith("VP:")) {
             resetarWatchdog();
             try {
@@ -184,6 +202,7 @@ public class PagamentoConcluido extends AppCompatActivity {
         if (parts.length < 2) return;
         if ("DONE".equals(parts[1])) {
             cancelarWatchdog();
+            cancelarKeepalive();
             mLiberacaoFinalizada = true;
             mComandoEnviado = false;
             chamarFinishSale(liberado);
@@ -195,6 +214,39 @@ public class PagamentoConcluido extends AppCompatActivity {
                 }, HOME_NAVIGATE_DELAY_MS);
             });
         }
+    }
+
+    private void iniciarKeepalive() {
+        if (mKeepaliveActive || mBluetoothService == null || mActiveSessionId == null || mLiberacaoFinalizada) return;
+        mKeepaliveActive = true;
+
+        if (mKeepaliveRunnable != null) {
+            mMainHandler.removeCallbacks(mKeepaliveRunnable);
+        }
+
+        mKeepaliveRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (!mKeepaliveActive || mBluetoothService == null || mActiveSessionId == null) return;
+
+                String pingCmdId = "HB_" + System.currentTimeMillis();
+                String ping = BleCommand.buildPing(pingCmdId, mActiveSessionId);
+                Log.i(TAG, "[KEEPALIVE] Enviando PING: " + ping);
+                mBluetoothService.write(ping);
+
+                mMainHandler.postDelayed(this, 2000L);
+            }
+        };
+
+        mMainHandler.post(mKeepaliveRunnable);
+    }
+
+    private void cancelarKeepalive() {
+        if (mKeepaliveRunnable != null) {
+            mMainHandler.removeCallbacks(mKeepaliveRunnable);
+            mKeepaliveRunnable = null;
+        }
+        mKeepaliveActive = false;
     }
 
     /**
@@ -324,6 +376,9 @@ public class PagamentoConcluido extends AppCompatActivity {
                     public void onSessionStarted(String sessionId, String checkoutId) {
                         Log.i(TAG, "[SESSION] Sessão iniciada | session_id=" + sessionId);
                         mActiveSessionId = sessionId;
+                        if (mBluetoothService != null) {
+                            mBluetoothService.setHeartbeatSessionId(sessionId);
+                        }
                         // CORREÇÃO 3: Usar método direto para garantir envio de SERVE
                         enfileirarSERVE(qtd_ml, checkoutId, sessionId);
                     }
@@ -387,12 +442,14 @@ public class PagamentoConcluido extends AppCompatActivity {
     protected void onPause() {
         super.onPause();
         LocalBroadcastManager.getInstance(this).unregisterReceiver(mServiceUpdateReceiver);
+        cancelarKeepalive();
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
         cancelarWatchdog();
+        cancelarKeepalive();
         mMainHandler.removeCallbacksAndMessages(null);
         if (currentImageTask != null) currentImageTask.cancel(true);
         imageExecutor.shutdown();

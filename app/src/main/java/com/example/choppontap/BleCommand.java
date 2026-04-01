@@ -206,6 +206,15 @@ public class BleCommand {
     }
 
     /**
+     * Gera comando PING v2.0 (com sessionId). Formato: PING|<cmdId>|<sessionId>
+     */
+    public static String buildPing(String cmdId, String sessionId) {
+        if (cmdId == null) cmdId = "HB_" + System.currentTimeMillis();
+        if (sessionId == null) sessionId = "";
+        return "PING|" + cmdId + "|" + sessionId;
+    }
+
+    /**
      * Retorna o cmdId de mensagens em formato PIPE-separated.
      */
     public static String parseCmdId(String message) {

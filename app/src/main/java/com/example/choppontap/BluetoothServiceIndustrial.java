@@ -310,8 +310,8 @@ public class BluetoothServiceIndustrial extends Service {
     // REQUISITO 7 — Heartbeat PING/PONG
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private static final boolean ENABLE_HEARTBEAT = false;
-    private static final long HEARTBEAT_INTERVAL_MS = 5_000L;  // PING a cada 5s
+    private static final boolean ENABLE_HEARTBEAT = true;
+    private static final long HEARTBEAT_INTERVAL_MS = 2_000L;  // PING a cada 2s
     private static final long HEARTBEAT_TIMEOUT_MS  = 10_000L; // timeout de resposta 10s
 
     private Runnable mHeartbeatRunnable = null;
@@ -1206,12 +1206,11 @@ public class BluetoothServiceIndustrial extends Service {
         transitionTo(State.CONNECTED);
         broadcastConnectionStatus("connected");
 
-        // v2.3.0 FIX: HIGH (timeout=5000ms) derruba o BLE no ESP32-C3 single-core
-        // durante dispensação. BALANCED usa timeout=6000ms e interval=30-50ms,
-        // suficiente para manter link estável sem saturar o single-core.
-        boolean priOk = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED);
-        Log.i(TAG, "[GATT] requestConnectionPriority(BALANCED) → " + (priOk ? "OK" : "FALHOU"));
-        Log.i(TAG, "[GATT] timeout=6000ms para ESP32-C3 single-core");
+        // v2.3.0 FIX: HIGH (timeout ~20s) reduz risco de supervision timeout 5s.
+        // Mantém baixo interval e evita quedas durante dispensa longa.
+        boolean priOk = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
+        Log.i(TAG, "[GATT] requestConnectionPriority(HIGH) → " + (priOk ? "OK" : "FALHOU"));
+        Log.i(TAG, "[GATT] timeout~20s para link mais estável durante dispensa");
 
         // REQUISITO 10 — MTU 512 (necessário para comandos longos)
         boolean mtuOk = gatt.requestMtu(512);
@@ -1598,9 +1597,14 @@ public class BluetoothServiceIndustrial extends Service {
     // ═══════════════════════════════════════════════════════════════════════════
 
     private Runnable mHeartbeatTimeoutRunnableRef = null;
+    private String mHeartbeatSessionId = "";
+
+    public void setHeartbeatSessionId(String sessionId) {
+        mHeartbeatSessionId = sessionId != null ? sessionId : "";
+    }
 
     /**
-     * Inicia heartbeat: envia PING a cada 5s.
+     * Inicia heartbeat: envia PING a cada 2s.
      * Se PONG não chegar em 10s: reconecta automaticamente.
      */
     private void iniciarHeartbeat() {
@@ -1622,9 +1626,11 @@ public class BluetoothServiceIndustrial extends Service {
                     logBleHandles("heartbeat");
                     return;
                 }
-                Log.d(TAG, "[HEARTBEAT] Enviando PING");
+                String pingCmdId = "HB_" + System.currentTimeMillis();
+                String ping = BleCommand.buildPing(pingCmdId, mHeartbeatSessionId);
+                Log.d(TAG, "[HEARTBEAT] Enviando PING: " + ping);
                 mWaitingPong = true;
-                writeImediato(PING_COMMAND);
+                writeImediato(ping);
 
                 // Timeout de resposta: 10s
                 mHeartbeatTimeoutRunnableRef = () -> {
