@@ -194,6 +194,7 @@ public class BluetoothServiceIndustrial extends Service {
                 mReconnectAttempts = 0;
                 mReconnectDelay    = BACKOFF_DELAYS[0];
                 mAuthRetryCount    = 0;
+                mTotalFailures     = 0;  // v2.3.1 FIX: reset contador de falhas ao conectar
                 // ═══════════════════════════════════════════════════════════════════
                 // GUARD-BAND: Registar timestamp do READY para sincronização do app
                 // ═══════════════════════════════════════════════════════════════════
@@ -289,6 +290,14 @@ public class BluetoothServiceIndustrial extends Service {
 
     /** Número máximo de reconexões antes de forçar closeGatt() e reiniciar do zero. */
     private static final int MAX_RECONNECT_BEFORE_RESET = 3;
+
+    /**
+     * v2.3.1 FIX: Número máximo de falhas totais antes de limpar o MAC salvo e fazer scan.
+     * Resolve o problema de MAC antigo gravado em SharedPreferences após troca de dispositivo.
+     * Após 10 falhas consecutivas sem sucesso, o MAC é descartado e um novo scan é iniciado.
+     */
+    private static final int MAX_FAILURES_BEFORE_MAC_RESET = 10;
+    private int mTotalFailures = 0;  // contador de falhas totais (resetado ao conectar)
 
     private long mReconnectDelay    = BACKOFF_DELAYS[0];
     private int  mReconnectAttempts = 0;
@@ -731,6 +740,28 @@ public class BluetoothServiceIndustrial extends Service {
             mReconnectAttempts = 0;
             mBackoffIndex      = 0;
             mReconnectDelay    = BACKOFF_DELAYS[0];
+        }
+
+        // v2.3.1 FIX: após MAX_FAILURES_BEFORE_MAC_RESET falhas totais sem conectar,
+        // limpa o MAC salvo e inicia scan do zero. Resolve o problema de MAC antigo
+        // gravado em SharedPreferences após troca de dispositivo ESP32.
+        mTotalFailures++;
+        if (mTotalFailures >= MAX_FAILURES_BEFORE_MAC_RESET && mTargetMac != null) {
+            Log.w(TAG, "[MAC] " + mTotalFailures + " falhas consecutivas ao MAC "
+                    + mTargetMac + " — limpando MAC e iniciando scan para encontrar novo ESP32");
+            mTotalFailures = 0;
+            mTargetMac = null;
+            getSharedPreferences("tap_config", Context.MODE_PRIVATE)
+                    .edit().remove("esp32_mac").apply();
+            closeGatt();
+            mReconnectRunnable = () -> {
+                mReconnectRunnable = null;
+                if (!mAutoReconnect) return;
+                Log.i(TAG, "[MAC] Iniciando scan após reset de MAC");
+                iniciarScanComRetry();
+            };
+            mMainHandler.postDelayed(mReconnectRunnable, 2_000L);
+            return;
         }
 
         mReconnectRunnable = () -> {
@@ -2119,6 +2150,28 @@ public class BluetoothServiceIndustrial extends Service {
         disconnect();
         mAutoReconnect = true;
         iniciarScanComRetry();
+    }
+
+    /**
+     * v2.3.1 FIX: Atualiza o MAC alvo externamente (chamado pelo Home/Imei quando a API
+     * retorna um MAC diferente do salvo). Reconecta imediatamente ao novo MAC.
+     * Resolve o problema de novo Android compilado com MAC antigo em SharedPreferences.
+     */
+    public void salvarMacExterno(String mac) {
+        if (mac == null || mac.isEmpty()) return;
+        if (mac.equalsIgnoreCase(mTargetMac)) {
+            Log.d(TAG, "[MAC] salvarMacExterno: MAC já é o mesmo (" + mac + ") — sem ação");
+            return;
+        }
+        Log.w(TAG, "[MAC] salvarMacExterno: atualizando MAC " + mTargetMac + " → " + mac);
+        salvarMac(mac);
+        // Se estiver tentando conectar ao MAC errado, desconecta e reconecta ao correto
+        if (mState == State.CONNECTING || mState == State.CONNECTED || mState == State.READY) {
+            Log.w(TAG, "[MAC] Desconectando do MAC antigo para reconectar ao novo: " + mac);
+            disconnect();
+        }
+        mAutoReconnect = true;
+        agendarConexaoDireta(mac);
     }
 
     /**

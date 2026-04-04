@@ -306,14 +306,15 @@ public class PagamentoConcluido extends AppCompatActivity {
     private void scheduleReadyOkTimeout() {
         cancelReadyOkTimeout();
         mReadyTimeoutRunnable = () -> {
-            Log.e(TAG, "[READY_OK] Timeout de 3s atingido sem READY_OK");
-            atualizarStatus("❌ Timeout READY_OK");
+            // v2.3.1 FIX: timeout aumentado de 3s para 8s para suportar lentidão do BLE
+            Log.e(TAG, "[READY_OK] Timeout de 8s atingido sem READY_OK");
+            atualizarStatus("❌ Timeout READY_OK — BLE lento ou desconectado");
             mPendingReadyCmdId = null;
             mPendingCmdId = null;
             mPendingSessionId = null;
             mComandoEnviado = false;
         };
-        mMainHandler.postDelayed(mReadyTimeoutRunnable, 3000L);
+        mMainHandler.postDelayed(mReadyTimeoutRunnable, 8000L);  // v2.3.1: 3s → 8s
     }
 
     private void cancelReadyOkTimeout() {

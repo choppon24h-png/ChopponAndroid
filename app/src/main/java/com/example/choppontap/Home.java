@@ -431,7 +431,26 @@ public class Home extends AppCompatActivity {
                     Log.i(TAG, "verify_tap OK: bebida=" + tap.bebida
                             + " preco=" + tap.preco
                             + " image=" + tap.image
-                            + " tap_status=" + tap.tap_status);
+                            + " tap_status=" + tap.tap_status
+                            + " esp32_mac=" + tap.esp32_mac);
+
+                    // v2.3.1 FIX: sincroniza o MAC salvo com o retornado pela API.
+                    // Resolve o problema de novo Android compilado com MAC antigo em
+                    // SharedPreferences (de outro dispositivo ou sessao anterior).
+                    if (tap.esp32_mac != null && !tap.esp32_mac.isEmpty()) {
+                        String macAtual = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
+                                .getString("esp32_mac", null);
+                        if (!tap.esp32_mac.equalsIgnoreCase(macAtual)) {
+                            Log.w(TAG, "[MAC] MAC desatualizado! API=" + tap.esp32_mac
+                                    + " | Salvo=" + macAtual + " → atualizando");
+                            getSharedPreferences("tap_config", Context.MODE_PRIVATE)
+                                    .edit().putString("esp32_mac", tap.esp32_mac).apply();
+                            // Notifica o BluetoothService para usar o novo MAC imediatamente
+                            if (mBluetoothService != null) {
+                                mBluetoothService.salvarMacExterno(tap.esp32_mac);
+                            }
+                        }
+                    }
 
                     boolean cartaoHabilitado = (tap.cartao != null) && tap.cartao;
                     new Sqlite(getApplicationContext()).tapCartao(cartaoHabilitado);
