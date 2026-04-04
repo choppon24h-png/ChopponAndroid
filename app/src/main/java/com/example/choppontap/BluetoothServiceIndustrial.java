@@ -1239,10 +1239,11 @@ public class BluetoothServiceIndustrial extends Service {
         transitionTo(State.CONNECTED);
         broadcastConnectionStatus("connected");
 
-        // v2.3.0 FIX: HIGH (timeout ~20s) reduz risco de supervision timeout 5s.
-        // Mantém baixo interval e evita quedas durante dispensa longa.
-        boolean priOk = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
-        Log.i(TAG, "[GATT] requestConnectionPriority(HIGH) → " + (priOk ? "OK" : "FALHOU"));
+        // v2.4.0 FIX: BALANCED aumenta o supervision timeout para ~20s no Android.
+        // HIGH forca o timeout para 5s (500 * 10ms), causando queda de conexao (status 133)
+        // durante a dispensacao se o ESP32 estiver ocupado com interrupcoes do sensor de fluxo.
+        boolean priOk = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED);
+        Log.i(TAG, "[GATT] requestConnectionPriority(BALANCED) → " + (priOk ? "OK" : "FALHOU"));
         Log.i(TAG, "[GATT] timeout~20s para link mais estável durante dispensa");
 
         // REQUISITO 10 — MTU 512 (necessário para comandos longos)
