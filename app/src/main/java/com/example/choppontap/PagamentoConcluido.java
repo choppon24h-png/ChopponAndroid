@@ -132,7 +132,11 @@ public class PagamentoConcluido extends AppCompatActivity {
                     long guardBandDelay = ML_SEND_DELAY_MS;
                     atualizarStatus("✓ Dispositivo autenticado. Liberando...");
                     mMainHandler.postDelayed(() -> {
-                        if (!mComandoEnviado) iniciarVendaEEnfileirar();
+                        // Se o comando foi enviado mas não finalizou, permite reenvio na reconexão
+                        if (!mComandoEnviado || (!mLiberacaoFinalizada && liberado == 0)) {
+                            mComandoEnviado = false; // Reseta para permitir reenvio
+                            iniciarVendaEEnfileirar();
+                        }
                     }, guardBandDelay);
                     break;
 

@@ -50,7 +50,7 @@ public class CommandQueue {
     private static final String TAG = "BLE_CMD_QUEUE";
 
     public static final int  MAX_QUEUE_SIZE  = 10;
-    private static final long ACK_TIMEOUT_MS  = 2_000L;
+    private static final long ACK_TIMEOUT_MS  = 8_000L; // Aumentado de 2s para 8s para suportar lentidão do BLE
     private static final long DONE_TIMEOUT_MS = 15_000L;  // aumentado de 10s para 15s (sensor de fluxo)
     public static final int  MAX_RETRIES     = 2;
 
