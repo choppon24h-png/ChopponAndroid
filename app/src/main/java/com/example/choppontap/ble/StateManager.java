@@ -3,8 +3,17 @@ package com.example.choppontap.ble;
 import android.util.Log;
 
 /**
- * Gerenciador de estado da máquina BLE
- * Previne transições inválidas e race conditions
+ * Gerenciador de estado da máquina BLE — Protocolo NUS v4.0
+ *
+ * Fluxo de estados:
+ *   IDLE → CONNECTING → CONNECTED → READY → PROCESSING → COMPLETED → READY
+ *                          ↓           ↓         ↓
+ *                       ERROR       DISCONNECTED  ERROR
+ *                          ↓           ↓
+ *                        IDLE       CONNECTING
+ *
+ * CONNECTED: GATT conectado, serviço NUS descoberto, aguardando notificações.
+ * READY:     Notificações habilitadas. Pronto para enviar comandos.
  */
 public class StateManager {
     private BleState currentState = BleState.IDLE;
@@ -49,7 +58,9 @@ public class StateManager {
     }
 
     public synchronized boolean isConnected() {
-        return currentState == BleState.READY || currentState == BleState.PROCESSING;
+        return currentState == BleState.CONNECTED
+                || currentState == BleState.READY
+                || currentState == BleState.PROCESSING;
     }
 
     public synchronized void reset() {
@@ -63,22 +74,50 @@ public class StateManager {
     }
 
     private boolean isValidTransition(BleState from, BleState to) {
-        // Define transições válidas
         switch (from) {
             case IDLE:
-                return to == BleState.CONNECTING || to == BleState.DISCONNECTED;
+                return to == BleState.CONNECTING
+                        || to == BleState.DISCONNECTED;
+
             case CONNECTING:
-                return to == BleState.READY || to == BleState.ERROR || to == BleState.IDLE;
+                // CONNECTED: GATT conectado, serviços descobertos
+                // READY: fallback direto (sem etapa CONNECTED explícita)
+                return to == BleState.CONNECTED
+                        || to == BleState.READY
+                        || to == BleState.ERROR
+                        || to == BleState.DISCONNECTED
+                        || to == BleState.IDLE;
+
+            case CONNECTED:
+                // Após habilitar notificações NUS → READY
+                return to == BleState.READY
+                        || to == BleState.ERROR
+                        || to == BleState.DISCONNECTED;
+
             case READY:
-                return to == BleState.PROCESSING || to == BleState.DISCONNECTED || to == BleState.IDLE;
+                return to == BleState.PROCESSING
+                        || to == BleState.DISCONNECTED
+                        || to == BleState.IDLE;
+
             case PROCESSING:
-                return to == BleState.COMPLETED || to == BleState.ERROR || to == BleState.DISCONNECTED;
+                return to == BleState.COMPLETED
+                        || to == BleState.ERROR
+                        || to == BleState.DISCONNECTED;
+
             case COMPLETED:
-                return to == BleState.READY || to == BleState.IDLE || to == BleState.DISCONNECTED;
+                return to == BleState.READY
+                        || to == BleState.IDLE
+                        || to == BleState.DISCONNECTED;
+
             case ERROR:
-                return to == BleState.IDLE || to == BleState.CONNECTING || to == BleState.DISCONNECTED;
+                return to == BleState.IDLE
+                        || to == BleState.CONNECTING
+                        || to == BleState.DISCONNECTED;
+
             case DISCONNECTED:
-                return to == BleState.IDLE || to == BleState.CONNECTING;
+                return to == BleState.IDLE
+                        || to == BleState.CONNECTING;
+
             default:
                 return false;
         }
