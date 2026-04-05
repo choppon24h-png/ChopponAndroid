@@ -2,27 +2,38 @@ package com.example.choppontap;
 
 /*
  * ═══════════════════════════════════════════════════════════════════════════════
- * BluetoothServiceIndustrial.java — Serviço BLE Padrão Industrial 24/7
+ * BluetoothServiceIndustrial.java — Serviço BLE NUS v5.0 (Simplificado)
  * ═══════════════════════════════════════════════════════════════════════════════
  *
- * Versão: 4.0-NUS
+ * Versão: 5.0-NUS-SIMPLE
  * Protocolo: Nordic UART Service (NUS) sobre BLE — Firmware ESP32 operacional.cpp
  * Target: ESP32 CHOPP Self-Service
  * Compatibilidade: Android 8+ (API 26+), Android 12+ permissões, Android 14 FGS
  *
  * ═══════════════════════════════════════════════════════════════════════════════
- * MÁQUINA DE ESTADOS
+ * FLUXO ÚNICO DE CONEXÃO
  * ═══════════════════════════════════════════════════════════════════════════════
  *
- *   DISCONNECTED ──scan──► SCANNING ──mac_found──► CONNECTING ──gatt──► CONNECTED
- *        ▲                                                                    │
- *        │                                                              discoverServices
- *        │                                                                    │
- *        │                                                          habilitarNotificacoes
- *        │                                                                    │
- *        └──────────────────── reconexão ◄──────────────────────────── READY ◄┘
- *                                                                         │
- *                                                                    ERROR (fatal)
+ *   API retorna MAC
+ *       ↓
+ *   connectWithMac(mac)
+ *       ↓
+ *   iniciarBondEConectar(device)
+ *       ├─ BOND_BONDED  → conectarGatt()
+ *       ├─ BOND_BONDING → aguarda ACTION_BOND_STATE_CHANGED
+ *       └─ BOND_NONE    → createBond() → PIN 259087 → BOND_BONDED → conectarGatt()
+ *       ↓
+ *   onConnectionStateChange(CONNECTED)
+ *       ↓
+ *   requestConnectionPriority(HIGH) + requestMtu(247)
+ *       ↓
+ *   onMtuChanged() → discoverServices()
+ *       ↓
+ *   onServicesDiscovered() → enableNotifications()
+ *       ↓
+ *   onDescriptorWrite() → READY
+ *       ↓
+ *   Comunicação fluida ($ML:, $PL:, $TO:, $LB:)
  *
  * ═══════════════════════════════════════════════════════════════════════════════
  * PROTOCOLO DE COMUNICAÇÃO (Firmware ESP32 operacional.cpp)
@@ -45,6 +56,16 @@ package com.example.choppontap;
  *   AUTENTICAÇÃO: Via BLE Pairing/Bonding com PIN 259087
  *   NÃO existe: HMAC, SESSION_ID, CMD_ID, AUTH, SERVE, STOP, STATUS, PING,
  *               ACK, DONE, AUTH:OK/FAIL, PONG, READY/READY_OK
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * REGRAS DO FLUXO (NÃO VIOLAR)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ *   1. NÃO conectar sem bond confirmado (BOND_BONDED)
+ *   2. NÃO usar scan automático — só via connectWithMac(mac)
+ *   3. NÃO usar timeout durante bonding
+ *   4. NÃO usar autoConnect=true como fallback agressivo
+ *   5. READY só é verdadeiro após notify habilitado com sucesso
  *
  * ═══════════════════════════════════════════════════════════════════════════════
  */
@@ -109,25 +130,19 @@ public class BluetoothServiceIndustrial extends Service {
 
     private static final String TAG = "BLE_INDUSTRIAL";
 
-    // FIX: Singleton para evitar múltiplas instâncias
+    /** Singleton — evita múltiplas instâncias do serviço. */
     private static BluetoothServiceIndustrial sInstance = null;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Máquina de estados
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Estados possíveis do serviço BLE industrial.
-     * Toda transição é feita exclusivamente via {@link #transitionTo(State)}.
-     */
     public enum State {
-        /** Sem conexão ativa. */
+        /** Sem conexão ativa. Estado inicial e após desconexão. */
         DISCONNECTED,
-        /** Scan BLE ativo procurando dispositivos CHOPP_*. */
-        SCANNING,
         /** connectGatt() foi chamado; aguardando STATE_CONNECTED. */
         CONNECTING,
-        /** GATT conectado; discoverServices em andamento ou MTU sendo negociado. */
+        /** GATT conectado; discoverServices/MTU em andamento. */
         CONNECTED,
         /** Notificações habilitadas. Pronto para receber comandos. */
         READY,
@@ -135,12 +150,8 @@ public class BluetoothServiceIndustrial extends Service {
         ERROR
     }
 
-    /** Estado atual — acesso apenas via {@link #transitionTo(State)} e {@link #getState()}. */
     private volatile State mState = State.DISCONNECTED;
 
-    /**
-     * Transiciona para um novo estado com log detalhado.
-     */
     private void transitionTo(State newState) {
         State old = mState;
         if (old == newState) return;
@@ -155,51 +166,40 @@ public class BluetoothServiceIndustrial extends Service {
                 mWriteBusy.set(false);
                 mReadyTimestamp = 0;
                 break;
-            case SCANNING:
-                break;
-            case CONNECTING:
-                break;
-            case CONNECTED:
-                break;
             case READY:
-                mReconnectAttempts  = 0;
-                mReconnectDelay     = BACKOFF_DELAYS[0];
-                mTotalFailures      = 0;
-                mAutoConnectFallback = false; // Resetar fallback ao conectar com sucesso
+                mReconnectAttempts = 0;
+                mBackoffIndex = 0;
                 mReadyTimestamp = System.currentTimeMillis();
-                Log.i(TAG, "[STATE] READY [timestamp=" + mReadyTimestamp + "]");
-                Log.i(TAG, "[FLOW] Aguardando pagamento");
+                Log.i(TAG, "[STATE] READY — aguardando pagamento");
                 broadcastWriteReady();
                 mMainHandler.post(this::drainCommandQueue);
                 break;
             case ERROR:
                 pararReconexao();
-                Log.e(TAG, "[INDUSTRIAL] Estado ERROR — verifique bond e firmware ESP32");
+                Log.e(TAG, "[STATE] ERROR — verifique bond e firmware ESP32");
+                break;
+            default:
                 break;
         }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Constantes de protocolo
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /** Prefixo do nome BLE do ESP32. Apenas dispositivos com este prefixo são aceitos. */
-    public static final String BLE_NAME_PREFIX = "CHOPP_";
-
-    // ═══════════════════════════════════════════════════════════════════════════
     // UUIDs NUS (Nordic UART Service) — Firmware ESP32 operaBLE.cpp
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /** Prefixo do nome BLE do ESP32. */
+    public static final String BLE_NAME_PREFIX = "CHOPP_";
+
     private static final UUID NUS_SERVICE_UUID           = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
-    /** RX do ESP32 — Android escreve aqui para enviar dados ao ESP32. */
+    /** RX do ESP32 — Android escreve aqui. */
     private static final UUID NUS_RX_CHARACTERISTIC_UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
     /** TX do ESP32 — Android recebe notificações aqui. */
     private static final UUID NUS_TX_CHARACTERISTIC_UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
-    /** Client Characteristic Configuration Descriptor — habilita notificações. */
+    /** CCCD — habilita notificações. */
     private static final UUID CCCD_UUID                  = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Ações de Broadcast (compatíveis com BluetoothService legado)
+    // Ações de Broadcast
     // ═══════════════════════════════════════════════════════════════════════════
 
     public static final String ACTION_DATA_AVAILABLE    = "com.example.choppontap.ACTION_DATA_AVAILABLE";
@@ -214,40 +214,31 @@ public class BluetoothServiceIndustrial extends Service {
     public static final String EXTRA_BLE_STATE = "com.example.choppontap.EXTRA_BLE_STATE";
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Códigos de status GATT (anti-bug Android)
+    // Códigos de status GATT
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private static final int STATUS_CONN_TIMEOUT     = 0x08;  // 8
-    private static final int STATUS_CONN_TERMINATE   = 0x13;  // 19
-    private static final int STATUS_CONN_FAIL        = 0x3E;  // 62
-    private static final int STATUS_CONN_257         = 257;
-    private static final int STATUS_GATT_ERROR       = 133;
-    private static final int STATUS_AUTH_FAIL        = 0x89;  // 137
+    private static final int STATUS_CONN_TIMEOUT   = 0x08;
+    private static final int STATUS_CONN_TERMINATE = 0x13;
+    private static final int STATUS_CONN_FAIL      = 0x3E;
+    private static final int STATUS_CONN_257       = 257;
+    private static final int STATUS_GATT_ERROR     = 133;
+    private static final int STATUS_AUTH_FAIL      = 0x89;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Backoff exponencial de reconexão
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private static final long[] BACKOFF_DELAYS = { 2_000L, 4_000L, 8_000L, 15_000L };
-    private static final int MAX_RECONNECT_BEFORE_RESET = 3;
-    private static final int MAX_FAILURES_BEFORE_MAC_RESET = 10;
-    private int mTotalFailures = 0;
-
-    private long mReconnectDelay    = BACKOFF_DELAYS[0];
+    /** Delays de backoff: 3s, 6s, 12s, 20s */
+    private static final long[] BACKOFF_DELAYS = { 3_000L, 6_000L, 12_000L, 20_000L };
     private int  mReconnectAttempts = 0;
     private int  mBackoffIndex      = 0;
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Delay inteligente antes de conectar (800–1200ms)
+    // Timeout de bond
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private static final long CONNECT_DELAY_MIN_MS = 800L;
-    private static final long CONNECT_DELAY_MAX_MS = 1_200L;
-
-    private long randomConnectDelay() {
-        return CONNECT_DELAY_MIN_MS
-                + (long)(Math.random() * (CONNECT_DELAY_MAX_MS - CONNECT_DELAY_MIN_MS));
-    }
+    /** Timeout para aguardar o bond completar (30s — suficiente para PIN manual). */
+    private static final long BOND_TIMEOUT_MS = 30_000L;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // GUARD-BAND — Sincronização após READY
@@ -255,15 +246,6 @@ public class BluetoothServiceIndustrial extends Service {
 
     private static final long GUARD_BAND_MS = 900L;
     private volatile long mReadyTimestamp = 0;
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Timeouts gerais
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private static final long BOND_TIMEOUT_MS = 15_000L;
-    private static final long SCAN_TIMEOUT_MS = 15_000L;
-    private static final long SCAN_RETRY_DELAY_MS = 5_000L;
-    private static final long CONNECT_TIMEOUT_MS = 20_000L; // Aumentado: bond+connect pode levar 15s
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Campos internos — BLE
@@ -277,14 +259,13 @@ public class BluetoothServiceIndustrial extends Service {
 
     private String  mTargetMac;
     private boolean mAutoReconnect = true;
-    private boolean mScanning      = false;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Fila de comandos (apenas 1 write por vez)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private final Queue<String> mCommandQueue = new ArrayDeque<>();
-    private final AtomicBoolean mWriteBusy = new AtomicBoolean(false);
+    private final Queue<String>  mCommandQueue = new ArrayDeque<>();
+    private final AtomicBoolean  mWriteBusy    = new AtomicBoolean(false);
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Handlers e Runnables
@@ -292,24 +273,7 @@ public class BluetoothServiceIndustrial extends Service {
 
     private final Handler mMainHandler         = new Handler(Looper.getMainLooper());
     private Runnable      mReconnectRunnable   = null;
-    private Runnable      mScanStopRunnable    = null;
     private Runnable      mBondTimeoutRunnable = null;
-    private Runnable      mConnectTimeoutRunnable = null;
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // MACs em validação
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private final java.util.Set<String> mMacsValidando = new java.util.HashSet<>();
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Fallback autoConnect=true após N falhas consecutivas
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /** Após este número de falhas, usa autoConnect=true para deixar o Android gerenciar. */
-    private static final int AUTO_CONNECT_FALLBACK_THRESHOLD = 5;
-    /** Flag que ativa autoConnect=true como fallback. Resetado ao atingir READY. */
-    private boolean mAutoConnectFallback = false;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Binder
@@ -342,16 +306,14 @@ public class BluetoothServiceIndustrial extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-
         try {
             if (sInstance != null) {
-                Log.w(TAG, "[INDUSTRIAL] Serviço BLE já está rodando! Abortando onCreate duplicado.");
+                Log.w(TAG, "[SERVICE] Serviço BLE já está rodando — abortando duplicata");
                 stopSelf();
                 return;
             }
-
             sInstance = this;
-            Log.i(TAG, "[SERVICE] SERVICE CREATED - BluetoothServiceIndustrial v4.0 NUS SINGLETON iniciado");
+            Log.i(TAG, "[SERVICE] BluetoothServiceIndustrial v5.0-NUS-SIMPLE iniciado");
 
             criarNotificacaoForeground();
 
@@ -362,7 +324,7 @@ public class BluetoothServiceIndustrial extends Service {
             // Carrega MAC salvo de sessão anterior
             mTargetMac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
                     .getString("esp32_mac", null);
-            Log.i(TAG, "[INDUSTRIAL] MAC salvo: " + (mTargetMac != null ? mTargetMac : "nenhum"));
+            Log.i(TAG, "[SERVICE] MAC salvo: " + (mTargetMac != null ? mTargetMac : "nenhum"));
 
             // Registra receivers de pareamento e bond
             IntentFilter pf = new IntentFilter(BluetoothDevice.ACTION_PAIRING_REQUEST);
@@ -377,12 +339,12 @@ public class BluetoothServiceIndustrial extends Service {
                 registerReceiver(mBondStateReceiver, bf);
             }
 
-            Log.i(TAG, "[INDUSTRIAL] Service iniciado. Iniciando conexão BLE...");
-            iniciarConexao();
+            // NÃO inicia conexão aqui.
+            // A conexão só inicia quando connectWithMac(mac) for chamado.
+            Log.i(TAG, "[SERVICE] Aguardando connectWithMac(mac) para iniciar conexão BLE");
+
         } catch (Exception e) {
-            Log.e(TAG, "[SERVICE] CRASH no onCreate do Service BLE!");
-            Log.e(TAG, "[SERVICE] Exception: " + e.getClass().getName() + " - " + e.getMessage());
-            Log.e(TAG, "[SERVICE] StackTrace:", e);
+            Log.e(TAG, "[SERVICE] CRASH no onCreate: " + e.getMessage(), e);
             sInstance = null;
         }
     }
@@ -394,487 +356,144 @@ public class BluetoothServiceIndustrial extends Service {
 
     @Override
     public void onDestroy() {
-        Log.i(TAG, "[SERVICE] SERVICE DESTROYED - limpando singleton");
+        Log.i(TAG, "[SERVICE] SERVICE DESTROYED");
         sInstance = null;
         mAutoReconnect = false;
         pararReconexao();
-        pararScan();
         cancelarBondTimeout();
         try { unregisterReceiver(mPairingReceiver);   } catch (Exception ignored) {}
         try { unregisterReceiver(mBondStateReceiver); } catch (Exception ignored) {}
-        if (mBluetoothGatt != null) {
-            mBluetoothGatt.disconnect();
-            mBluetoothGatt.close();
-            mBluetoothGatt = null;
-        }
+        closeGatt();
         transitionTo(State.DISCONNECTED);
         super.onDestroy();
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Singleton methods
+    // Singleton
     // ═══════════════════════════════════════════════════════════════════════════
 
-    public static BluetoothServiceIndustrial getInstance() {
-        return sInstance;
-    }
-
-    public static boolean isRunning() {
-        return sInstance != null;
-    }
+    public static BluetoothServiceIndustrial getInstance() { return sInstance; }
+    public static boolean isRunning() { return sInstance != null; }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Ponto de entrada: iniciar conexão
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private void iniciarConexao() {
-        if (!mAutoReconnect) {
-            Log.d(TAG, "[INDUSTRIAL] autoReconnect=false — conexão não iniciada");
-            return;
-        }
-        if (!mBluetoothAdapter.isEnabled()) {
-            Log.w(TAG, "[INDUSTRIAL] Bluetooth desativado — aguardando ativação");
-            return;
-        }
-        if (mTargetMac != null) {
-            Log.i(TAG, "[INDUSTRIAL] MAC conhecido: " + mTargetMac + " — verificando bond antes de conectar");
-            // CORREÇÃO CRÍTICA: sempre verificar bond antes de conectar.
-            // O ESP32 com PIN 259087 requer BOND_BONDED antes de aceitar conexão GATT.
-            // Usar agendarConexaoDireta() sem bond causa loop de timeout (8s) infinito.
-            if (hasConnectPermission()) {
-                BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mTargetMac);
-                iniciarBondEConectar(device);
-            } else {
-                Log.w(TAG, "[INDUSTRIAL] BLUETOOTH_CONNECT não concedida — agendando retry em 5s");
-                mMainHandler.postDelayed(this::iniciarConexao, 5_000L);
-            }
-        } else {
-            Log.i(TAG, "[INDUSTRIAL] Sem MAC — iniciando scan BLE por CHOPP_*");
-            iniciarScanComRetry();
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Proteção contra dupla conexão
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private boolean podeConectar() {
-        State s = mState;
-        if (s == State.CONNECTING || s == State.CONNECTED || s == State.READY) {
-            Log.w(TAG, "[INDUSTRIAL] podeConectar() → BLOQUEADO (estado=" + s.name() + ")");
-            return false;
-        }
-        return true;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Verificação de permissão BLUETOOTH_CONNECT (Android 12+)
+    // PONTO DE ENTRADA ÚNICO: connectWithMac(mac)
     // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Verifica se a permissão BLUETOOTH_CONNECT foi concedida (Android 12+).
-     * No Android 11 e abaixo, a permissão não existe e retorna true.
+     * Ponto de entrada principal para conexão BLE.
+     * Deve ser chamado após a API retornar o MAC do ESP32.
      *
-     * CORREÇÃO CRÍTICA: No Android 12+, TODAS as operações GATT exigem
-     * BLUETOOTH_CONNECT: connectGatt(), getBondState(), createBond(),
-     * setPin(), setPairingConfirmation(), getConnectedDevices(), etc.
-     * Sem essa verificação, o sistema lança SecurityException fatal.
+     * Fluxo:
+     *   connectWithMac(mac) → iniciarBondEConectar() → GATT → READY
+     *
+     * @param mac endereço MAC do ESP32 (ex: "DC:B4:D9:99:B8:E2")
      */
-    private boolean hasConnectPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) { // Android 12+
-            boolean granted = checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT)
-                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
-            if (!granted) {
-                Log.e(TAG, "[PERM] BLUETOOTH_CONNECT NÃO concedida — operação GATT bloqueada");
-            }
-            return granted;
+    public void connectWithMac(String mac) {
+        if (mac == null || mac.isEmpty()) {
+            Log.e(TAG, "[CONNECT] connectWithMac() — MAC inválido");
+            return;
         }
-        return true; // Android 11 e abaixo: permissão não existe
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Delay inteligente antes de conectar
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private void agendarConexaoDireta(String mac) {
-        long delay = randomConnectDelay();
-        Log.i(TAG, "[INDUSTRIAL] Agendando conexão em " + delay + "ms → " + mac);
-        mMainHandler.postDelayed(() -> {
-            if (!podeConectar()) return;
-            // CORREÇÃO CRÍTICA: verificar BLUETOOTH_CONNECT antes de getRemoteDevice/connectGatt
-            if (!hasConnectPermission()) {
-                Log.w(TAG, "[INDUSTRIAL] BLUETOOTH_CONNECT não concedida — agendando retry em 5s");
-                mMainHandler.postDelayed(() -> agendarConexaoDireta(mac), 5_000L);
-                return;
-            }
-            BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mac);
-            conectarGatt(device);
-        }, delay);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Conexão BLE (autoConnect=false, TRANSPORT_LE)
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private void conectarGatt(BluetoothDevice device) {
-        if (!podeConectar()) return;
-
-        // CORREÇÃO CRÍTICA: BLUETOOTH_CONNECT é obrigatório para connectGatt() e getBondState()
         if (!hasConnectPermission()) {
-            Log.w(TAG, "[GATT] BLUETOOTH_CONNECT não concedida — conectarGatt() abortado");
+            Log.e(TAG, "[CONNECT] BLUETOOTH_CONNECT não concedida — aguardando permissão");
+            // Agenda retry em 3s — quando a permissão for concedida, Imei.java
+            // chamará connectWithMac() novamente via startBleServiceIfPermitted()
+            mMainHandler.postDelayed(() -> connectWithMac(mac), 3_000L);
             return;
         }
-
-        transitionTo(State.CONNECTING);
-        iniciarTimeoutConexao(device);
-        Log.i(TAG, "[GATT] conectarGatt() → " + device.getAddress()
-                + " | bond=" + bondStateName(device.getBondState())
-                + " | tentativa=" + (mReconnectAttempts + 1));
-
-        if (mBluetoothGatt != null
-                && mBluetoothGatt.getDevice().getAddress()
-                        .equalsIgnoreCase(device.getAddress())) {
-            Log.i(TAG, "[GATT] GATT existente → gatt.connect() (reconexão rápida)");
-            boolean ok = mBluetoothGatt.connect();
-            Log.i(TAG, "[GATT] gatt.connect() → " + (ok ? "OK" : "FALHOU — criando novo GATT"));
-            if (ok) return;
-            closeGatt();
-        } else if (mBluetoothGatt != null) {
-            Log.i(TAG, "[GATT] GATT de outro MAC — fechando antes de criar novo");
-            closeGatt();
-        }
-
-        // Após AUTO_CONNECT_FALLBACK_THRESHOLD falhas, ativa autoConnect=true:
-        // o Android gerencia a reconexão automaticamente quando o ESP32 anunciar.
-        if (mTotalFailures >= AUTO_CONNECT_FALLBACK_THRESHOLD) {
-            mAutoConnectFallback = true;
-        }
-        boolean useAutoConnect = mAutoConnectFallback;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Log.i(TAG, "[GATT] connectGatt(autoConnect=" + useAutoConnect + ", TRANSPORT_LE) → " + device.getAddress());
-            mBluetoothGatt = device.connectGatt(
-                    this, useAutoConnect, mGattCallback, BluetoothDevice.TRANSPORT_LE);
-        } else {
-            Log.i(TAG, "[GATT] connectGatt(autoConnect=" + useAutoConnect + ") → " + device.getAddress());
-            mBluetoothGatt = device.connectGatt(this, useAutoConnect, mGattCallback);
-        }
-
-        if (mBluetoothGatt == null) {
-            cancelarTimeoutConexao();
-            Log.e(TAG, "[GATT] connectGatt() retornou null — reagendando reconexão");
-            transitionTo(State.DISCONNECTED);
-            reconectarComBackoff();
-        }
-    }
-
-    private void iniciarTimeoutConexao(BluetoothDevice device) {
-        cancelarTimeoutConexao();
-        final String mac = device != null ? device.getAddress() : "desconhecido";
-        mConnectTimeoutRunnable = () -> {
-            if (mState == State.CONNECTING) {
-                Log.e(TAG, "[BLE] Timeout conexão (" + CONNECT_TIMEOUT_MS + "ms) → reconectando | mac=" + mac);
-                closeGatt();
-                transitionTo(State.DISCONNECTED);
-                reconectarComBackoff();
-            }
-        };
-        mMainHandler.postDelayed(mConnectTimeoutRunnable, CONNECT_TIMEOUT_MS);
-    }
-
-    private void cancelarTimeoutConexao() {
-        if (mConnectTimeoutRunnable != null) {
-            mMainHandler.removeCallbacks(mConnectTimeoutRunnable);
-            mConnectTimeoutRunnable = null;
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Reconexão industrial com backoff exponencial
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private void reconectarComBackoff() {
-        Log.i(TAG, "[RECONNECT] Tentativa de reconexão automática iniciada");
-        if (!mAutoReconnect) return;
-        if (mReconnectRunnable != null) {
-            Log.d(TAG, "[INDUSTRIAL] Reconexão já agendada — ignorando duplicata");
-            return;
-        }
-
-        mReconnectAttempts++;
-        mReconnectDelay = BACKOFF_DELAYS[Math.min(mBackoffIndex, BACKOFF_DELAYS.length - 1)];
-        mBackoffIndex   = Math.min(mBackoffIndex + 1, BACKOFF_DELAYS.length - 1);
-
-        Log.i(TAG, "[INDUSTRIAL] Reconexão #" + mReconnectAttempts
-                + " em " + mReconnectDelay + "ms"
-                + " (backoff index=" + mBackoffIndex + ")");
-
-        if (mReconnectAttempts >= MAX_RECONNECT_BEFORE_RESET) {
-            Log.w(TAG, "[INDUSTRIAL] " + mReconnectAttempts
-                    + " reconexões consecutivas — forçando closeGatt() e reiniciando");
-            closeGatt();
-            mReconnectAttempts = 0;
-            mBackoffIndex      = 0;
-            mReconnectDelay    = BACKOFF_DELAYS[0];
-        }
-
-        mTotalFailures++;
-        if (mTotalFailures >= MAX_FAILURES_BEFORE_MAC_RESET && mTargetMac != null) {
-            Log.w(TAG, "[MAC] " + mTotalFailures + " falhas consecutivas ao MAC "
-                    + mTargetMac + " — limpando MAC e iniciando scan para encontrar novo ESP32");
-            mTotalFailures = 0;
-            mTargetMac = null;
-            getSharedPreferences("tap_config", Context.MODE_PRIVATE)
-                    .edit().remove("esp32_mac").apply();
-            closeGatt();
-            mReconnectRunnable = () -> {
-                mReconnectRunnable = null;
-                if (!mAutoReconnect) return;
-                Log.i(TAG, "[MAC] Iniciando scan após reset de MAC");
-                iniciarScanComRetry();
-            };
-            mMainHandler.postDelayed(mReconnectRunnable, 2_000L);
-            return;
-        }
-
-        mReconnectRunnable = () -> {
-            mReconnectRunnable = null;
-            if (!mAutoReconnect) return;
-            if (mTargetMac != null) {
-                Log.i(TAG, "[INDUSTRIAL] Reconectando → " + mTargetMac + " (via bond check)");
-                // CORREÇÃO: sempre verificar bond antes de reconectar.
-                // Sem bond, o ESP32 com PIN 259087 rejeita silenciosamente a conexão GATT.
-                if (hasConnectPermission()) {
-                    BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mTargetMac);
-                    iniciarBondEConectar(device);
-                } else {
-                    Log.w(TAG, "[INDUSTRIAL] BLUETOOTH_CONNECT não concedida — retry em 5s");
-                    mMainHandler.postDelayed(() -> reconectarComBackoff(), 5_000L);
-                }
-            } else {
-                Log.i(TAG, "[INDUSTRIAL] Sem MAC — reiniciando scan");
-                iniciarScanComRetry();
-            }
-        };
-        mMainHandler.postDelayed(mReconnectRunnable, mReconnectDelay);
-    }
-
-    private void pararReconexao() {
-        if (mReconnectRunnable != null) {
-            mMainHandler.removeCallbacks(mReconnectRunnable);
-            mReconnectRunnable = null;
-            Log.d(TAG, "[INDUSTRIAL] Reconexão cancelada");
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Scan BLE
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private void iniciarScanComRetry() {
-        if (!mAutoReconnect) return;
-        if (mTargetMac != null) {
-            Log.i(TAG, "[SCAN] MAC disponível durante retry → verificando bond antes de conectar");
-            if (hasConnectPermission()) {
-                BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mTargetMac);
-                iniciarBondEConectar(device);
-            } else {
-                agendarConexaoDireta(mTargetMac); // fallback sem permissão
-            }
-            return;
-        }
-        iniciarScan();
-    }
-
-    private void iniciarScan() {
-        if (mScanning || mBleScanner == null) return;
         if (!mBluetoothAdapter.isEnabled()) {
-            Log.w(TAG, "[SCAN] Bluetooth desativado — scan cancelado");
+            Log.w(TAG, "[CONNECT] Bluetooth desativado — aguardando ativação");
             return;
         }
 
-        // CORREÇÃO CRÍTICA Android 12+: verificar BLUETOOTH_SCAN antes de startScan().
-        // Sem esta verificação, o serviço lança SecurityException se a permissão
-        // ainda não foi concedida (ex: primeira abertura do app).
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (checkSelfPermission(android.Manifest.permission.BLUETOOTH_SCAN)
-                    != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                Log.w(TAG, "[SCAN] BLUETOOTH_SCAN não concedido — scan adiado. "
-                        + "Aguardando permissão do usuário em Imei.java");
-                // Agenda retry: quando a permissão for concedida, Imei.java inicia
-                // o serviço novamente via startBleServiceIfPermitted(). Mas caso
-                // o serviço já esteja rodando, tentamos novamente em 5s.
-                mMainHandler.postDelayed(() -> {
-                    if (mAutoReconnect) iniciarConexao();
-                }, 5_000L);
-                return;
-            }
+        Log.i(TAG, "[CONNECT] connectWithMac(" + mac + ")");
+        salvarMac(mac);
+        mAutoReconnect = true;
+
+        // Se já está conectado/conectando ao mesmo MAC, não faz nada
+        if ((mState == State.CONNECTING || mState == State.CONNECTED || mState == State.READY)
+                && mac.equalsIgnoreCase(mTargetMac)) {
+            Log.i(TAG, "[CONNECT] Já conectado/conectando ao MAC " + mac + " — ignorando");
+            return;
         }
 
-        synchronized (mMacsValidando) { mMacsValidando.clear(); }
-        mScanning = true;
-        transitionTo(State.SCANNING);
-        Log.i(TAG, "[SCAN] Iniciando scan BLE por CHOPP_*");
-        broadcastConnectionStatus("scanning");
-        mBleScanner.startScan(mScanCallback);
-
-        mScanStopRunnable = () -> {
-            if (mScanning) {
-                Log.w(TAG, "[SCAN] Timeout " + SCAN_TIMEOUT_MS / 1000
-                        + "s — nenhum CHOPP_ encontrado. Retry em "
-                        + SCAN_RETRY_DELAY_MS / 1000 + "s");
-                pararScan();
-                broadcastConnectionStatus("scan_timeout");
-                if (mAutoReconnect && mTargetMac == null) {
-                    mMainHandler.postDelayed(() -> {
-                        if (mAutoReconnect && mTargetMac == null) {
-                            iniciarScanComRetry();
-                        } else if (mAutoReconnect && mTargetMac != null) {
-                            if (hasConnectPermission()) {
-                                BluetoothDevice dev = mBluetoothAdapter.getRemoteDevice(mTargetMac);
-                                iniciarBondEConectar(dev);
-                            } else {
-                                agendarConexaoDireta(mTargetMac);
-                            }
-                        }
-                    }, SCAN_RETRY_DELAY_MS);
-                }
-            }
-        };
-        mMainHandler.postDelayed(mScanStopRunnable, SCAN_TIMEOUT_MS);
-    }
-
-    private void pararScan() {
-        if (!mScanning) return;
-        mScanning = false;
-        if (mScanStopRunnable != null) {
-            mMainHandler.removeCallbacks(mScanStopRunnable);
-            mScanStopRunnable = null;
-        }
-        if (mBleScanner != null) {
-            try { mBleScanner.stopScan(mScanCallback); } catch (Exception e) {
-                Log.w(TAG, "[SCAN] stopScan() erro: " + e.getMessage());
-            }
-        }
-        Log.i(TAG, "[SCAN] Scan parado");
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // ScanCallback — filtra CHOPP_* e valida MAC na API
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private final ScanCallback mScanCallback = new ScanCallback() {
-        @Override
-        public void onScanResult(int callbackType, ScanResult result) {
-            BluetoothDevice device = result.getDevice();
-            String name = device.getName();
-            if (name == null || name.isEmpty()) return;
-            if (!name.startsWith(BLE_NAME_PREFIX)) return;
-
-            String mac = device.getAddress();
-            Log.i(TAG, "[SCAN] Dispositivo encontrado: " + name + " | " + mac);
-
-            synchronized (mMacsValidando) {
-                if (mMacsValidando.contains(mac)) return;
-                mMacsValidando.add(mac);
-            }
-            validarMacNaApi(device);
-        }
-
-        @Override
-        public void onScanFailed(int errorCode) {
-            Log.e(TAG, "[SCAN] Falhou com código: " + errorCode);
-            mScanning = false;
+        // Se está conectado a outro MAC, desconecta primeiro
+        if (mState != State.DISCONNECTED) {
+            Log.i(TAG, "[CONNECT] Desconectando MAC anterior para conectar ao novo: " + mac);
+            closeGatt();
             transitionTo(State.DISCONNECTED);
         }
-    };
+
+        pararReconexao();
+        BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mac);
+        iniciarBondEConectar(device);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Bond → GATT (fluxo único)
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Valida o MAC BLE na API verify_tap_mac.php.
+     * Verifica o estado de bond e age de acordo:
+     *   BOND_BONDED  → conectarGatt() imediatamente
+     *   BOND_BONDING → aguarda ACTION_BOND_STATE_CHANGED
+     *   BOND_NONE    → createBond() com PIN 259087 → aguarda BOND_BONDED → conectarGatt()
      */
-    private void validarMacNaApi(BluetoothDevice device) {
-        final String mac = device.getAddress();
-        final String androidId = Settings.Secure.getString(
-                getContentResolver(), Settings.Secure.ANDROID_ID);
-        new Thread(() -> {
-            try {
-                String token = gerarJwtToken();
-                OkHttpClient client = new OkHttpClient.Builder()
-                        .connectTimeout(10, TimeUnit.SECONDS)
-                        .readTimeout(15, TimeUnit.SECONDS)
-                        .build();
-                okhttp3.RequestBody body = new FormBody.Builder()
-                        .add("android_id", androidId != null ? androidId : "")
-                        .add("mac", mac)
-                        .build();
-                Request request = new Request.Builder()
-                        .url("https://ochoppoficial.com.br/api/verify_tap_mac.php")
-                        .header("token", token)
-                        .post(body)
-                        .build();
-                try (Response response = client.newCall(request).execute()) {
-                    String responseBody = response.body() != null
-                            ? response.body().string() : "";
-                    Log.d(TAG, "[SCAN] verify_tap_mac: HTTP " + response.code()
-                            + " | " + responseBody);
-                    if (response.isSuccessful() && responseBody.contains("\"valid\":true")) {
-                        Log.i(TAG, "[SCAN] MAC válido: " + mac + " — conectando");
-                        mMainHandler.post(() -> {
-                            pararScan();
-                            salvarMac(mac);
-                            iniciarBondEConectar(device);
-                        });
-                    } else {
-                        Log.i(TAG, "[SCAN] MAC inválido — ignorando: " + mac);
-                        synchronized (mMacsValidando) { mMacsValidando.remove(mac); }
-                    }
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "[SCAN] Erro ao validar MAC: " + e.getMessage());
-                synchronized (mMacsValidando) { mMacsValidando.remove(mac); }
-            }
-        }).start();
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Bond (pareamento) — PIN 259087
-    // ═══════════════════════════════════════════════════════════════════════════
-
     private void iniciarBondEConectar(BluetoothDevice device) {
-        // CORREÇÃO CRÍTICA: getBondState() e createBond() exigem BLUETOOTH_CONNECT no Android 12+
-        if (!hasConnectPermission()) {
-            Log.w(TAG, "[BOND] BLUETOOTH_CONNECT não concedida — pulando bond, conectando direto");
-            agendarConexaoDireta(device.getAddress());
+        if (device == null) {
+            Log.e(TAG, "[BOND] device null — abortando");
             return;
         }
+        if (!hasConnectPermission()) {
+            Log.e(TAG, "[BOND] BLUETOOTH_CONNECT não concedida — abortando");
+            return;
+        }
+
         int bondState = device.getBondState();
-        Log.i(TAG, "[BOND] iniciarBondEConectar() | bond=" + bondStateName(bondState)
-                + " | mac=" + device.getAddress());
+        Log.i(TAG, "[BOND] iniciarBondEConectar | mac=" + device.getAddress()
+                + " | bond=" + bondStateName(bondState));
+
         switch (bondState) {
             case BluetoothDevice.BOND_BONDED:
-                Log.i(TAG, "[BOND] Bond já existe → agendando conexão GATT");
-                agendarConexaoDireta(device.getAddress());
+                Log.i(TAG, "[BOND] Dispositivo já pareado → conectarGatt()");
+                conectarGatt(device);
                 break;
+
             case BluetoothDevice.BOND_BONDING:
-                Log.i(TAG, "[BOND] Bond em andamento → aguardando BOND_STATE_CHANGED");
-                iniciarTimeoutBond(device);
+                Log.i(TAG, "[BOND] Bond em andamento → aguardando ACTION_BOND_STATE_CHANGED");
+                iniciarBondTimeout(device);
                 break;
-            default: // BOND_NONE
-                Log.i(TAG, "[BOND] BOND_NONE → createBond() com PIN 259087");
+
+            case BluetoothDevice.BOND_NONE:
+            default:
+                Log.i(TAG, "[BOND] Sem bond → createBond() com PIN 259087");
+                iniciarBondTimeout(device);
                 boolean ok = device.createBond();
                 Log.i(TAG, "[BOND] createBond() → " + (ok ? "INICIADO" : "FALHOU"));
-                iniciarTimeoutBond(device);
+                if (!ok) {
+                    // createBond() falhou — tenta conectar diretamente (alguns dispositivos não precisam)
+                    Log.w(TAG, "[BOND] createBond() falhou — tentando conectarGatt() diretamente");
+                    cancelarBondTimeout();
+                    conectarGatt(device);
+                }
                 break;
         }
     }
 
-    private void iniciarTimeoutBond(BluetoothDevice device) {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Timeout de bond (não timeout de conexão GATT)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void iniciarBondTimeout(BluetoothDevice device) {
         cancelarBondTimeout();
         mBondTimeoutRunnable = () -> {
-            Log.e(TAG, "[BOND] Timeout " + BOND_TIMEOUT_MS / 1000
-                    + "s — forçando connectGatt() sem bond");
-            agendarConexaoDireta(device.getAddress());
+            Log.w(TAG, "[BOND] Timeout " + BOND_TIMEOUT_MS / 1000 + "s — bond não completou. "
+                    + "Tentando conectarGatt() diretamente");
+            // Após timeout de bond, tenta conectar mesmo assim
+            // (o ESP32 pode já ter o bond de uma sessão anterior)
+            conectarGatt(device);
         };
         mMainHandler.postDelayed(mBondTimeoutRunnable, BOND_TIMEOUT_MS);
+        Log.d(TAG, "[BOND] Bond timeout agendado: " + BOND_TIMEOUT_MS + "ms");
     }
 
     private void cancelarBondTimeout() {
@@ -884,20 +503,40 @@ public class BluetoothServiceIndustrial extends Service {
         }
     }
 
-    private boolean isBleStackPronto() {
-        return mBluetoothGatt != null
-                && mWriteCharacteristic != null
-                && mNotifyCharacteristic != null;
-    }
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BroadcastReceiver — Bond state
+    // ═══════════════════════════════════════════════════════════════════════════
 
-    private void logBleHandles(String origem) {
-        Log.d(TAG, "[BLE] " + origem + " | gatt=" + mBluetoothGatt);
-        Log.d(TAG, "[BLE] " + origem + " | writeCharacteristic=" + mWriteCharacteristic);
-        Log.d(TAG, "[BLE] " + origem + " | notifyCharacteristic=" + mNotifyCharacteristic);
-    }
+    private final BroadcastReceiver mBondStateReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(intent.getAction())) return;
+            BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+            if (device == null) return;
+            if (mTargetMac != null && !device.getAddress().equalsIgnoreCase(mTargetMac)) return;
+
+            int bondState    = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1);
+            int prevBondState = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, -1);
+
+            Log.i(TAG, "[BOND] STATE_CHANGED | mac=" + device.getAddress()
+                    + " | " + bondStateName(prevBondState) + " → " + bondStateName(bondState));
+
+            if (bondState == BluetoothDevice.BOND_BONDED) {
+                Log.i(TAG, "[BOND] BOND_BONDED ✓ → conectarGatt()");
+                cancelarBondTimeout();
+                mMainHandler.post(() -> conectarGatt(device));
+
+            } else if (bondState == BluetoothDevice.BOND_NONE
+                    && prevBondState == BluetoothDevice.BOND_BONDING) {
+                Log.e(TAG, "[BOND] Bond FALHOU — reagendando reconexão com backoff");
+                cancelarBondTimeout();
+                mMainHandler.post(() -> reconectarComBackoff());
+            }
+        }
+    };
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Receiver: ACTION_PAIRING_REQUEST — injeta PIN 259087 automaticamente
+    // BroadcastReceiver — Pairing request (PIN automático)
     // ═══════════════════════════════════════════════════════════════════════════
 
     private final BroadcastReceiver mPairingReceiver = new BroadcastReceiver() {
@@ -905,101 +544,149 @@ public class BluetoothServiceIndustrial extends Service {
         public void onReceive(Context context, Intent intent) {
             if (!BluetoothDevice.ACTION_PAIRING_REQUEST.equals(intent.getAction())) return;
             BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-            int variant = intent.getIntExtra(BluetoothDevice.EXTRA_PAIRING_VARIANT, -1);
-            Log.i(TAG, "[PAIRING] ACTION_PAIRING_REQUEST | device="
-                    + (device != null ? device.getAddress() : "null")
-                    + " | variant=" + variant);
             if (device == null) return;
+            if (mTargetMac != null && !device.getAddress().equalsIgnoreCase(mTargetMac)) return;
 
-            // CORREÇÃO CRÍTICA: setPin() e setPairingConfirmation() exigem BLUETOOTH_CONNECT no Android 12+
+            int pairingType = intent.getIntExtra(BluetoothDevice.EXTRA_PAIRING_VARIANT, -1);
+            Log.i(TAG, "[PAIR] PAIRING_REQUEST | mac=" + device.getAddress()
+                    + " | type=" + pairingType);
+
             if (!hasConnectPermission()) {
-                Log.e(TAG, "[PAIRING] BLUETOOTH_CONNECT não concedida — não é possível confirmar pareamento");
+                Log.e(TAG, "[PAIR] BLUETOOTH_CONNECT não concedida — PIN não pode ser injetado");
                 return;
             }
 
-            // PIN do firmware ESP32: 259087
-            byte[] pinBytes = "259087".getBytes(StandardCharsets.UTF_8);
-
-            switch (variant) {
-                case BluetoothDevice.PAIRING_VARIANT_PIN: {
-                    boolean ok = device.setPin(pinBytes);
-                    Log.i(TAG, "[PAIRING] PIN_VARIANT → setPin(259087) -> "
-                            + (ok ? "ACEITO" : "REJEITADO"));
-                    abortBroadcast();
-                    break;
-                }
-                case BluetoothDevice.PAIRING_VARIANT_PASSKEY_CONFIRMATION:
+            try {
+                if (pairingType == BluetoothDevice.PAIRING_VARIANT_PIN) {
+                    device.setPin("259087".getBytes(StandardCharsets.UTF_8));
+                    Log.i(TAG, "[PAIR] PIN 259087 injetado automaticamente");
+                } else if (pairingType == BluetoothDevice.PAIRING_VARIANT_PASSKEY_CONFIRMATION) {
                     device.setPairingConfirmation(true);
-                    Log.i(TAG, "[PAIRING] AUTO-CONFIRM -> setPairingConfirmation(true)");
-                    abortBroadcast();
-                    break;
-                case 3: // PAIRING_VARIANT_PASSKEY (NimBLE)
-                    try {
-                        boolean okPasskey = device.setPin(pinBytes);
-                        Log.i(TAG, "[PAIRING] Variante 3 (PASSKEY) → setPin(259087) -> "
-                                + (okPasskey ? "ACEITO" : "REJEITADO"));
-                        abortBroadcast();
-                    } catch (Exception ex) {
-                        Log.e(TAG, "[PAIRING] Erro ao confirmar pareamento variante 3: " + ex.getMessage());
-                    }
-                    break;
-                default:
-                    Log.w(TAG, "[PAIRING] Variante desconhecida: " + variant
-                            + " - tentando setPin como fallback");
-                    try {
-                        device.setPin(pinBytes);
-                        abortBroadcast();
-                    } catch (Exception ignored) {}
-                    break;
+                    Log.i(TAG, "[PAIR] Confirmação de passkey aceita automaticamente");
+                }
+                abortBroadcast();
+            } catch (Exception e) {
+                Log.e(TAG, "[PAIR] Erro ao injetar PIN: " + e.getMessage());
             }
         }
     };
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Receiver: ACTION_BOND_STATE_CHANGED
+    // Conexão GATT (apenas chamado após BOND_BONDED confirmado)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private final BroadcastReceiver mBondStateReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            if (!BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(intent.getAction())) return;
-            BluetoothDevice device   = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-            int newState  = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1);
-            int prevState = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, -1);
-            Log.i(TAG, "[BOND] STATE_CHANGED: " + bondStateName(prevState)
-                    + " → " + bondStateName(newState)
-                    + " | mac=" + (device != null ? device.getAddress() : "null"));
-            if (device == null) return;
-
-            if (newState == BluetoothDevice.BOND_BONDED) {
-                Log.i(TAG, "[BOND] BOND_BONDED! Salvando MAC e agendando conexão GATT...");
-                cancelarBondTimeout();
-                salvarMac(device.getAddress());
-                agendarConexaoDireta(device.getAddress());
-
-            } else if (newState == BluetoothDevice.BOND_NONE
-                    && prevState == BluetoothDevice.BOND_BONDING) {
-                Log.e(TAG, "[BOND] Pareamento FALHOU. Verifique PIN 259087 no firmware ESP32.");
-                cancelarBondTimeout();
-                broadcastConnectionStatus("bond_failed");
-                mMainHandler.postDelayed(() -> iniciarConexao(), 3_000L);
-            }
+    private void conectarGatt(BluetoothDevice device) {
+        if (device == null) {
+            Log.e(TAG, "[GATT] device null — abortando");
+            return;
         }
-    };
+        if (!hasConnectPermission()) {
+            Log.e(TAG, "[GATT] BLUETOOTH_CONNECT não concedida — abortando");
+            return;
+        }
+        if (mState == State.CONNECTING || mState == State.CONNECTED || mState == State.READY) {
+            Log.w(TAG, "[GATT] Já conectado/conectando (estado=" + mState.name() + ") — ignorando");
+            return;
+        }
+
+        transitionTo(State.CONNECTING);
+        Log.i(TAG, "[GATT] conectarGatt() → " + device.getAddress()
+                + " | bond=" + bondStateName(device.getBondState())
+                + " | tentativa=" + (mReconnectAttempts + 1));
+
+        // Reutiliza GATT existente se for o mesmo MAC
+        if (mBluetoothGatt != null
+                && mBluetoothGatt.getDevice().getAddress().equalsIgnoreCase(device.getAddress())) {
+            Log.i(TAG, "[GATT] GATT existente → gatt.connect() (reconexão rápida)");
+            boolean ok = mBluetoothGatt.connect();
+            if (ok) {
+                Log.i(TAG, "[GATT] gatt.connect() → OK");
+                return;
+            }
+            Log.w(TAG, "[GATT] gatt.connect() falhou → fechando e criando novo GATT");
+            closeGatt();
+        } else if (mBluetoothGatt != null) {
+            Log.i(TAG, "[GATT] GATT de outro MAC — fechando");
+            closeGatt();
+        }
+
+        // Cria novo GATT com autoConnect=false (comportamento da conexão manual)
+        Log.i(TAG, "[GATT] connectGatt(autoConnect=false, TRANSPORT_LE) → " + device.getAddress());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            mBluetoothGatt = device.connectGatt(
+                    this, false, mGattCallback, BluetoothDevice.TRANSPORT_LE);
+        } else {
+            mBluetoothGatt = device.connectGatt(this, false, mGattCallback);
+        }
+
+        if (mBluetoothGatt == null) {
+            Log.e(TAG, "[GATT] connectGatt() retornou null — reagendando");
+            transitionTo(State.DISCONNECTED);
+            reconectarComBackoff();
+        }
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // GATT Callback — coração do serviço BLE
+    // Reconexão com backoff exponencial
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void reconectarComBackoff() {
+        if (!mAutoReconnect) {
+            Log.d(TAG, "[RECONNECT] autoReconnect=false — não reconectando");
+            return;
+        }
+        if (mReconnectRunnable != null) {
+            Log.d(TAG, "[RECONNECT] Reconexão já agendada — ignorando duplicata");
+            return;
+        }
+        if (mTargetMac == null) {
+            Log.w(TAG, "[RECONNECT] Sem MAC — não é possível reconectar. Aguardando connectWithMac()");
+            return;
+        }
+
+        long delay = BACKOFF_DELAYS[Math.min(mBackoffIndex, BACKOFF_DELAYS.length - 1)];
+        mBackoffIndex = Math.min(mBackoffIndex + 1, BACKOFF_DELAYS.length - 1);
+        mReconnectAttempts++;
+
+        Log.i(TAG, "[RECONNECT] Tentativa #" + mReconnectAttempts
+                + " em " + delay + "ms → " + mTargetMac);
+
+        final String mac = mTargetMac;
+        mReconnectRunnable = () -> {
+            mReconnectRunnable = null;
+            if (!mAutoReconnect || mTargetMac == null) return;
+            Log.i(TAG, "[RECONNECT] Executando reconexão → " + mac);
+            if (hasConnectPermission()) {
+                BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mac);
+                iniciarBondEConectar(device);
+            } else {
+                Log.w(TAG, "[RECONNECT] BLUETOOTH_CONNECT não concedida — retry em 5s");
+                mMainHandler.postDelayed(() -> reconectarComBackoff(), 5_000L);
+            }
+        };
+        mMainHandler.postDelayed(mReconnectRunnable, delay);
+    }
+
+    private void pararReconexao() {
+        if (mReconnectRunnable != null) {
+            mMainHandler.removeCallbacks(mReconnectRunnable);
+            mReconnectRunnable = null;
+            Log.d(TAG, "[RECONNECT] Reconexão cancelada");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GATT Callback
     // ═══════════════════════════════════════════════════════════════════════════
 
     private final BluetoothGattCallback mGattCallback = new BluetoothGattCallback() {
 
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newConnectionState) {
-            String mac = gatt.getDevice().getAddress();
+            final String mac = gatt.getDevice().getAddress();
             Log.i(TAG, "[GATT] onConnectionStateChange | status=" + status
-                    + " | newState=" + connectionStateName(newConnectionState)
-                    + " | mac=" + mac
-                    + " | bond=" + bondStateName(gatt.getDevice().getBondState()));
+                    + " | newState=" + gattStateName(newConnectionState)
+                    + " | mac=" + mac);
 
             if (newConnectionState == BluetoothProfile.STATE_CONNECTED) {
                 handleGattConnected(gatt, status);
@@ -1011,13 +698,17 @@ public class BluetoothServiceIndustrial extends Service {
         @Override
         public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
             Log.i(TAG, "[GATT] onMtuChanged | mtu=" + mtu + " | status=" + status);
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.i(TAG, "[GATT] MTU negociado: " + mtu + " bytes — iniciando discoverServices()");
-            } else {
-                Log.w(TAG, "[GATT] MTU falhou (status=" + status + ") — prosseguindo com discoverServices()");
-            }
+            // Independente do resultado do MTU, prossegue com discoverServices
             boolean ok = gatt.discoverServices();
             Log.i(TAG, "[GATT] discoverServices() → " + (ok ? "INICIADO" : "FALHOU"));
+            if (!ok) {
+                mMainHandler.postDelayed(() -> {
+                    if (mBluetoothGatt != null) {
+                        boolean retry = mBluetoothGatt.discoverServices();
+                        Log.i(TAG, "[GATT] discoverServices() retry → " + (retry ? "INICIADO" : "FALHOU"));
+                    }
+                }, 600L);
+            }
         }
 
         @Override
@@ -1029,27 +720,24 @@ public class BluetoothServiceIndustrial extends Service {
                 return;
             }
 
-            // Localiza serviço NUS do ESP32
             BluetoothGattService nusService = gatt.getService(NUS_SERVICE_UUID);
             if (nusService == null) {
-                Log.e(TAG, "[BLE] NUS SERVICE NOT FOUND (6E400001)");
+                Log.e(TAG, "[BLE] NUS SERVICE NOT FOUND (6E400001) — reconectando");
                 mMainHandler.post(() -> reconectarComBackoff());
                 return;
             }
-            Log.i(TAG, "[BLE] NUS SERVICE FOUND");
+            Log.i(TAG, "[BLE] NUS SERVICE FOUND ✓");
 
-            BluetoothGattCharacteristic rxChar =
-                    nusService.getCharacteristic(NUS_RX_CHARACTERISTIC_UUID);
-            BluetoothGattCharacteristic txChar =
-                    nusService.getCharacteristic(NUS_TX_CHARACTERISTIC_UUID);
+            BluetoothGattCharacteristic rxChar = nusService.getCharacteristic(NUS_RX_CHARACTERISTIC_UUID);
+            BluetoothGattCharacteristic txChar = nusService.getCharacteristic(NUS_TX_CHARACTERISTIC_UUID);
 
             if (rxChar == null) {
-                Log.e(TAG, "[BLE] CRITICAL: NUS RX NOT FOUND (6E400002)");
+                Log.e(TAG, "[BLE] NUS RX NOT FOUND (6E400002) — reconectando");
                 mMainHandler.post(() -> reconectarComBackoff());
                 return;
             }
             if (txChar == null) {
-                Log.e(TAG, "[BLE] CRITICAL: NUS TX NOT FOUND (6E400003)");
+                Log.e(TAG, "[BLE] NUS TX NOT FOUND (6E400003) — reconectando");
                 mMainHandler.post(() -> reconectarComBackoff());
                 return;
             }
@@ -1057,31 +745,22 @@ public class BluetoothServiceIndustrial extends Service {
             mBluetoothGatt = gatt;
             mWriteCharacteristic = rxChar;
             mNotifyCharacteristic = txChar;
-            Log.i(TAG, "[BLE] NUS RX READY (write)");
-            Log.i(TAG, "[BLE] NUS TX READY (notify)");
-            Log.i(TAG, "[BLE] BLE READY: NUS SERVICE + RX + TX OK");
-            logBleHandles("onServicesDiscovered");
+            Log.i(TAG, "[BLE] NUS RX (write) + TX (notify) prontos ✓");
 
-            // Habilita notificações no TX
             habilitarNotificacoes(gatt, txChar);
         }
 
         @Override
-        public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor,
-                                      int status) {
-            Log.i(TAG, "[GATT] onDescriptorWrite | status=" + status
-                    + " | descriptor=" + descriptor.getUuid());
-            logBleHandles("onDescriptorWrite");
+        public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
+            Log.i(TAG, "[GATT] onDescriptorWrite | status=" + status);
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.i(TAG, "[BLE] NOTIFY ENABLED — transicionando para READY");
-                // Novo protocolo: sem AUTH — após notificações habilitadas, está READY
+                Log.i(TAG, "[BLE] NOTIFY ENABLED ✓ → READY");
                 mMainHandler.post(() -> {
                     if (isBleStackPronto()) {
                         transitionTo(State.READY);
                         broadcastConnectionStatus("ready");
                     } else {
                         Log.e(TAG, "[BLE] READY BLOQUEADO — handles BLE ausentes");
-                        logBleHandles("onDescriptorWrite_ready");
                     }
                 });
             } else {
@@ -1102,7 +781,6 @@ public class BluetoothServiceIndustrial extends Service {
             Log.d(TAG, "[GATT] onCharacteristicWrite | status=" + status);
             mWriteBusy.set(false);
             mMainHandler.post(BluetoothServiceIndustrial.this::drainCommandQueue);
-
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.e(TAG, "[GATT] Write falhou (status=" + status + ")");
                 broadcastData("WRITE_ERROR:" + status);
@@ -1116,7 +794,6 @@ public class BluetoothServiceIndustrial extends Service {
             if (raw == null || raw.length == 0) return;
             String data = new String(raw, StandardCharsets.UTF_8).trim();
             Log.i(TAG, "[RX] " + data);
-
             processarRespostaBle(data);
         }
     };
@@ -1126,67 +803,69 @@ public class BluetoothServiceIndustrial extends Service {
     // ═══════════════════════════════════════════════════════════════════════════
 
     private void handleGattConnected(BluetoothGatt gatt, int status) {
-        Log.i(TAG, "[GATT] CONECTADO → " + gatt.getDevice().getAddress()
+        Log.i(TAG, "[GATT] CONECTADO ✓ → " + gatt.getDevice().getAddress()
                 + " | status=" + status);
-        cancelarTimeoutConexao();
+        cancelarBondTimeout();
+        pararReconexao();
         mBluetoothGatt = gatt;
         mWriteCharacteristic = null;
         mNotifyCharacteristic = null;
-        logBleHandles("handleGattConnected");
-        pararReconexao();
         transitionTo(State.CONNECTED);
         broadcastConnectionStatus("connected");
 
-        // BALANCED aumenta o supervision timeout para ~20s no Android
-        boolean priOk = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED);
-        Log.i(TAG, "[GATT] requestConnectionPriority(BALANCED) → " + (priOk ? "OK" : "FALHOU"));
+        // Prioridade HIGH para menor latência
+        boolean priOk = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
+        Log.i(TAG, "[GATT] requestConnectionPriority(HIGH) → " + (priOk ? "OK" : "FALHOU"));
 
-        boolean mtuOk = gatt.requestMtu(512);
-        Log.i(TAG, "[GATT] requestMtu(512) → " + (mtuOk ? "AGUARDANDO onMtuChanged" : "FALHOU — discoverServices direto"));
+        // MTU 247 — máximo prático para NUS
+        boolean mtuOk = gatt.requestMtu(247);
+        Log.i(TAG, "[GATT] requestMtu(247) → " + (mtuOk ? "AGUARDANDO onMtuChanged" : "FALHOU — discoverServices direto"));
         if (!mtuOk) {
-            mMainHandler.post(() -> {
-                boolean ok = gatt.discoverServices();
-                Log.i(TAG, "[GATT] discoverServices() (fallback) → " + (ok ? "INICIADO" : "FALHOU"));
-            });
+            mMainHandler.postDelayed(() -> {
+                if (mBluetoothGatt != null) {
+                    boolean ok = mBluetoothGatt.discoverServices();
+                    Log.i(TAG, "[GATT] discoverServices() (fallback MTU) → " + (ok ? "INICIADO" : "FALHOU"));
+                }
+            }, 300L);
         }
     }
 
     private void handleGattDisconnected(BluetoothGatt gatt, int status) {
         Log.i(TAG, "[GATT] DESCONECTADO | status=" + status
                 + " | mac=" + gatt.getDevice().getAddress()
-                + " | state_anterior=" + mState.name());
+                + " | estado_anterior=" + mState.name());
 
-        cancelarTimeoutConexao();
+        cancelarBondTimeout();
         transitionTo(State.DISCONNECTED);
         broadcastConnectionStatus("disconnected:" + status);
 
         if (!mAutoReconnect) {
-            Log.i(TAG, "[INDUSTRIAL] autoReconnect=false — não reconectando");
+            Log.i(TAG, "[GATT] autoReconnect=false — não reconectando");
             return;
         }
 
-        if (status == STATUS_GATT_ERROR) {
-            Log.w(TAG, "[GATT] status=133 (GATT_ERROR) → fechando GATT e recriando");
-            closeGatt();
-            mMainHandler.postDelayed(() -> reconectarComBackoff(), 1_000L);
-
-        } else if (status == STATUS_AUTH_FAIL) {
-            Log.e(TAG, "[GATT] status=0x89 (AUTH_FAIL) → removendo bond e recriando");
+        if (status == STATUS_AUTH_FAIL) {
+            // Falha de autenticação — remove bond e reinicia processo
+            Log.e(TAG, "[GATT] AUTH_FAIL (0x89) → removendo bond e reiniciando");
             BluetoothDevice device = gatt.getDevice();
             closeGatt();
             removeBond(device);
-            mMainHandler.postDelayed(() -> iniciarBondEConectar(device), 2_000L);
+            mMainHandler.postDelayed(() -> {
+                if (mAutoReconnect && mTargetMac != null) {
+                    BluetoothDevice dev = mBluetoothAdapter.getRemoteDevice(mTargetMac);
+                    iniciarBondEConectar(dev);
+                }
+            }, 2_000L);
 
-        } else if (status == STATUS_CONN_TIMEOUT
-                || status == STATUS_CONN_257
-                || status == STATUS_CONN_TERMINATE
-                || status == STATUS_CONN_FAIL) {
-            Log.i(TAG, "[GATT] status=" + status + " → NÃO fechando GATT — reconectando");
-            reconectarComBackoff();
+        } else if (status == STATUS_GATT_ERROR) {
+            // GATT error 133 — fecha e recria GATT
+            Log.w(TAG, "[GATT] GATT_ERROR (133) → fechando GATT e reconectando");
+            closeGatt();
+            mMainHandler.postDelayed(() -> reconectarComBackoff(), 1_000L);
 
         } else {
-            Log.w(TAG, "[GATT] status=" + status + " (desconhecido) → fechando GATT");
-            closeGatt();
+            // Outros status (timeout, terminate, etc.) — reconecta com backoff
+            Log.i(TAG, "[GATT] status=" + status + " → reconectando com backoff");
             reconectarComBackoff();
         }
     }
@@ -1195,16 +874,14 @@ public class BluetoothServiceIndustrial extends Service {
     // Habilitar notificações (CCCD)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private void habilitarNotificacoes(BluetoothGatt gatt,
-                                        BluetoothGattCharacteristic txChar) {
+    private void habilitarNotificacoes(BluetoothGatt gatt, BluetoothGattCharacteristic txChar) {
         mNotifyCharacteristic = txChar;
-        logBleHandles("habilitarNotificacoes");
         boolean ok = gatt.setCharacteristicNotification(txChar, true);
         Log.i(TAG, "[GATT] setCharacteristicNotification(TX, true) → " + (ok ? "OK" : "FALHOU"));
 
         BluetoothGattDescriptor cccd = txChar.getDescriptor(CCCD_UUID);
         if (cccd == null) {
-            Log.e(TAG, "[GATT] CCCD descriptor não encontrado — indo para READY sem notificações");
+            Log.e(TAG, "[GATT] CCCD não encontrado — indo para READY sem notificações");
             mMainHandler.post(() -> {
                 if (isBleStackPronto()) {
                     transitionTo(State.READY);
@@ -1216,9 +893,8 @@ public class BluetoothServiceIndustrial extends Service {
 
         cccd.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
         boolean writeOk = gatt.writeDescriptor(cccd);
-        Log.i(TAG, "[GATT] writeDescriptor(CCCD) → " + (writeOk ? "OK" : "FALHOU"));
+        Log.i(TAG, "[GATT] writeDescriptor(CCCD) → " + (writeOk ? "OK — aguardando onDescriptorWrite" : "FALHOU"));
         if (!writeOk) {
-            // Fallback: ir para READY mesmo sem CCCD confirmado
             mMainHandler.post(() -> {
                 if (isBleStackPronto()) {
                     transitionTo(State.READY);
@@ -1229,128 +905,90 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Processamento de respostas BLE do ESP32 (novo protocolo)
+    // Processamento de respostas BLE do ESP32
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Processa todas as mensagens recebidas do ESP32 via notificação BLE.
-     *
-     * Protocolo do firmware operacional.cpp:
-     *   OK       — Comando aceito e enfileirado
-     *   ERRO     — Comando com erro
-     *   VP:xxx   — Volume parcial durante liberação (mL)
-     *   QP:xxx   — Quantidade de pulsos ao final
-     *   ML:xxx   — Volume final liberado (sinal de conclusão — válvula fechada)
-     *   PL:xxx   — Resposta de leitura de pulsos/litro
-     */
     private void processarRespostaBle(String data) {
-        // ── OK — comando aceito ──────────────────────────────────────────────
         if ("OK".equalsIgnoreCase(data)) {
-            Log.i(TAG, "[BLE] Comando aceito pelo ESP32 (OK)");
+            Log.i(TAG, "[BLE] Comando aceito (OK)");
             broadcastData(data);
             return;
         }
-
-        // ── ERRO — comando com erro ──────────────────────────────────────────
         if ("ERRO".equalsIgnoreCase(data)) {
             Log.e(TAG, "[BLE] ESP32 reportou ERRO");
             broadcastData(data);
             return;
         }
-
-        // ── VP: — volume parcial durante liberação ───────────────────────────
         if (data.startsWith("VP:")) {
-            Log.i(TAG, "[BLE] Volume parcial: " + data);
+            String val = data.substring(3).trim();
+            Log.i(TAG, "[BLE] Volume parcial: " + val + " mL");
             broadcastData(data);
             return;
         }
-
-        // ── QP: — quantidade de pulsos ao final ──────────────────────────────
         if (data.startsWith("QP:")) {
-            Log.i(TAG, "[BLE] Pulsos: " + data);
+            String val = data.substring(3).trim();
+            Log.i(TAG, "[BLE] Pulsos finais: " + val);
             broadcastData(data);
             return;
         }
-
-        // ── ML: — volume final liberado (conclusão) ──────────────────────────
         if (data.startsWith("ML:")) {
-            Log.i(TAG, "[BLE] Volume final (conclusão): " + data);
+            String val = data.substring(3).trim();
+            Log.i(TAG, "[BLE] Volume final liberado: " + val + " mL ✓");
             broadcastData(data);
             return;
         }
-
-        // ── PL: — resposta de leitura de pulsos/litro ────────────────────────
         if (data.startsWith("PL:")) {
-            Log.i(TAG, "[BLE] Pulsos/litro: " + data);
+            String val = data.substring(3).trim();
+            Log.i(TAG, "[BLE] Pulsos/litro: " + val);
             broadcastData(data);
             return;
         }
-
-        // ── Demais dados não reconhecidos ─────────────────────────────────────
-        Log.i(TAG, "[BLE] Dado recebido (não reconhecido): \"" + data + "\"");
+        Log.w(TAG, "[BLE] Resposta desconhecida: \"" + data + "\"");
         broadcastData(data);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Fila de comandos (apenas 1 write por vez)
+    // Fila de comandos
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private void enqueueCommand(String command) {
-        mMainHandler.post(() -> {
-            mCommandQueue.add(command);
-            Log.d(TAG, "[QUEUE] Enfileirado: \"" + command
-                    + "\" | fila=" + mCommandQueue.size());
-            drainCommandQueue();
-        });
+    private void enqueueCommand(String cmd) {
+        mCommandQueue.offer(cmd);
+        drainCommandQueue();
     }
 
     private void drainCommandQueue() {
-        if (mState != State.READY) {
-            Log.e(TAG, "[QUEUE] Bloqueado — BLE não pronto (estado=" + mState.name()
-                    + ", fila=" + mCommandQueue.size() + ")");
-            return;
-        }
+        if (mWriteBusy.get()) return;
+        if (mState != State.READY) return;
+        if (!isBleStackPronto()) return;
 
-        if (!isBleStackPronto()) {
-            Log.e(TAG, "[QUEUE] Bloqueado — BLE não pronto (handles ausentes, fila="
-                    + mCommandQueue.size() + ")");
-            logBleHandles("drainCommandQueue");
-            return;
-        }
-        if (mWriteBusy.get()) {
-            Log.d(TAG, "[QUEUE] Write em andamento — aguardando onCharacteristicWrite");
-            return;
-        }
-        String next = mCommandQueue.poll();
-        if (next == null) return;
+        String cmd = mCommandQueue.poll();
+        if (cmd == null) return;
 
-        Log.i(TAG, "[QUEUE] Enviando: \"" + next + "\" | restante=" + mCommandQueue.size());
-        writeImediato(next);
+        mWriteBusy.set(true);
+        writeImediato(cmd);
     }
 
-    /**
-     * Escreve diretamente na característica NUS RX.
-     */
     private void writeImediato(String data) {
-        if (!isBleStackPronto()) {
-            Log.e(TAG, "[WRITE] WRITE BLOQUEADO — BLE não inicializado: \"" + data + "\"");
-            logBleHandles("writeImediato");
-            return;
-        }
-        // CORREÇÃO CRÍTICA: writeCharacteristic() exige BLUETOOTH_CONNECT no Android 12+
         if (!hasConnectPermission()) {
-            Log.e(TAG, "[WRITE] BLUETOOTH_CONNECT não concedida — write bloqueado: \"" + data + "\"");
+            Log.e(TAG, "[WRITE] BLUETOOTH_CONNECT não concedida — write abortado");
             mWriteBusy.set(false);
             return;
         }
-        mWriteBusy.set(true);
-        mWriteCharacteristic.setValue(data.getBytes(StandardCharsets.UTF_8));
-        mWriteCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+        if (mBluetoothGatt == null || mWriteCharacteristic == null) {
+            Log.e(TAG, "[WRITE] GATT ou characteristic null — write abortado");
+            mWriteBusy.set(false);
+            return;
+        }
+
+        byte[] bytes = data.getBytes(StandardCharsets.UTF_8);
+        mWriteCharacteristic.setValue(bytes);
+        mWriteCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
         boolean ok = mBluetoothGatt.writeCharacteristic(mWriteCharacteristic);
-        Log.i(TAG, "[TX] " + data + " | ok=" + ok);
+        Log.i(TAG, "[WRITE] writeCharacteristic(\"" + data + "\") → " + (ok ? "OK" : "FALHOU"));
+
         if (!ok) {
             mWriteBusy.set(false);
-            Log.e(TAG, "[WRITE] writeCharacteristic() falhou para: \"" + data + "\"");
+            mMainHandler.postDelayed(this::drainCommandQueue, 200L);
         }
     }
 
@@ -1358,49 +996,52 @@ public class BluetoothServiceIndustrial extends Service {
     // Utilitários GATT
     // ═══════════════════════════════════════════════════════════════════════════
 
+    private boolean isBleStackPronto() {
+        return mBluetoothGatt != null
+                && mWriteCharacteristic != null
+                && mNotifyCharacteristic != null;
+    }
+
     private void closeGatt() {
-        cancelarTimeoutConexao();
         if (mBluetoothGatt != null) {
-            Log.i(TAG, "[GATT] closeGatt() → " + mBluetoothGatt.getDevice().getAddress());
-            mBluetoothGatt.close();
+            try {
+                if (hasConnectPermission()) {
+                    mBluetoothGatt.disconnect();
+                }
+            } catch (Exception ignored) {}
+            try {
+                mBluetoothGatt.close();
+            } catch (Exception ignored) {}
             mBluetoothGatt = null;
-            mWriteCharacteristic = null;
-            mNotifyCharacteristic = null;
+            Log.d(TAG, "[GATT] closeGatt() — GATT fechado");
         }
     }
 
-    public static void removeBond(BluetoothDevice device) {
+    private void removeBond(BluetoothDevice device) {
         if (device == null) return;
         try {
-            Method m = device.getClass().getMethod("removeBond", (Class[]) null);
-            m.invoke(device, (Object[]) null);
-            Log.i(TAG, "[BOND] removeBond() → " + device.getAddress());
+            Method m = device.getClass().getMethod("removeBond");
+            boolean ok = (boolean) m.invoke(device);
+            Log.i(TAG, "[BOND] removeBond() → " + (ok ? "OK" : "FALHOU"));
         } catch (Exception e) {
-            Log.e(TAG, "[BOND] removeBond() erro: " + e.getMessage());
+            Log.w(TAG, "[BOND] removeBond() exception: " + e.getMessage());
         }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Utilitários de log
+    // Verificação de permissão BLUETOOTH_CONNECT (Android 12+)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private static String bondStateName(int state) {
-        switch (state) {
-            case BluetoothDevice.BOND_NONE:    return "BOND_NONE";
-            case BluetoothDevice.BOND_BONDING: return "BOND_BONDING";
-            case BluetoothDevice.BOND_BONDED:  return "BOND_BONDED";
-            default:                           return "UNKNOWN(" + state + ")";
+    private boolean hasConnectPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            boolean granted = checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            if (!granted) {
+                Log.e(TAG, "[PERM] BLUETOOTH_CONNECT NÃO concedida");
+            }
+            return granted;
         }
-    }
-
-    private static String connectionStateName(int state) {
-        switch (state) {
-            case BluetoothProfile.STATE_CONNECTED:    return "CONNECTED";
-            case BluetoothProfile.STATE_CONNECTING:   return "CONNECTING";
-            case BluetoothProfile.STATE_DISCONNECTED: return "DISCONNECTED";
-            case BluetoothProfile.STATE_DISCONNECTING:return "DISCONNECTING";
-            default:                                  return "UNKNOWN(" + state + ")";
-        }
+        return true;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1412,7 +1053,7 @@ public class BluetoothServiceIndustrial extends Service {
         mTargetMac = mac;
         getSharedPreferences("tap_config", Context.MODE_PRIVATE)
                 .edit().putString("esp32_mac", mac).apply();
-        Log.i(TAG, "[INDUSTRIAL] MAC salvo: " + mac);
+        Log.i(TAG, "[MAC] MAC salvo: " + mac);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1433,7 +1074,7 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     private void broadcastWriteReady() {
-        Log.i(TAG, "[BROADCAST] *** ACTION_WRITE_READY *** — READY para comandos");
+        Log.i(TAG, "[BROADCAST] ACTION_WRITE_READY — READY para comandos");
         LocalBroadcastManager.getInstance(this)
                 .sendBroadcast(new Intent(ACTION_WRITE_READY));
     }
@@ -1445,7 +1086,7 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // JWT para validação de MAC na API
+    // JWT para validação de MAC na API (scan manual)
     // ═══════════════════════════════════════════════════════════════════════════
 
     private String gerarJwtToken() {
@@ -1470,7 +1111,6 @@ public class BluetoothServiceIndustrial extends Service {
             String s   = Base64.encodeToString(sig,
                              Base64.URL_SAFE | Base64.NO_PADDING | Base64.NO_WRAP);
 
-            Log.d(TAG, "[JWT] Token gerado com sucesso");
             return msg + "." + s;
         } catch (Exception e) {
             Log.e(TAG, "[JWT] Erro ao gerar token: " + e.getMessage());
@@ -1479,15 +1119,137 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Notificação Foreground — Android 12+ / Android 14 FGS
+    // Scan BLE manual (fallback — apenas quando não há MAC)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private boolean mScanning = false;
+    private Runnable mScanStopRunnable = null;
+    private final java.util.Set<String> mMacsValidando = new java.util.HashSet<>();
+
+    /**
+     * Scan BLE manual — apenas como fallback quando não há MAC disponível.
+     * NÃO é chamado automaticamente. Apenas via scanLeDevice(true) de compatibilidade.
+     */
+    private void iniciarScanManual() {
+        if (mTargetMac != null) {
+            Log.i(TAG, "[SCAN] MAC disponível — usando connectWithMac() em vez de scan");
+            connectWithMac(mTargetMac);
+            return;
+        }
+        if (mBleScanner == null || !mBluetoothAdapter.isEnabled()) {
+            Log.w(TAG, "[SCAN] Scanner não disponível");
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (checkSelfPermission(android.Manifest.permission.BLUETOOTH_SCAN)
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                Log.w(TAG, "[SCAN] BLUETOOTH_SCAN não concedido — scan cancelado");
+                return;
+            }
+        }
+        if (mScanning) return;
+
+        synchronized (mMacsValidando) { mMacsValidando.clear(); }
+        mScanning = true;
+        Log.i(TAG, "[SCAN] Iniciando scan manual por CHOPP_*");
+        broadcastConnectionStatus("scanning");
+        mBleScanner.startScan(mScanCallback);
+
+        mScanStopRunnable = () -> {
+            if (mScanning) {
+                Log.w(TAG, "[SCAN] Timeout 15s — nenhum CHOPP_ encontrado");
+                pararScan();
+                broadcastConnectionStatus("scan_timeout");
+            }
+        };
+        mMainHandler.postDelayed(mScanStopRunnable, 15_000L);
+    }
+
+    private void pararScan() {
+        if (!mScanning) return;
+        mScanning = false;
+        if (mScanStopRunnable != null) {
+            mMainHandler.removeCallbacks(mScanStopRunnable);
+            mScanStopRunnable = null;
+        }
+        if (mBleScanner != null) {
+            try { mBleScanner.stopScan(mScanCallback); } catch (Exception ignored) {}
+        }
+        Log.i(TAG, "[SCAN] Scan parado");
+    }
+
+    private final ScanCallback mScanCallback = new ScanCallback() {
+        @Override
+        public void onScanResult(int callbackType, ScanResult result) {
+            BluetoothDevice device = result.getDevice();
+            String name = device.getName();
+            if (name == null || !name.startsWith(BLE_NAME_PREFIX)) return;
+
+            String mac = device.getAddress();
+            Log.i(TAG, "[SCAN] Encontrado: " + name + " | " + mac);
+
+            synchronized (mMacsValidando) {
+                if (mMacsValidando.contains(mac)) return;
+                mMacsValidando.add(mac);
+            }
+            validarMacNaApi(device);
+        }
+
+        @Override
+        public void onScanFailed(int errorCode) {
+            Log.e(TAG, "[SCAN] Falhou: " + errorCode);
+            mScanning = false;
+        }
+    };
+
+    private void validarMacNaApi(BluetoothDevice device) {
+        final String mac = device.getAddress();
+        final String androidId = Settings.Secure.getString(
+                getContentResolver(), Settings.Secure.ANDROID_ID);
+        new Thread(() -> {
+            try {
+                String token = gerarJwtToken();
+                OkHttpClient client = new OkHttpClient.Builder()
+                        .connectTimeout(10, TimeUnit.SECONDS)
+                        .readTimeout(15, TimeUnit.SECONDS)
+                        .build();
+                okhttp3.RequestBody body = new FormBody.Builder()
+                        .add("android_id", androidId != null ? androidId : "")
+                        .add("mac", mac)
+                        .build();
+                Request request = new Request.Builder()
+                        .url("https://ochoppoficial.com.br/api/verify_tap_mac.php")
+                        .header("token", token)
+                        .post(body)
+                        .build();
+                try (Response response = client.newCall(request).execute()) {
+                    String responseBody = response.body() != null ? response.body().string() : "";
+                    if (response.isSuccessful() && responseBody.contains("\"valid\":true")) {
+                        Log.i(TAG, "[SCAN] MAC válido: " + mac + " — conectando");
+                        mMainHandler.post(() -> {
+                            pararScan();
+                            connectWithMac(mac);
+                        });
+                    } else {
+                        Log.i(TAG, "[SCAN] MAC inválido — ignorando: " + mac);
+                        synchronized (mMacsValidando) { mMacsValidando.remove(mac); }
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "[SCAN] Erro ao validar MAC: " + e.getMessage());
+                synchronized (mMacsValidando) { mMacsValidando.remove(mac); }
+            }
+        }).start();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Notificação Foreground
     // ═══════════════════════════════════════════════════════════════════════════
 
     private void criarNotificacaoForeground() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
-                    NOTIF_CHANNEL_ID,
-                    "Chopp BLE Industrial",
-                    NotificationManager.IMPORTANCE_LOW);
+                    NOTIF_CHANNEL_ID, "Chopp BLE Industrial", NotificationManager.IMPORTANCE_LOW);
             channel.setDescription("Serviço BLE Chopp Self-Service");
             NotificationManager nm = getSystemService(NotificationManager.class);
             if (nm != null) nm.createNotificationChannel(channel);
@@ -1510,168 +1272,121 @@ public class BluetoothServiceIndustrial extends Service {
                 .build();
 
         startForeground(NOTIF_ID, notification);
-        Log.i(TAG, "[INDUSTRIAL] Foreground service iniciado (notif_id=" + NOTIF_ID + ")");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Helpers de nomes
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private String bondStateName(int state) {
+        switch (state) {
+            case BluetoothDevice.BOND_BONDED:  return "BOND_BONDED";
+            case BluetoothDevice.BOND_BONDING: return "BOND_BONDING";
+            case BluetoothDevice.BOND_NONE:    return "BOND_NONE";
+            default:                           return "BOND_UNKNOWN(" + state + ")";
+        }
+    }
+
+    private String gattStateName(int state) {
+        switch (state) {
+            case BluetoothProfile.STATE_CONNECTED:    return "CONNECTED";
+            case BluetoothProfile.STATE_CONNECTING:   return "CONNECTING";
+            case BluetoothProfile.STATE_DISCONNECTED: return "DISCONNECTED";
+            case BluetoothProfile.STATE_DISCONNECTING:return "DISCONNECTING";
+            default:                                  return "UNKNOWN(" + state + ")";
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // API Pública
     // ═══════════════════════════════════════════════════════════════════════════
 
-    public void connect(String mac) {
-        if (mac == null || mac.isEmpty()) {
-            Log.e(TAG, "[API] connect() — MAC inválido");
-            return;
+    /**
+     * Envia um comando ao ESP32 via fila de comandos.
+     * Formato: "$ML:100", "$PL:5880", "$TO:5000", "$LB:", etc.
+     */
+    public boolean write(String data) {
+        if (data == null || data.isEmpty()) return false;
+        if (mState != State.READY) {
+            Log.e(TAG, "[WRITE] BLOCKED — BLE não está READY (estado=" + mState.name() + ")");
+            return false;
         }
-        Log.i(TAG, "[API] connect(" + mac + ")");
-        if (!mac.equalsIgnoreCase(mTargetMac)) {
-            salvarMac(mac);
+        if (!isBleStackPronto()) {
+            Log.e(TAG, "[WRITE] BLOCKED — handles BLE ausentes");
+            return false;
         }
-        if (mState == State.CONNECTING || mState == State.CONNECTED || mState == State.READY) {
-            Log.i(TAG, "[API] connect() — já conectado/conectando (estado=" + mState.name() + ")");
-            return;
-        }
-        pararScan();
-        pararReconexao();
-        // Verificar bond antes de conectar
-        if (hasConnectPermission()) {
-            BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mac);
-            iniciarBondEConectar(device);
-        } else {
-            agendarConexaoDireta(mac);
-        }
+        Log.i(TAG, "[WRITE] enfileirando: \"" + data + "\"");
+        enqueueCommand(data);
+        return true;
     }
+
+    public boolean isReady() { return mState == State.READY; }
+    public State getState()  { return mState; }
+    public String getTargetMac() { return mTargetMac; }
+
+    public long getTimeSinceReady() {
+        if (mReadyTimestamp == 0) return -1;
+        return System.currentTimeMillis() - mReadyTimestamp;
+    }
+
+    public boolean isReadyWithGuardBand() {
+        if (!isReady()) return false;
+        long t = getTimeSinceReady();
+        if (t < 0) return false;
+        boolean ok = t >= GUARD_BAND_MS;
+        if (!ok) Log.w(TAG, "[GUARD-BAND] BLOQUEADO — " + (GUARD_BAND_MS - t) + "ms faltando");
+        return ok;
+    }
+
+    public long getReadyTimestamp() { return mReadyTimestamp; }
+    public long getGuardBandMs()    { return GUARD_BAND_MS; }
 
     public void disconnect() {
         Log.i(TAG, "[API] disconnect()");
         mAutoReconnect = false;
         pararReconexao();
-        pararScan();
-        if (mBluetoothGatt != null) {
-            mBluetoothGatt.disconnect();
-        }
+        cancelarBondTimeout();
+        closeGatt();
         transitionTo(State.DISCONNECTED);
     }
 
-    /**
-     * Envia um comando ao ESP32 via fila de comandos.
-     * Formato esperado: "$ML:100", "$PL:5880", "$TO:5000", "$LB:", etc.
-     *
-     * @param data string de comando
-     * @return true se o comando foi enfileirado
-     */
-    public boolean write(String data) {
-        if (data == null || data.isEmpty()) {
-            Log.w(TAG, "[API] write() — dado vazio ignorado");
-            return false;
-        }
-        if (mState != State.READY) {
-            Log.e(TAG, "BLOCKED: BLE NOT READY");
-            Log.e(TAG, "[API] write() bloqueado — BLE não pronto (estado=" + mState.name() + ")");
-            return false;
-        }
-        if (!isBleStackPronto()) {
-            Log.e(TAG, "BLOCKED: BLE NOT READY");
-            Log.e(TAG, "[API] write() bloqueado — handles BLE ausentes");
-            logBleHandles("write");
-            return false;
-        }
-        if (mState == State.ERROR) {
-            Log.e(TAG, "[API] write() — estado ERROR, comando descartado: \"" + data + "\"");
-            return false;
-        }
-        Log.i(TAG, "[API] write(\"" + data + "\") | estado=" + mState.name());
-        enqueueCommand(data);
-        return true;
-    }
-
-    public boolean isReady() {
-        return mState == State.READY;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // GUARD-BAND
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    public long getTimeSinceReady() {
-        if (mReadyTimestamp == 0) {
-            return -1;
-        }
-        return System.currentTimeMillis() - mReadyTimestamp;
-    }
-
-    public boolean isReadyWithGuardBand() {
-        if (!isReady()) {
-            return false;
-        }
-        long timeSinceReady = getTimeSinceReady();
-        if (timeSinceReady < 0) {
-            return false;
-        }
-        boolean guardBandExpired = timeSinceReady >= GUARD_BAND_MS;
-        if (!guardBandExpired) {
-            Log.w(TAG, "[GUARD-BAND] BLOQUEADO — " + (GUARD_BAND_MS - timeSinceReady)
-                    + "ms faltando. Time since READY: " + timeSinceReady + "ms");
-        }
-        return guardBandExpired;
-    }
-
-    public long getReadyTimestamp() {
-        return mReadyTimestamp;
-    }
-
-    public long getGuardBandMs() {
-        return GUARD_BAND_MS;
-    }
-
-    public State getState() {
-        return mState;
-    }
-
-    public String getTargetMac() {
-        return mTargetMac;
-    }
-
     public void resetMac() {
-        Log.i(TAG, "[API] resetMac() — limpando MAC salvo e reiniciando scan");
+        Log.i(TAG, "[API] resetMac() — limpando MAC salvo");
         mTargetMac = null;
         getSharedPreferences("tap_config", Context.MODE_PRIVATE)
                 .edit().remove("esp32_mac").apply();
         disconnect();
         mAutoReconnect = true;
-        iniciarScanComRetry();
     }
 
     public void salvarMacExterno(String mac) {
         if (mac == null || mac.isEmpty()) return;
-        if (mac.equalsIgnoreCase(mTargetMac)) {
-            Log.d(TAG, "[MAC] salvarMacExterno: MAC já é o mesmo (" + mac + ") — sem ação");
+        if (mac.equalsIgnoreCase(mTargetMac)
+                && (mState == State.CONNECTED || mState == State.READY)) {
+            Log.d(TAG, "[MAC] salvarMacExterno: MAC já conectado (" + mac + ") — sem ação");
             return;
         }
-        Log.w(TAG, "[MAC] salvarMacExterno: atualizando MAC " + mTargetMac + " → " + mac);
-        salvarMac(mac);
-        if (mState == State.CONNECTING || mState == State.CONNECTED || mState == State.READY) {
-            Log.w(TAG, "[MAC] Desconectando do MAC antigo para reconectar ao novo: " + mac);
-            disconnect();
-        }
-        mAutoReconnect = true;
-        // Verificar bond antes de conectar ao novo MAC
-        if (hasConnectPermission()) {
-            BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mac);
-            iniciarBondEConectar(device);
-        } else {
-            agendarConexaoDireta(mac);
-        }
+        Log.i(TAG, "[MAC] salvarMacExterno: " + mac);
+        connectWithMac(mac);
     }
 
-    public int getQueueSize() {
-        return mCommandQueue.size();
-    }
-
-    public void clearQueue() {
+    public int  getQueueSize() { return mCommandQueue.size(); }
+    public void clearQueue()   {
         int size = mCommandQueue.size();
         mCommandQueue.clear();
         mWriteBusy.set(false);
         Log.i(TAG, "[API] clearQueue() — " + size + " comandos descartados");
+    }
+
+    public boolean isInternetAvailable() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return false;
+            NetworkInfo ni = cm.getActiveNetworkInfo();
+            return ni != null && ni.isConnected();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1682,14 +1397,10 @@ public class BluetoothServiceIndustrial extends Service {
 
     public BleState getBleState() {
         switch (mState) {
-            case READY:
-                return BleState.READY;
+            case READY:     return BleState.READY;
             case CONNECTED:
-            case CONNECTING:
-            case SCANNING:
-                return BleState.CONNECTED;
-            default:
-                return BleState.DISCONNECTED;
+            case CONNECTING: return BleState.CONNECTED;
+            default:        return BleState.DISCONNECTED;
         }
     }
 
@@ -1698,18 +1409,18 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     public void forceReady() {
-        Log.i(TAG, "[COMPAT] forceReady() chamado — estado=" + mState.name());
-        logBleHandles("forceReady");
+        Log.i(TAG, "[COMPAT] forceReady() — estado=" + mState.name());
         if (!isBleStackPronto()) {
             Log.e(TAG, "[COMPAT] forceReady BLOQUEADO — BLE não pronto");
             return;
         }
-        Log.i(TAG, "[COMPAT] forceReady permitido — BLE pronto");
-        if (mState != State.READY) {
-            transitionTo(State.READY);
-        }
+        if (mState != State.READY) transitionTo(State.READY);
     }
 
+    /**
+     * Compatibilidade: scanLeDevice(true) inicia conexão pelo MAC salvo ou scan manual.
+     * scanLeDevice(false) para o scan.
+     */
     public void scanLeDevice(boolean enable) {
         mAutoReconnect = true;
         if (!enable) {
@@ -1717,18 +1428,18 @@ public class BluetoothServiceIndustrial extends Service {
             return;
         }
         if (mTargetMac != null) {
-            Log.i(TAG, "[COMPAT] scanLeDevice() — MAC salvo: " + mTargetMac + " → conectando");
-            BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mTargetMac);
-            iniciarBondEConectar(device);
+            Log.i(TAG, "[COMPAT] scanLeDevice() — MAC salvo: " + mTargetMac + " → connectWithMac()");
+            connectWithMac(mTargetMac);
         } else {
-            Log.i(TAG, "[COMPAT] scanLeDevice() — sem MAC → scan por CHOPP_");
-            iniciarScanComRetry();
+            Log.i(TAG, "[COMPAT] scanLeDevice() — sem MAC → scan manual por CHOPP_*");
+            iniciarScanManual();
         }
     }
 
     public void enableAutoReconnect() {
         mAutoReconnect = true;
         mReconnectAttempts = 0;
+        mBackoffIndex = 0;
         Log.i(TAG, "[COMPAT] enableAutoReconnect()");
     }
 
@@ -1736,61 +1447,37 @@ public class BluetoothServiceIndustrial extends Service {
         return mBluetoothGatt != null ? mBluetoothGatt.getDevice() : null;
     }
 
-    /**
-     * Retorna CommandQueueManager (legado) — null nesta implementação.
-     */
-    public CommandQueueManager getCommandQueue() {
-        Log.w(TAG, "[COMPAT] getCommandQueue() chamado — não utilizado no protocolo v4.0 NUS");
-        return null;
-    }
+    /** @deprecated Não utilizado no protocolo v5.0 NUS */
+    public CommandQueueManager getCommandQueue() { return null; }
+
+    /** @deprecated Não utilizado no protocolo v5.0 NUS */
+    public CommandQueue getCommandQueueV2() { return null; }
 
     /**
-     * Retorna CommandQueue v2.3 — null nesta implementação (protocolo simplificado).
-     */
-    public CommandQueue getCommandQueueV2() {
-        Log.w(TAG, "[COMPAT] getCommandQueueV2() chamado — não utilizado no protocolo v4.0 NUS");
-        return null;
-    }
-
-    /**
-     * Enfileira comando de liberação de chopp no novo protocolo.
+     * Enfileira comando de liberação de chopp.
      * Formato: $ML:<volume_ml>
-     *
-     * @param volumeMl volume em mL a liberar
-     * @param sessionId ignorado no novo protocolo (mantido para compatibilidade de assinatura)
-     * @return BleCommand com os dados do comando, ou null se BLE não pronto
      */
     public BleCommand enqueueServeCommand(int volumeMl, String sessionId) {
         if (mState != State.READY || !isBleStackPronto()) {
-            Log.e(TAG, "[BLOCK] BLE não está READY");
-            logBleHandles("enqueueServeCommand");
+            Log.e(TAG, "[SERVE] BLE não está READY — comando descartado");
             return null;
         }
-
         String command = "$ML:" + volumeMl;
-        Log.i(TAG, "[FLOW] Pagamento aprovado → liberando " + volumeMl + "mL via " + command);
-
+        Log.i(TAG, "[SERVE] Liberando " + volumeMl + "mL → " + command);
         BleCommand cmd = new BleCommand(BleCommand.Type.ML, sessionId, volumeMl);
         boolean ok = write(command);
         if (!ok) {
-            Log.e(TAG, "[FLOW] Falha ao enfileirar comando: " + command);
+            Log.e(TAG, "[SERVE] Falha ao enfileirar: " + command);
             return null;
         }
-
         cmd.state = BleCommand.State.SENT;
         return cmd;
     }
 
-    public boolean isInternetAvailable() {
-        try {
-            ConnectivityManager cm = (ConnectivityManager)
-                    getSystemService(Context.CONNECTIVITY_SERVICE);
-            if (cm == null) return false;
-            NetworkInfo ni = cm.getActiveNetworkInfo();
-            return ni != null && ni.isConnected();
-        } catch (Exception e) {
-            Log.e(TAG, "[NET] isInternetAvailable() erro: " + e.getMessage());
-            return false;
-        }
+    /**
+     * Alias para connectWithMac() — mantido para compatibilidade.
+     */
+    public void connect(String mac) {
+        connectWithMac(mac);
     }
 }
