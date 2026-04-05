@@ -1,103 +1,58 @@
 package com.example.choppontap.ble
 
 import android.util.Log
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
 
 /**
- * BleManagerV2.kt — Orquestrador BLE com autenticação HMAC-SHA256 v2.0
+ * BleManagerV2.kt — Orquestrador BLE para protocolo NUS v4.0
  *
  * ═══════════════════════════════════════════════════════════════════════
- * PROTOCOLO v2.0 — ESP32 FRANQ
+ * PROTOCOLO NUS v4.0 — ESP32 ChoppON
  * ═══════════════════════════════════════════════════════════════════════
  *
  *  ENVIO (Android → ESP32):
- *    SERVE:   SERVE|<ml>|<CMD_ID>|<SESSION_ID>|<HMAC>
- *    AUTH:    AUTH|<CMD_ID>|<SESSION_ID>|<HMAC>
- *    STOP:    STOP|<CMD_ID>|<SESSION_ID>|<HMAC>
- *    STATUS:  STATUS|<CMD_ID>
- *    PING:    PING|<CMD_ID>
+ *    $ML:<volume>  — Liberar volume em ml
+ *    $LB:          — Liberação contínua
+ *    $ML:0         — Parar liberação
+ *    $PL:<pulsos>  — Configurar pulsos/litro
+ *    $PL:0         — Consultar pulsos/litro
+ *    $TO:<ms>      — Configurar timeout
+ *    $TO:          — Consultar timeout
  *
  *  RECEPÇÃO (ESP32 → Android):
- *    ACK|<CMD_ID>
- *    DONE|<CMD_ID>|<ML_REAL>|<SESSION_ID>
- *    AUTH:OK
- *    AUTH:FAIL
- *    ERROR:SESSION_MISMATCH
- *    ERROR:NOT_AUTHENTICATED
- *    ERROR:VOLUME_EXCEEDED
- *    ERROR:TIMEOUT
- *    ERROR:BUSY
- *    ERROR:WATCHDOG
- *    WARN:FLOW_TIMEOUT          ← barril vazio / sem fluxo
- *    WARN:VOLUME_EXCEEDED
- *    STATUS:READY
- *    STATUS:BUSY
- *    PONG|<CMD_ID>
- *    VP:<ML_PARCIAL>
- *    VALVE:OPEN
- *    VALVE:CLOSED
- *    DUPLICATE
+ *    OK            — Comando aceito
+ *    ERRO          — Comando rejeitado
+ *    VP:<valor>    — Volume parcial liberado
+ *    ML:<valor>    — Volume total final (operação concluída)
+ *    PL:<valor>    — Pulsos por litro
+ *    QP:<valor>    — Quantidade de pulsos
+ *    TO:<valor>    — Timeout atual
  *
  * ═══════════════════════════════════════════════════════════════════════
- * UUIDs do Serviço BLE — Protocolo v2.0 (7f0a0001-...)
+ * UUIDs do Nordic UART Service (NUS) — Protocolo v4.0
  * ═══════════════════════════════════════════════════════════════════════
  *
- *  SERVICE:  7f0a0001-7b6b-4b5f-9d3e-3c7b9f100001
- *  RX (TX→ESP32): 7f0a0002-7b6b-4b5f-9d3e-3c7b9f100001
- *  TX (ESP32→RX): 7f0a0003-7b6b-4b5f-9d3e-3c7b9f100001
+ *  SERVICE:        6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+ *  RX (App→ESP32): 6E400002-B5A3-F393-E0A9-E50E24DCCA9E
+ *  TX (ESP32→App): 6E400003-B5A3-F393-E0A9-E50E24DCCA9E
  *
- * ═══════════════════════════════════════════════════════════════════════
- * ARQUITETURA
- * ═══════════════════════════════════════════════════════════════════════
+ * NÃO existe mais: HMAC, AUTH, SERVE, STOP, STATUS, PING, PONG,
+ *                  ACK, DONE, CMD_ID, SESSION_ID
  *
- *   BluetoothServiceIndustrial
- *        │
- *        ▼
- *   BleManagerV2  ◄──── PagamentoConcluido (via getCommandQueue)
- *        │
- *        ├── BleParser         (parse de mensagens BLE)
- *        ├── ConnectionManager (estados + heartbeat + reconexão)
- *        └── CommandQueue      (fila FIFO ACK/DONE)
- *
- * ═══════════════════════════════════════════════════════════════════════
- * SEGURANÇA
- * ═══════════════════════════════════════════════════════════════════════
- *
- *  - Token HMAC-SHA256 gerado com chave secreta compartilhada
- *  - CMD_ID único por comando (UUID truncado 8 chars)
- *  - SESSION_ID único por sessão de venda
- *  - Proteção anti-replay via CMD_ID validado no ESP32
- *
- * @author  ChoppOnTap — Equipe de Desenvolvimento
- * @version 2.0.0
- * @since   2026-03-22
+ * @version 4.0.0
  */
 class BleManagerV2 {
 
     companion object {
         private const val TAG = "BLE_MANAGER_V2"
 
-        // ── UUIDs do Serviço BLE v2.0 ────────────────────────────────────────
-        const val NUS_SERVICE_UUID            = "7f0a0001-7b6b-4b5f-9d3e-3c7b9f100001"
-        const val NUS_RX_CHARACTERISTIC_UUID  = "7f0a0002-7b6b-4b5f-9d3e-3c7b9f100001"
-        const val NUS_TX_CHARACTERISTIC_UUID  = "7f0a0003-7b6b-4b5f-9d3e-3c7b9f100001"
+        // ── UUIDs do Nordic UART Service (NUS) v4.0 ──────────────────────────
+        const val NUS_SERVICE_UUID            = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+        const val NUS_RX_CHARACTERISTIC_UUID  = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+        const val NUS_TX_CHARACTERISTIC_UUID  = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
         const val CCCD_UUID                   = "00002902-0000-1000-8000-00805f9b34fb"
 
         // ── Prefixo do nome BLE ───────────────────────────────────────────────
         const val BLE_NAME_PREFIX = "CHOPP_"
-
-        // ── Chave HMAC compartilhada com o firmware ESP32 ────────────────────
-        // IMPORTANTE: Esta chave DEVE ser idêntica à HMAC_SECRET_KEY no config.h do ESP32
-        // Em produção, considere obter esta chave via API segura (HTTPS) no login do franqueado
-        private const val HMAC_SECRET_KEY = "Choppon103614@"
-
-        // ── Algoritmo HMAC ────────────────────────────────────────────────────
-        private const val HMAC_ALGORITHM = "HmacSHA256"
-
-        // ── Comprimento do token HMAC no comando (primeiros 16 chars do hex) ─
-        // Token completo (64 chars hex) — não truncar para manter compatibilidade com firmware v2.0
-        private const val HMAC_TOKEN_LENGTH = 64
     }
 
     // ── Interface de callback para o BluetoothServiceIndustrial ─────────────
@@ -107,28 +62,13 @@ class BleManagerV2 {
         /** Solicitação de conexão GATT */
         fun onConnectRequested(mac: String, autoConnect: Boolean)
         /** Comando enviado via BLE */
-        fun onCommandSent(cmdId: String, type: String)
-        /** ACK recebido do ESP32 */
-        fun onCommandAck(cmdId: String)
-        /** DONE recebido — mlReal disponível */
-        fun onCommandDone(cmdId: String, mlReal: Int, sessionId: String?)
+        fun onCommandSent(command: String)
+        /** Resposta recebida do ESP32 */
+        fun onCommandResponse(command: String, response: String)
         /** Erro no comando */
-        fun onCommandError(cmdId: String?, reason: String)
-        /** Alerta de barril vazio / sem fluxo */
-        fun onFlowWarning(warningType: String)
-        /** Heartbeat falhou */
+        fun onCommandError(command: String?, reason: String)
+        /** Keepalive falhou */
         fun onHeartbeatFailed()
-    }
-
-    // ── Estados de conexão BLE v2.0 ──────────────────────────────────────────
-    enum class BleState {
-        DISCONNECTED,
-        SCANNING,
-        CONNECTING,
-        CONNECTED,
-        AUTHENTICATED,
-        READY,
-        ERROR
     }
 
     // ── Estado atual ─────────────────────────────────────────────────────────
@@ -139,6 +79,9 @@ class BleManagerV2 {
 
     // ── Interface de escrita BLE ─────────────────────────────────────────────
     private var bleWriter: ((String) -> Boolean)? = null
+
+    // ── Comando ativo ────────────────────────────────────────────────────────
+    private var activeCommand: String? = null
 
     // ═════════════════════════════════════════════════════════════════════════
     // Configuração
@@ -153,323 +96,170 @@ class BleManagerV2 {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // Geração de Token HMAC-SHA256
+    // Envio de Comandos — Protocolo NUS v4.0
     // ═════════════════════════════════════════════════════════════════════════
 
     /**
-     * Gera token HMAC-SHA256 no formato exigido pelo firmware v2.0:
-     * payload = "$timestamp:$sessionId"
-     * token   = "$hmacHex:$timestamp"
+     * Envia comando de liberação de volume.
+     * Formato: $ML:<volume>
      */
-    fun generateAuthToken(sessionId: String): String {
-        return try {
-            val timestampSeg = System.currentTimeMillis() / 1000L
-            val payload = "$sessionId:$timestampSeg"
-            val keySpec = SecretKeySpec(HMAC_SECRET_KEY.toByteArray(Charsets.UTF_8), HMAC_ALGORITHM)
-            val mac = Mac.getInstance(HMAC_ALGORITHM)
-            mac.init(keySpec)
-            val hmacBytes = mac.doFinal(payload.toByteArray(Charsets.UTF_8))
-            val hmacHex = hmacBytes.joinToString("") { "%02x".format(it) }
-            val token = "$hmacHex:$timestampSeg"
-            Log.d("BLE_AUTH", "Payload: $payload")
-            Log.d("BLE_AUTH", "Token gerado: $token")
-            token
-        } catch (e: Exception) {
-            Log.e(TAG, "[HMAC] Erro ao gerar token: ${e.message}")
-            "0".repeat(64) + ":0"
-        }
-    }
-
-    // Mantido por compatibilidade com chamadas internas de SERVE/STOP
-    fun generateAuthToken(command: String, cmdId: String, sessionId: String): String {
-        return try {
-            val timestampSeg = System.currentTimeMillis() / 1000L
-            val payload = "$sessionId:$timestampSeg"
-            val keySpec = SecretKeySpec(HMAC_SECRET_KEY.toByteArray(Charsets.UTF_8), HMAC_ALGORITHM)
-            val mac = Mac.getInstance(HMAC_ALGORITHM)
-            mac.init(keySpec)
-            val hmacBytes = mac.doFinal(payload.toByteArray(Charsets.UTF_8))
-            val hmacHex = hmacBytes.joinToString("") { "%02x".format(it) }
-            "$hmacHex:$timestampSeg"
-        } catch (e: Exception) {
-            Log.e(TAG, "[HMAC] Erro ao gerar token ($command): ${e.message}")
-            "0".repeat(64) + ":0"
-        }
+    fun sendServe(volumeMl: Int): Boolean {
+        val command = "\$ML:$volumeMl"
+        return sendCommand(command)
     }
 
     /**
-     * Gera um CMD_ID único de 8 caracteres alfanuméricos maiúsculos.
-     * Baseado em UUID aleatório truncado para garantir unicidade.
+     * Envia comando de liberação contínua.
+     * Formato: $LB:
      */
-    fun generateCmdId(): String {
-        return java.util.UUID.randomUUID().toString()
-            .replace("-", "")
-            .take(8)
-            .uppercase()
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    // Construção de Comandos BLE v2.0
-    // ═════════════════════════════════════════════════════════════════════════
-
-    /**
-     * Constrói o comando SERVE com token HMAC.
-     * Formato: SERVE|<ml>|<CMD_ID>|<SESSION_ID>|<HMAC>
-     */
-    fun buildServeCommand(volumeMl: Int, cmdId: String, sessionId: String): String {
-        val token = generateAuthToken("SERVE", cmdId, sessionId)
-        return "SERVE|$volumeMl|$cmdId|$sessionId|$token"
+    fun sendContinuous(): Boolean {
+        return sendCommand("\$LB:")
     }
 
     /**
-     * Constrói o comando AUTH com token HMAC.
-     * Formato: AUTH|<CMD_ID>|<SESSION_ID>|<HMAC>
+     * Envia comando para parar liberação.
+     * Formato: $ML:0
      */
-    fun buildAuthCommand(cmdId: String, sessionId: String): String {
-        val token = generateAuthToken(sessionId)
-        val command = "AUTH|$token|$cmdId|$sessionId"
-        Log.d("BLE_AUTH", "Comando enviado: $command")
-        return command
+    fun sendStop(): Boolean {
+        return sendCommand("\$ML:0")
     }
 
     /**
-     * Constrói o comando STOP com token HMAC.
-     * Formato: STOP|<CMD_ID>|<SESSION_ID>|<HMAC>
+     * Consulta pulsos por litro.
+     * Formato: $PL:0
      */
-    fun buildStopCommand(cmdId: String, sessionId: String): String {
-        val token = generateAuthToken("STOP", cmdId, sessionId)
-        return "STOP|$cmdId|$sessionId|$token"
+    fun queryPulses(): Boolean {
+        return sendCommand("\$PL:0")
     }
 
     /**
-     * Constrói o comando STATUS (sem HMAC — comando de consulta).
-     * Formato: STATUS|<CMD_ID>
+     * Configura pulsos por litro.
+     * Formato: $PL:<pulsos>
      */
-    fun buildStatusCommand(cmdId: String): String {
-        return "STATUS|$cmdId"
+    fun setPulses(pulsesPerLiter: Int): Boolean {
+        return sendCommand("\$PL:$pulsesPerLiter")
     }
 
     /**
-     * Constrói o comando PING (heartbeat, sem HMAC).
-     * Formato: PING|<CMD_ID>
+     * Consulta timeout.
+     * Formato: $TO:
      */
-    fun buildPingCommand(cmdId: String): String {
-        return "PING|$cmdId"
+    fun queryTimeout(): Boolean {
+        return sendCommand("\$TO:")
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // Envio de Comandos
-    // ═════════════════════════════════════════════════════════════════════════
+    /**
+     * Configura timeout.
+     * Formato: $TO:<ms>
+     */
+    fun setTimeout(timeoutMs: Int): Boolean {
+        return sendCommand("\$TO:$timeoutMs")
+    }
 
     /**
-     * Envia um comando SERVE para o ESP32.
-     * Gera CMD_ID único e token HMAC automaticamente.
-     *
-     * @param volumeMl  Volume em ml a ser servido
-     * @param sessionId ID da sessão de venda (ex: "SES_8472ABCD")
-     * @return          CMD_ID gerado, ou null se falhou
+     * Envia um comando genérico ao ESP32.
      */
-    fun sendServe(volumeMl: Int, sessionId: String): String? {
+    fun sendCommand(command: String): Boolean {
         if (currentState != BleState.READY) {
-            Log.e(TAG, "[SERVE] Bloqueado — estado=$currentState (esperado READY)")
-            callback?.onCommandError(null, "BLE_NOT_READY")
-            return null
+            Log.e(TAG, "[SEND] Bloqueado — estado=$currentState (esperado READY)")
+            callback?.onCommandError(command, "Estado inválido: $currentState")
+            return false
         }
 
-        val cmdId = generateCmdId()
-        val command = buildServeCommand(volumeMl, cmdId, sessionId)
+        val writer = bleWriter
+        if (writer == null) {
+            Log.e(TAG, "[SEND] BLE writer não configurado")
+            callback?.onCommandError(command, "BLE writer não configurado")
+            return false
+        }
 
-        return if (writeCommand(command)) {
-            Log.i(TAG, "[SERVE] Enviado: vol=${volumeMl}ml cmd=$cmdId session=$sessionId")
-            callback?.onCommandSent(cmdId, "SERVE")
-            cmdId
+        activeCommand = command
+        val ok = writer(command)
+        if (ok) {
+            Log.i(TAG, "[SEND] Enviado: $command")
+            callback?.onCommandSent(command)
         } else {
-            Log.e(TAG, "[SERVE] Falha ao escrever no BLE")
-            callback?.onCommandError(cmdId, "BLE_WRITE_FAILED")
-            null
+            Log.e(TAG, "[SEND] Falha ao enviar: $command")
+            callback?.onCommandError(command, "Falha no write BLE")
+            activeCommand = null
         }
-    }
-
-    /**
-     * Envia autenticação AUTH após conexão BLE estabelecida.
-     * Chamado automaticamente pelo BluetoothServiceIndustrial após discoverServices.
-     */
-    fun sendAuth(sessionId: String): String? {
-        val cmdId = generateCmdId()
-        val command = buildAuthCommand(cmdId, sessionId)
-
-        return if (writeCommand(command)) {
-            Log.i(TAG, "[AUTH] Enviado: cmd=$cmdId session=$sessionId")
-            callback?.onCommandSent(cmdId, "AUTH")
-            cmdId
-        } else {
-            Log.e(TAG, "[AUTH] Falha ao escrever no BLE")
-            null
-        }
-    }
-
-    /**
-     * Envia comando STOP para interromper dispensação.
-     */
-    fun sendStop(cmdId: String, sessionId: String): Boolean {
-        val command = buildStopCommand(cmdId, sessionId)
-        return writeCommand(command).also { success ->
-            if (success) Log.i(TAG, "[STOP] Enviado: cmd=$cmdId")
-            else Log.e(TAG, "[STOP] Falha ao escrever no BLE")
-        }
-    }
-
-    /**
-     * Envia STATUS para consultar estado do ESP32.
-     */
-    fun sendStatus(): Boolean {
-        val cmdId = generateCmdId()
-        val command = buildStatusCommand(cmdId)
-        return writeCommand(command).also { success ->
-            if (success) Log.d(TAG, "[STATUS] Enviado: cmd=$cmdId")
-        }
-    }
-
-    /**
-     * Envia PING para heartbeat.
-     */
-    fun sendPing(): Boolean {
-        val cmdId = generateCmdId()
-        val command = buildPingCommand(cmdId)
-        return writeCommand(command).also { success ->
-            if (success) Log.d(TAG, "[PING] Enviado: cmd=$cmdId")
-        }
+        return ok
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // Processamento de Respostas do ESP32
+    // Processamento de Respostas — Protocolo NUS v4.0
     // ═════════════════════════════════════════════════════════════════════════
 
     /**
-     * Processa dados recebidos do ESP32 via BLE.
-     * Deve ser chamado em onCharacteristicChanged() do BluetoothServiceIndustrial.
-     *
-     * Suporta todos os formatos do protocolo v2.0:
-     *   ACK|<CMD_ID>
-     *   DONE|<CMD_ID>|<ML_REAL>|<SESSION_ID>
-     *   AUTH:OK / AUTH:FAIL
-     *   ERROR:<TIPO>
-     *   WARN:<TIPO>
-     *   STATUS:<ESTADO>
-     *   PONG|<CMD_ID>
-     *   VP:<ML>
-     *   VALVE:OPEN / VALVE:CLOSED
-     *   DUPLICATE
+     * Processa dados recebidos do ESP32 via notificação BLE.
+     * Respostas válidas: OK, ERRO, VP:, ML:, PL:, QP:, TO:
      */
-    fun onBleDataReceived(raw: String) {
-        if (raw.isBlank()) return
-
-        val s = raw.trim()
-        Log.d(TAG, "[RX] $s")
+    fun onBleDataReceived(data: String) {
+        val trimmed = data.trim()
+        Log.d(TAG, "[RX] $trimmed | ativo=$activeCommand")
 
         when {
-            // ── ACK ──────────────────────────────────────────────────────────
-            s.startsWith("ACK|") -> {
-                val cmdId = s.substringAfter("ACK|").trim()
-                Log.i(TAG, "[ACK] cmd=$cmdId")
-                callback?.onCommandAck(cmdId)
-            }
-
-            // ── DONE ─────────────────────────────────────────────────────────
-            s.startsWith("DONE|") -> {
-                val parts = s.split("|")
-                val cmdId     = parts.getOrNull(1)?.trim() ?: ""
-                val mlReal    = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: 0
-                val sessionId = parts.getOrNull(3)?.trim()
-                Log.i(TAG, "[DONE] cmd=$cmdId ml=${mlReal}ml session=$sessionId")
-                callback?.onCommandDone(cmdId, mlReal, sessionId)
-            }
-
-            // ── AUTH:OK ───────────────────────────────────────────────────────
-            s == "AUTH:OK" || s.startsWith("AUTH_OK") -> {
-                Log.i(TAG, "[AUTH] OK → transicionando para READY")
-                transitionState(BleState.READY)
-            }
-
-            // ── AUTH:FAIL ─────────────────────────────────────────────────────
-            s == "AUTH:FAIL" || s.startsWith("AUTH_FAIL") -> {
-                Log.e(TAG, "[AUTH] FAIL — token inválido ou sessão expirada")
-                callback?.onCommandError(null, "AUTH_FAIL")
-            }
-
-            // ── WARN: alertas operacionais ────────────────────────────────────
-            s.startsWith("WARN:") -> {
-                val warnType = s.substringAfter("WARN:").trim()
-                Log.w(TAG, "[WARN] $warnType")
-                when (warnType) {
-                    "FLOW_TIMEOUT"     -> {
-                        Log.w(TAG, "[WARN] BARRIL VAZIO ou sem fluxo detectado!")
-                        callback?.onFlowWarning("FLOW_TIMEOUT")
-                    }
-                    "VOLUME_EXCEEDED"  -> {
-                        Log.w(TAG, "[WARN] Volume excedido!")
-                        callback?.onFlowWarning("VOLUME_EXCEEDED")
-                    }
-                    else -> {
-                        Log.w(TAG, "[WARN] Alerta desconhecido: $warnType")
-                        callback?.onFlowWarning(warnType)
-                    }
+            // OK — comando aceito
+            trimmed.equals("OK", ignoreCase = true) -> {
+                Log.i(TAG, "[RX] OK recebido")
+                val cmd = activeCommand
+                // Para comandos de configuração, OK é a resposta final
+                if (cmd != null && !cmd.startsWith("\$ML:") && cmd != "\$LB:") {
+                    activeCommand = null
+                    callback?.onCommandResponse(cmd, trimmed)
                 }
             }
 
-            // ── ERROR: erros do ESP32 ─────────────────────────────────────────
-            s.startsWith("ERROR:") -> {
-                val errorType = s.substringAfter("ERROR:").trim()
-                Log.e(TAG, "[ERROR] $errorType")
-                callback?.onCommandError(null, errorType)
+            // ERRO — comando rejeitado
+            trimmed.equals("ERRO", ignoreCase = true) -> {
+                Log.e(TAG, "[RX] ERRO recebido")
+                val cmd = activeCommand
+                activeCommand = null
+                callback?.onCommandError(cmd, "ESP32 retornou ERRO")
             }
 
-            // ── STATUS ────────────────────────────────────────────────────────
-            s.startsWith("STATUS:") -> {
-                val status = s.substringAfter("STATUS:").trim()
-                Log.d(TAG, "[STATUS] $status")
-                when (status) {
-                    "READY" -> Log.i(TAG, "[STATUS] ESP32 READY")
-                    "BUSY"  -> Log.w(TAG, "[STATUS] ESP32 BUSY")
-                    "IDLE"  -> Log.i(TAG, "[STATUS] ESP32 IDLE")
-                    else    -> Log.d(TAG, "[STATUS] Estado: $status")
-                }
+            // ML: — Volume total final (operação concluída)
+            trimmed.startsWith("ML:") -> {
+                Log.i(TAG, "[RX] ML recebido — operação concluída: $trimmed")
+                val cmd = activeCommand
+                activeCommand = null
+                if (cmd != null) callback?.onCommandResponse(cmd, trimmed)
             }
 
-            // ── PONG ──────────────────────────────────────────────────────────
-            s.startsWith("PONG|") -> {
-                val cmdId = s.substringAfter("PONG|").trim()
-                Log.d(TAG, "[PONG] cmd=$cmdId — heartbeat OK")
+            // VP: — Volume parcial
+            trimmed.startsWith("VP:") -> {
+                Log.d(TAG, "[RX] VP parcial: $trimmed")
+                val cmd = activeCommand
+                if (cmd != null) callback?.onCommandResponse(cmd, trimmed)
             }
 
-            // ── VP: progresso parcial ─────────────────────────────────────────
-            s.startsWith("VP:") -> {
-                val ml = s.substringAfter("VP:").trim().toDoubleOrNull()?.toInt() ?: 0
-                Log.d(TAG, "[VP] progresso=${ml}ml")
-                // Broadcast tratado pela Activity via BluetoothServiceIndustrial
+            // QP: — Quantidade de pulsos
+            trimmed.startsWith("QP:") -> {
+                Log.d(TAG, "[RX] QP: $trimmed")
+                val cmd = activeCommand
+                if (cmd != null) callback?.onCommandResponse(cmd, trimmed)
             }
 
-            // ── VALVE ─────────────────────────────────────────────────────────
-            s.startsWith("VALVE:") -> {
-                val valveState = s.substringAfter("VALVE:").trim()
-                Log.d(TAG, "[VALVE] $valveState")
+            // PL: — Pulsos por litro
+            trimmed.startsWith("PL:") -> {
+                Log.d(TAG, "[RX] PL: $trimmed")
+                val cmd = activeCommand
+                activeCommand = null
+                if (cmd != null) callback?.onCommandResponse(cmd, trimmed)
             }
 
-            // ── DUPLICATE ────────────────────────────────────────────────────
-            s == "DUPLICATE" || s == "ML:DUPLICATE" -> {
-                Log.w(TAG, "[DUPLICATE] Comando duplicado rejeitado pelo ESP32")
-                callback?.onCommandError(null, "DUPLICATE")
+            // TO: — Timeout
+            trimmed.startsWith("TO:") -> {
+                Log.d(TAG, "[RX] TO: $trimmed")
+                val cmd = activeCommand
+                activeCommand = null
+                if (cmd != null) callback?.onCommandResponse(cmd, trimmed)
             }
 
-            // ── QUEUE:FULL ────────────────────────────────────────────────────
-            s == "QUEUE:FULL" -> {
-                Log.e(TAG, "[QUEUE] Fila do ESP32 cheia")
-                callback?.onCommandError(null, "QUEUE_FULL")
-            }
-
-            // ── Mensagem desconhecida ─────────────────────────────────────────
             else -> {
-                Log.d(TAG, "[RX] Mensagem não reconhecida pelo protocolo v2.0: [$s]")
+                Log.w(TAG, "[RX] Resposta desconhecida: $trimmed")
+                val cmd = activeCommand
+                if (cmd != null) callback?.onCommandResponse(cmd, trimmed)
             }
         }
     }
@@ -478,55 +268,26 @@ class BleManagerV2 {
     // Gerenciamento de Estado
     // ═════════════════════════════════════════════════════════════════════════
 
-    fun onGattConnected(mac: String) {
-        Log.i(TAG, "[BLE] GATT conectado → $mac")
-        transitionState(BleState.CONNECTED)
-    }
-
-    fun onGattDisconnected() {
-        Log.w(TAG, "[BLE] GATT desconectado")
-        transitionState(BleState.DISCONNECTED)
-    }
-
-    fun onAuthOk() {
-        Log.i(TAG, "[BLE] AUTH:OK → READY")
-        transitionState(BleState.READY)
-    }
-
-    fun onScanStarted() {
-        transitionState(BleState.SCANNING)
+    fun setState(newState: BleState) {
+        if (currentState == newState) return
+        val old = currentState
+        currentState = newState
+        Log.i(TAG, "[STATE] $old -> $newState")
+        callback?.onStateChanged(newState, old)
     }
 
     fun getState(): BleState = currentState
 
     fun isReady(): Boolean = currentState == BleState.READY
 
-    fun isConnected(): Boolean = currentState == BleState.CONNECTED
-            || currentState == BleState.AUTHENTICATED
-            || currentState == BleState.READY
+    fun isConnected(): Boolean =
+        currentState == BleState.CONNECTED || currentState == BleState.READY
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // Internos
-    // ═════════════════════════════════════════════════════════════════════════
+    fun getActiveCommand(): String? = activeCommand
 
-    private fun transitionState(newState: BleState) {
-        val old = currentState
-        if (old == newState) return
-        currentState = newState
-        Log.i(TAG, "[STATE] $old → $newState")
-        callback?.onStateChanged(newState, old)
-    }
-
-    private fun writeCommand(command: String): Boolean {
-        val writer = bleWriter
-        if (writer == null) {
-            Log.e(TAG, "[WRITE] BleWriter não configurado!")
-            return false
-        }
-        return writer(command)
-    }
-
-    override fun toString(): String {
-        return "BleManagerV2{state=$currentState}"
+    fun reset() {
+        activeCommand = null
+        currentState = BleState.DISCONNECTED
+        Log.i(TAG, "[RESET] Estado resetado")
     }
 }

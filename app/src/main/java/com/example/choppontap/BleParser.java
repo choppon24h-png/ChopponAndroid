@@ -3,370 +3,158 @@ package com.example.choppontap;
 import android.util.Log;
 
 /**
- * BleParser — Parser centralizado de respostas BLE do ESP32 v2.0 FRANQ.
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * BleParser — Parser centralizado de respostas BLE do ESP32 (Protocolo NUS v4.0)
+ * ═══════════════════════════════════════════════════════════════════════════════
  *
- * ═══════════════════════════════════════════════════════════════════════
- * PROTOCOLO SUPORTADO v2.0 (FONTE DA VERDADE)
- * ═══════════════════════════════════════════════════════════════════════
+ * PROTOCOLO SUPORTADO (Firmware ESP32 operacional.cpp):
  *
- *  OPERACIONAIS:
- *    ✔ ACK|<CMD_ID>
- *    ✔ DONE|<CMD_ID>|<ML_REAL>|<SESSION_ID>
- *    ✔ PONG|<CMD_ID>
- *    ✔ VP:<ML_PARCIAL>
+ *   OK              — Comando aceito e enfileirado
+ *   ERRO            — Comando com erro
+ *   VP:<ml_parcial> — Volume parcial durante liberação
+ *   QP:<pulsos>     — Quantidade de pulsos ao final
+ *   ML:<ml_final>   — Volume final liberado (sinal de conclusão)
+ *   PL:<pulsos>     — Resposta de leitura de pulsos/litro
  *
- *  AUTENTICAÇÃO:
- *    ✔ AUTH:OK
- *    ✔ AUTH:FAIL
- *    ✔ AUTH_OK|<CMD_ID>|<SESSION_ID>
- *    ✔ AUTH_FAIL|<CMD_ID>|<SESSION_ID>
+ * NÃO existe mais: ACK|, DONE|, PONG|, AUTH:OK/FAIL, HMAC, SESSION, SERVE, STOP
  *
- *  ERROS:
- *    ✔ ERROR:SESSION_MISMATCH
- *    ✔ ERROR:NOT_AUTHENTICATED
- *    ✔ ERROR:VOLUME_EXCEEDED
- *    ✔ ERROR:TIMEOUT
- *    ✔ ERROR:BUSY
- *    ✔ ERROR:WATCHDOG / ERROR:WDG
- *    ✔ ERROR:HMAC_INVALID
- *    ✔ ERROR:DUPLICATE
- *    ✔ ERROR:QUEUE_FULL
- *    ✔ ERROR:VALVE_STUCK
- *
- *  ALERTAS (novos no v2.0):
- *    ✔ WARN:FLOW_TIMEOUT      — barril vazio / sem fluxo
- *    ✔ WARN:VOLUME_EXCEEDED   — volume real excedeu o solicitado
- *
- *  VÁLVULA:
- *    ✔ VALVE:OPEN
- *    ✔ VALVE:CLOSED
- *
- *  ESTADOS:
- *    ✔ STATUS:IDLE
- *    ✔ STATUS:RUNNING
- *    ✔ STATUS:ERROR
- *    ✔ STATUS:READY
- *    ✔ STATUS:BUSY
- *
- *  LITERAIS:
- *    ✔ READY
- *    ✔ BUSY
- *    ✔ DUPLICATE / ML:DUPLICATE
- *    ✔ QUEUE:FULL
- *    ✔ ML:ACK (compatibilidade legada)
- *
- * @version 2.0.0
- * @since   2026-03-22
+ * @version 4.0.0
  */
 public class BleParser {
 
     private static final String TAG = "BLE_PARSER";
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Tipos de mensagem
+    // ═══════════════════════════════════════════════════════════════════════════
+
     public enum MessageType {
-        // ── Operacionais ─────────────────────────────────────────────────────
-        ACK,
-        DONE,
-        PONG,
+        /** OK — Comando aceito pelo ESP32 */
+        OK,
+        /** ERRO — Comando com erro */
+        ERRO,
+        /** VP:<ml_parcial> — Volume parcial durante liberação */
         VP,
-
-        // ── Autenticação ─────────────────────────────────────────────────────
-        AUTH_OK,
-        AUTH_FAIL,
-
-        // ── Erros do ESP32 v2.0 ──────────────────────────────────────────────
-        ERROR_SESSION_MISMATCH,
-        ERROR_NOT_AUTHENTICATED,
-        ERROR_NOT_READY,            // ESP32 ainda não pronto para SERVE
-        ERROR_VOLUME_EXCEEDED,      // NOVO v2.0
-        ERROR_TIMEOUT,
-        ERROR_BUSY,
-        ERROR_WATCHDOG,
-        ERROR_HMAC_INVALID,         // NOVO v2.0 — token HMAC inválido
-        ERROR_DUPLICATE,            // NOVO v2.0 — CMD_ID já processado
-        ERROR_QUEUE_FULL,
-        ERROR_VALVE_STUCK,          // NOVO v2.0 — válvula travada
-
-        // ── Alertas operacionais (NOVO v2.0) ──────────────────────────────────
-        WARN_FLOW_TIMEOUT,          // Barril vazio / sem fluxo detectado
-        WARN_VOLUME_EXCEEDED,       // Volume real excedeu o solicitado
-
-        // ── Válvula ───────────────────────────────────────────────────────────
-        VALVE_OPEN,
-        VALVE_CLOSED,
-
-        // ── Estados ───────────────────────────────────────────────────────────
-        STATUS_IDLE,
-        STATUS_RUNNING,
-        STATUS_ERROR,
-        STATUS_READY,
-        STATUS_BUSY,
-
-        // ── Fila ─────────────────────────────────────────────────────────────
-        QUEUE_FULL,
-
-        // ── Duplicidade ───────────────────────────────────────────────────────
-        DUPLICATE,
-
-        // ── Desconhecido ─────────────────────────────────────────────────────
+        /** QP:<pulsos> — Quantidade de pulsos ao final */
+        QP,
+        /** ML:<ml_final> — Volume final liberado (conclusão) */
+        ML,
+        /** PL:<pulsos> — Resposta de leitura de pulsos/litro */
+        PL,
+        /** Mensagem não reconhecida */
         UNKNOWN
     }
 
-    // ── Resultado do parse ────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Resultado do parse
+    // ═══════════════════════════════════════════════════════════════════════════
+
     public static class ParsedMessage {
+        /** Tipo da mensagem parseada */
         public final MessageType type;
-        public final String      raw;
-        public final String      commandId;
-        public final String      sessionId;
-        public final int         mlReal;
-        public final String      warnType;   // NOVO v2.0 — tipo do alerta WARN:*
+        /** String bruta recebida */
+        public final String raw;
+        /** Valor numérico extraído (mL, pulsos, etc.) */
+        public final int intValue;
+        /** Valor decimal extraído (para VP com decimais) */
+        public final double doubleValue;
 
-        private ParsedMessage(MessageType type, String raw,
-                              String commandId, String sessionId,
-                              int mlReal, String warnType) {
-            this.type      = type;
-            this.raw       = raw;
-            this.commandId = commandId;
-            this.sessionId = sessionId;
-            this.mlReal    = mlReal;
-            this.warnType  = warnType;
+        private ParsedMessage(MessageType type, String raw, int intValue, double doubleValue) {
+            this.type = type;
+            this.raw = raw;
+            this.intValue = intValue;
+            this.doubleValue = doubleValue;
         }
 
-        // Construtor sem warnType (compatibilidade)
-        private ParsedMessage(MessageType type, String raw,
-                              String commandId, String sessionId, int mlReal) {
-            this(type, raw, commandId, sessionId, mlReal, null);
-        }
-
-        /** Retorna true se é um alerta operacional (WARN:*). */
-        public boolean isWarning() {
-            return type == MessageType.WARN_FLOW_TIMEOUT
-                    || type == MessageType.WARN_VOLUME_EXCEEDED;
+        private ParsedMessage(MessageType type, String raw) {
+            this(type, raw, 0, 0.0);
         }
 
         /** Retorna true se é um erro do ESP32. */
         public boolean isError() {
-            return type.name().startsWith("ERROR_");
+            return type == MessageType.ERRO;
+        }
+
+        /** Retorna true se é a conclusão da liberação (ML:). */
+        public boolean isDone() {
+            return type == MessageType.ML;
+        }
+
+        /** Retorna true se é progresso parcial (VP:). */
+        public boolean isProgress() {
+            return type == MessageType.VP;
         }
 
         @Override
         public String toString() {
             return String.format(
-                    "ParsedMessage{type=%s, cmd=%s, session=%s, ml=%d, warn=%s, raw=[%s]}",
-                    type, commandId, sessionId, mlReal,
-                    (warnType != null ? warnType : "-"), raw);
+                    "ParsedMessage{type=%s, int=%d, double=%.1f, raw=[%s]}",
+                    type, intValue, doubleValue, raw);
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════
     // Parser principal
-    // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Faz o parse de uma string recebida via BLE do ESP32 v2.0.
+     * Faz o parse de uma string recebida via BLE do ESP32 (protocolo NUS v4.0).
      *
-     * Implementação resiliente com split por pipe "|" e fallback seguro.
-     * Compatível com protocolo v2.0 (HMAC) e legado v1.x.
-     *
-     * @param raw String bruta recebida via BLE
-     * @return    ParsedMessage com tipo e campos extraídos
+     * @param raw String bruta recebida via notificação BLE
+     * @return ParsedMessage com tipo e valores extraídos
      */
     public static ParsedMessage parse(String raw) {
         if (raw == null || raw.isEmpty()) {
-            return new ParsedMessage(MessageType.UNKNOWN, "", null, null, 0);
+            return new ParsedMessage(MessageType.UNKNOWN, "");
         }
 
         String s = raw.trim();
-        String[] parts = s.split("\\|");
 
-        // ── 1. Mensagens baseadas em PIPE (ACK, DONE, PONG) ──────────────────
-
-        if (s.startsWith("ACK|")) {
-            return new ParsedMessage(MessageType.ACK, s,
-                    extractCmdId(parts, 1), null, 0);
+        // ── OK — comando aceito ──────────────────────────────────────────────
+        if ("OK".equalsIgnoreCase(s)) {
+            return new ParsedMessage(MessageType.OK, s);
         }
 
-        if (s.startsWith("DONE|") || s.equals("DONE")) {
-            String cmdId     = extractCmdId(parts, 1);
-            int    ml        = parseIntSafe(getPart(parts, 2));
-            String sessionId = getPart(parts, 3);
-            return new ParsedMessage(MessageType.DONE, s, cmdId, sessionId, ml);
+        // ── ERRO — comando com erro ──────────────────────────────────────────
+        if ("ERRO".equalsIgnoreCase(s)) {
+            return new ParsedMessage(MessageType.ERRO, s);
         }
 
-        if (s.startsWith("PONG|")) {
-            return new ParsedMessage(MessageType.PONG, s,
-                    extractCmdId(parts, 1), null, 0);
-        }
-
-        // ── 2. WARN: alertas operacionais (NOVO v2.0) ─────────────────────────
-
-        if (s.startsWith("WARN:")) {
-            String warnType = s.substring(5).trim();
-            switch (warnType) {
-                case "FLOW_TIMEOUT":
-                    Log.w(TAG, "[WARN] Barril vazio ou sem fluxo detectado!");
-                    return new ParsedMessage(MessageType.WARN_FLOW_TIMEOUT,
-                            s, null, null, 0, warnType);
-                case "VOLUME_EXCEEDED":
-                    Log.w(TAG, "[WARN] Volume real excedeu o solicitado!");
-                    return new ParsedMessage(MessageType.WARN_VOLUME_EXCEEDED,
-                            s, null, null, 0, warnType);
-                default:
-                    Log.w(TAG, "[WARN] Alerta desconhecido: " + warnType);
-                    return new ParsedMessage(MessageType.UNKNOWN,
-                            s, null, null, 0, warnType);
-            }
-        }
-
-        // ── 3. ERROR: erros do ESP32 ──────────────────────────────────────────
-
-        if (s.startsWith("ERROR:")) {
-            String err = s.substring(6).trim();
-            switch (err) {
-                case "SESSION_MISMATCH":
-                    // v2.3.0 FIX: Log detalhado para SESSION_MISMATCH
-                    Log.e(TAG, "[SECURITY] ERROR:SESSION_MISMATCH recebido do ESP32");
-                    Log.e(TAG, "[SESSION] ⚠️  POSSÍVEL CAUSA 1: SES_LOCAL_* (fallback local) enviado");
-                    Log.e(TAG, "[SESSION] ⚠️  POSSÍVEL CAUSA 2: API não confirmou session_id antes de SERVE");
-                    Log.e(TAG, "[SESSION] ⚠️  POSSÍVEL CAUSA 3: Reconexão com SESSION_ID antigo");
-                    Log.e(TAG, "[RECOVERY] Retry automático: CommandQueueManager reenviará comando");
-                    return new ParsedMessage(MessageType.ERROR_SESSION_MISMATCH,
-                            s, null, null, 0);
-                case "NOT_AUTHENTICATED":
-                    return new ParsedMessage(MessageType.ERROR_NOT_AUTHENTICATED,
-                            s, null, null, 0);
-                case "NOT_READY":
-                    // v2.3.0 FIX: Log para NOT_READY
-                    Log.w(TAG, "[SYNC] ERROR:NOT_READY — ESP32 ainda sincronizando");
-                    return new ParsedMessage(MessageType.ERROR_NOT_READY,
-                            s, null, null, 0);
-                case "VOLUME_EXCEEDED":
-                    return new ParsedMessage(MessageType.ERROR_VOLUME_EXCEEDED,
-                            s, null, null, 0);
-                case "TIMEOUT":
-                    return new ParsedMessage(MessageType.ERROR_TIMEOUT,
-                            s, null, null, 0);
-                case "BUSY":
-                    return new ParsedMessage(MessageType.ERROR_BUSY,
-                            s, null, null, 0);
-                case "WATCHDOG":
-                case "WDG":
-                    return new ParsedMessage(MessageType.ERROR_WATCHDOG,
-                            s, null, null, 0);
-                case "HMAC_INVALID":
-                    Log.e(TAG, "[SECURITY] Token HMAC inválido — possível replay attack!");
-                    return new ParsedMessage(MessageType.ERROR_HMAC_INVALID,
-                            s, null, null, 0);
-                case "DUPLICATE":
-                    return new ParsedMessage(MessageType.ERROR_DUPLICATE,
-                            s, null, null, 0);
-                case "QUEUE_FULL":
-                    return new ParsedMessage(MessageType.ERROR_QUEUE_FULL,
-                            s, null, null, 0);
-                case "VALVE_STUCK":
-                    Log.e(TAG, "[ERROR] Válvula travada — verificar hardware!");
-                    return new ParsedMessage(MessageType.ERROR_VALVE_STUCK,
-                            s, null, null, 0);
-                case "INVALID_AUTH":
-                    // Firmware v2.0: pacote AUTH mal-formado (falta campo ou token muito curto)
-                    Log.e(TAG, "[AUTH] ERROR:INVALID_AUTH — formato do pacote AUTH incorreto");
-                    return new ParsedMessage(MessageType.AUTH_FAIL, s, null, null, 0);
-                default:
-                    // Captura ERROR:INVALID_TOKEN|<detalhe> com pipe (ex: INVALID_TOKEN|HMAC invalido)
-                    if (err.startsWith("INVALID_TOKEN")) {
-                        String detail = err.contains("|") ? err.substring(err.indexOf('|') + 1) : err;
-                        Log.e(TAG, "[AUTH] ERROR:INVALID_TOKEN — " + detail
-                                + " (HMAC inválido ou token expirado)");
-                        return new ParsedMessage(MessageType.AUTH_FAIL, s, null, null, 0);
-                    }
-                    Log.e(TAG, "[ERROR] Código desconhecido: " + err);
-                    return new ParsedMessage(MessageType.UNKNOWN, s, null, null, 0);
-            }
-        }
-
-        // ── 4. STATUS: ────────────────────────────────────────────────────────
-
-        if (s.startsWith("STATUS:")) {
-            String st = s.substring(7).trim();
-            switch (st) {
-                case "IDLE":    return new ParsedMessage(MessageType.STATUS_IDLE,    s, null, null, 0);
-                case "RUNNING": return new ParsedMessage(MessageType.STATUS_RUNNING, s, null, null, 0);
-                case "ERROR":   return new ParsedMessage(MessageType.STATUS_ERROR,   s, null, null, 0);
-                case "READY":   return new ParsedMessage(MessageType.STATUS_READY,   s, null, null, 0);
-                case "BUSY":    return new ParsedMessage(MessageType.STATUS_BUSY,    s, null, null, 0);
-                default:        return new ParsedMessage(MessageType.UNKNOWN,        s, null, null, 0);
-            }
-        }
-
-        // ── 5. VALVE: ─────────────────────────────────────────────────────────
-
-        if (s.startsWith("VALVE:")) {
-            String v = s.substring(6).trim();
-            if (v.equals("OPEN"))   return new ParsedMessage(MessageType.VALVE_OPEN,   s, null, null, 0);
-            if (v.equals("CLOSED")) return new ParsedMessage(MessageType.VALVE_CLOSED, s, null, null, 0);
-        }
-
-        // ── 6. VP: progresso parcial ──────────────────────────────────────────
-
+        // ── VP: — volume parcial durante liberação ───────────────────────────
         if (s.startsWith("VP:")) {
-            int ml = (int) Math.round(parseDoubleSafe(s.substring(3).trim()));
-            return new ParsedMessage(MessageType.VP, s, null, null, ml);
+            double val = parseDoubleSafe(s.substring(3).trim());
+            int intVal = (int) Math.round(val);
+            return new ParsedMessage(MessageType.VP, s, intVal, val);
         }
 
-        // ── 7. AUTH ───────────────────────────────────────────────────────────
-
-        if (s.startsWith("AUTH_OK|")) {
-            return new ParsedMessage(MessageType.AUTH_OK, s,
-                    getPart(parts, 1), getPart(parts, 2), 0);
-        }
-        if (s.startsWith("AUTH_FAIL|")) {
-            return new ParsedMessage(MessageType.AUTH_FAIL, s,
-                    getPart(parts, 1), getPart(parts, 2), 0);
-        }
-        if (s.startsWith("AUTH:")) {
-            String authResult = s.substring(5).trim();
-            if (authResult.equals("OK"))   return new ParsedMessage(MessageType.AUTH_OK,   s, null, null, 0);
-            if (authResult.equals("FAIL")) return new ParsedMessage(MessageType.AUTH_FAIL, s, null, null, 0);
+        // ── QP: — quantidade de pulsos ao final ──────────────────────────────
+        if (s.startsWith("QP:")) {
+            int val = parseIntSafe(s.substring(3).trim());
+            return new ParsedMessage(MessageType.QP, s, val, val);
         }
 
-        // ── 8. Literais fixos ─────────────────────────────────────────────────
+        // ── ML: — volume final liberado (conclusão) ──────────────────────────
+        if (s.startsWith("ML:")) {
+            double val = parseDoubleSafe(s.substring(3).trim());
+            int intVal = (int) Math.round(val);
+            Log.i(TAG, "[PARSE] Liberação concluída: " + intVal + "mL");
+            return new ParsedMessage(MessageType.ML, s, intVal, val);
+        }
 
-        if (s.equals("QUEUE:FULL"))
-            return new ParsedMessage(MessageType.QUEUE_FULL, s, null, null, 0);
-        if (s.equals("READY"))
-            return new ParsedMessage(MessageType.STATUS_READY, s, null, null, 0);
-        if (s.equals("BUSY"))
-            return new ParsedMessage(MessageType.STATUS_BUSY, s, null, null, 0);
-        if (s.equals("DUPLICATE") || s.equals("ML:DUPLICATE"))
-            return new ParsedMessage(MessageType.DUPLICATE, s, null, null, 0);
+        // ── PL: — resposta de leitura de pulsos/litro ────────────────────────
+        if (s.startsWith("PL:")) {
+            int val = parseIntSafe(s.substring(3).trim());
+            return new ParsedMessage(MessageType.PL, s, val, val);
+        }
 
-        // ── 9. Compatibilidade legada ─────────────────────────────────────────
-
-        if (s.equals("ML:ACK"))
-            return new ParsedMessage(MessageType.ACK, s, null, null, 0);
-
-        // ── 10. Desconhecido ──────────────────────────────────────────────────
-
+        // ── Desconhecido ─────────────────────────────────────────────────────
         Log.d(TAG, "[PARSE] Mensagem não reconhecida: [" + s + "]");
-        return new ParsedMessage(MessageType.UNKNOWN, s, null, null, 0);
+        return new ParsedMessage(MessageType.UNKNOWN, s);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════
     // Utilitários internos
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private static String getPart(String[] parts, int index) {
-        if (parts == null || index >= parts.length) return null;
-        String p = parts[index].trim();
-        return p.isEmpty() ? null : p;
-    }
-
-    /** Extrai CMD_ID de um campo, removendo prefixo "ID=" se presente. */
-    private static String extractCmdId(String[] parts, int index) {
-        String part = getPart(parts, index);
-        if (part == null) return null;
-        if (part.startsWith("ID=")) return part.substring(3).trim();
-        return part;
-    }
+    // ═══════════════════════════════════════════════════════════════════════════
 
     private static int parseIntSafe(String s) {
         if (s == null) return 0;
@@ -380,77 +168,34 @@ public class BleParser {
         catch (NumberFormatException e) { return 0.0; }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Testes de validação (executar no onCreate ou em modo debug)
-    // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Testes de validação
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Executa bateria de testes do parser v2.0.
+     * Executa bateria de testes do parser v4.0 NUS.
      * Chamar em modo debug para validar o parser antes de produção.
      */
     public static void runSimulationTests() {
-        Log.i(TAG, "═══ INICIANDO VALIDAÇÃO DO PARSER v2.0 ═══");
+        Log.i(TAG, "═══ INICIANDO VALIDAÇÃO DO PARSER v4.0 NUS ═══");
 
-        // Operacionais
-        validate("ACK|A1B2C3D4");
-        validate("DONE|A1B2C3D4|300|SES_8472ABCD");
-        validate("PONG|A1B2C3D4");
+        validate("OK");
+        validate("ERRO");
+        validate("VP:50");
         validate("VP:150.5");
+        validate("QP:2940");
+        validate("ML:100");
+        validate("ML:300.5");
+        validate("PL:5880");
+        validate("DESCONHECIDO");
+        validate("");
+        validate(null);
 
-        // Autenticação
-        validate("AUTH:OK");
-        validate("AUTH:FAIL");
-        validate("AUTH_OK|A1B2C3D4|SES_8472ABCD");
-        validate("AUTH_FAIL|A1B2C3D4|SES_8472ABCD");
-
-        // Erros v2.0
-        validate("ERROR:SESSION_MISMATCH");
-        validate("ERROR:NOT_AUTHENTICATED");
-        validate("ERROR:NOT_READY");
-        validate("ERROR:VOLUME_EXCEEDED");
-        validate("ERROR:TIMEOUT");
-        validate("ERROR:BUSY");
-        validate("ERROR:WATCHDOG");
-        validate("ERROR:HMAC_INVALID");
-        validate("ERROR:DUPLICATE");
-        validate("ERROR:QUEUE_FULL");
-        validate("ERROR:VALVE_STUCK");
-
-        // Alertas v2.0 (NOVO)
-        validate("WARN:FLOW_TIMEOUT");
-        validate("WARN:VOLUME_EXCEEDED");
-
-        // Válvula
-        validate("VALVE:OPEN");
-        validate("VALVE:CLOSED");
-
-        // Estados
-        validate("STATUS:IDLE");
-        validate("STATUS:RUNNING");
-        validate("STATUS:ERROR");
-        validate("STATUS:READY");
-        validate("STATUS:BUSY");
-
-        // Literais
-        validate("QUEUE:FULL");
-        validate("READY");
-        validate("BUSY");
-        validate("DUPLICATE");
-
-        // Legado
-        validate("ML:ACK");
-        validate("ML:DUPLICATE");
-
-        Log.i(TAG, "═══ VALIDAÇÃO FINALIZADA ═══");
+        Log.i(TAG, "═══ VALIDAÇÃO CONCLUÍDA ═══");
     }
 
-    private static void validate(String raw) {
-        ParsedMessage pm = parse(raw);
-        String status = (pm.type != MessageType.UNKNOWN) ? "✔ OK" : "✖ FAILED";
-        Log.d(TAG, String.format("[%s] %-30s → %-25s | cmd=%-8s | ml=%d | warn=%s",
-                status, raw, pm.type,
-                (pm.commandId != null ? pm.commandId : "-"),
-                pm.mlReal,
-                (pm.warnType  != null ? pm.warnType  : "-")));
+    private static void validate(String input) {
+        ParsedMessage result = parse(input);
+        Log.d(TAG, "[TEST] input=[" + input + "] → " + result);
     }
 }

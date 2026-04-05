@@ -101,7 +101,7 @@ public class ChopperController {
         this.currentMlReceived = 0;
         this.apiRequestSent = false; // *** RESET GUARD ***
 
-        String command = "SERVE|" + mlRequested + "|DUMMY|DUMMY";
+        String command = "$ML:" + mlRequested;
         bleManager.sendCommand(command);
 
         if (listener != null) {

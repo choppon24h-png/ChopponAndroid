@@ -6,71 +6,73 @@ import android.util.Log;
 
 import java.util.LinkedList;
 import java.util.Queue;
-import java.util.UUID;
 
 /**
- * CommandQueue — Fila de comandos BLE com suporte ao protocolo v2.0 FRANQ.
+ * CommandQueue — Fila de comandos BLE para protocolo NUS v4.0.
  *
  * ═══════════════════════════════════════════════════════════════════════
- * CICLO DE VIDA
+ * PROTOCOLO NUS v4.0 (simplificado)
  * ═══════════════════════════════════════════════════════════════════════
  *
- *   enqueueServe() → processQueue() → enviarComandoAtivo()
+ *   enqueue() → processQueue() → enviarComandoAtivo()
  *        │                                    │
  *        ▼                                    ▼
- *   BleCommand.QUEUED             BleCommand.SENT
+ *   QUEUED                            SENT (write BLE)
  *                                             │
  *                              ┌──────────────┴──────────────┐
  *                              ▼                             ▼
- *                         ACK recebido               ACK timeout
- *                         ACKED                      retry ou ERROR
+ *                     Resposta recebida              Timeout (sem resposta)
+ *                     OK/VP:/ML:/PL:/ERRO            retry ou ERROR
  *                              │
- *                    ┌─────────┴─────────┐
- *                    ▼                   ▼
- *               DONE recebido       DONE timeout
- *               DONE                ERROR
+ *                              ▼
+ *                           DONE
  *
- * ═══════════════════════════════════════════════════════════════════════
- * NOVIDADES v2.0
- * ═══════════════════════════════════════════════════════════════════════
+ * NÃO existe mais: ACK, DONE|cmd_id, PONG, HMAC, SESSION_ID, CMD_ID,
+ *                  ERROR:HMAC_INVALID, ERROR:DUPLICATE, ERROR:SESSION_MISMATCH
  *
- *  - Tratamento de ERROR:VOLUME_EXCEEDED (novo)
- *  - Tratamento de ERROR:HMAC_INVALID (novo — alerta de segurança)
- *  - Tratamento de ERROR:DUPLICATE (novo — anti-replay)
- *  - Tratamento de ERROR:VALVE_STUCK (novo — falha mecânica)
- *  - Tratamento de WARN:FLOW_TIMEOUT (novo — barril vazio)
- *  - Tratamento de WARN:VOLUME_EXCEEDED (novo — volume excedido)
- *  - Callback onWarning() para alertas operacionais
+ * Comandos suportados:
+ *   $ML:<volume>  — Liberar volume em ml
+ *   $LB:          — Liberação contínua
+ *   $ML:0         — Parar liberação
+ *   $PL:<pulsos>  — Configurar pulsos/litro
+ *   $PL:0         — Consultar pulsos/litro
+ *   $TO:<ms>      — Configurar timeout
+ *   $TO:          — Consultar timeout
  *
- * @version 2.0.0
- * @since   2026-03-22
+ * Respostas esperadas:
+ *   OK            — Comando aceito
+ *   ERRO          — Comando rejeitado
+ *   VP:<valor>    — Volume parcial liberado
+ *   ML:<valor>    — Volume total final (operação concluída)
+ *   PL:<valor>    — Pulsos por litro atual
+ *   QP:<valor>    — Quantidade de pulsos
+ *   TO:<valor>    — Timeout atual
+ *
+ * @version 4.0.0
  */
 public class CommandQueue {
 
     private static final String TAG = "BLE_CMD_QUEUE";
 
-    public static final int  MAX_QUEUE_SIZE  = 10;
-    private static final long ACK_TIMEOUT_MS  = 8_000L; // Aumentado de 2s para 8s para suportar lentidão do BLE
-    private static final long DONE_TIMEOUT_MS = 15_000L;  // aumentado de 10s para 15s (sensor de fluxo)
-    public static final int  MAX_RETRIES     = 2;
+    public static final int   MAX_QUEUE_SIZE     = 10;
+    private static final long RESPONSE_TIMEOUT_MS = 10_000L;
+    public static final int   MAX_RETRIES        = 2;
 
-    private final Queue<BleCommand> mQueue  = new LinkedList<>();
-    private BleCommand              mActive = null;
-    private boolean                 mPaused = false;
+    private final Queue<String> mQueue  = new LinkedList<>();
+    private String              mActive = null;
+    private boolean             mPaused = false;
 
-    private final Handler  mHandler             = new Handler(Looper.getMainLooper());
-    private Runnable       mAckTimeoutRunnable  = null;
-    private Runnable       mDoneTimeoutRunnable = null;
+    private final Handler mHandler              = new Handler(Looper.getMainLooper());
+    private Runnable      mResponseTimeoutRunnable = null;
 
     // ── Interfaces de callback ────────────────────────────────────────────────
 
     public interface Callback {
-        void onSend(BleCommand cmd);
-        void onAck(BleCommand cmd);
-        void onDone(BleCommand cmd);
-        void onError(BleCommand cmd, String reason);
+        void onSend(String command);
+        void onResponse(String command, String response);
+        void onError(String command, String reason);
         void onQueueFull();
-        /** NOVO v2.0 — alerta operacional (barril vazio, volume excedido, etc.) */
+        /** Alerta operacional */
         default void onWarning(String warnType) {
             Log.w("BLE_CMD_QUEUE", "[WARN] " + warnType);
         }
@@ -82,6 +84,7 @@ public class CommandQueue {
 
     private final Callback  mCallback;
     private final BleWriter mWriter;
+    private int mRetryCount = 0;
 
     public CommandQueue(BleWriter writer, Callback callback) {
         this.mWriter   = writer;
@@ -92,142 +95,123 @@ public class CommandQueue {
     // Enfileiramento
     // ═══════════════════════════════════════════════════════════════════════
 
-    public synchronized BleCommand enqueueServe(int volumeMl, String sessionId) {
-        if (mActive != null) {
-            Log.w(TAG, "[QUEUE] SERVE bloqueado — comando em execução: " + mActive.commandId);
-            return null;
-        }
-        if (!mQueue.isEmpty()) {
-            Log.w(TAG, "[QUEUE] SERVE bloqueado — fila já possui comando pendente");
-            return null;
+    /**
+     * Enfileira um comando para envio ao ESP32.
+     * Formato: "$ML:100", "$PL:0", "$LB:", "$TO:5000", etc.
+     */
+    public synchronized boolean enqueue(String command) {
+        if (command == null || command.isEmpty()) {
+            Log.w(TAG, "[QUEUE] Comando vazio — ignorando");
+            return false;
         }
         if (mQueue.size() >= MAX_QUEUE_SIZE) {
-            Log.e(TAG, "[QUEUE] Fila cheia (" + MAX_QUEUE_SIZE + ") — rejeitando SERVE vol=" + volumeMl);
+            Log.e(TAG, "[QUEUE] Fila cheia (" + MAX_QUEUE_SIZE + ") — rejeitando: " + command);
             if (mCallback != null) mCallback.onQueueFull();
-            return null;
+            return false;
         }
 
-        String cmdId = gerarCmdId();
-        BleCommand cmd = new BleCommand(BleCommand.Type.SERVE, cmdId, sessionId, volumeMl);
-        mQueue.add(cmd);
-        Log.i(TAG, "[QUEUE] enqueue → " + cmd + " | fila=" + mQueue.size());
+        mQueue.add(command);
+        Log.i(TAG, "[QUEUE] enqueue → " + command + " | fila=" + mQueue.size());
         processQueue();
-        return cmd;
+        return true;
     }
 
-    public synchronized void enqueuePing() {
-        if (mActive != null && mActive.type == BleCommand.Type.PING) return;
-        String cmdId = gerarCmdId().substring(0, 4);
-        BleCommand cmd = new BleCommand(BleCommand.Type.PING, cmdId, "", 0);
-        mQueue.add(cmd);
-        processQueue();
+    /**
+     * Enfileira um comando de liberação de volume.
+     * Compatibilidade com código legado.
+     */
+    public synchronized boolean enqueueServe(int volumeMl) {
+        return enqueue("$ML:" + volumeMl);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Processamento de respostas BLE — Protocolo v2.0
+    // Processamento de respostas BLE — Protocolo NUS v4.0
     // ═══════════════════════════════════════════════════════════════════════
 
-    public synchronized void onBleResponse(BleParser.ParsedMessage msg) {
-        if (msg == null) return;
+    /**
+     * Processa resposta recebida do ESP32 via notificação BLE.
+     * Respostas válidas: OK, ERRO, VP:, ML:, PL:, QP:, TO:
+     */
+    public synchronized void onBleResponse(String response) {
+        if (response == null || response.isEmpty()) return;
 
-        Log.d(TAG, "[QUEUE] resposta: " + msg + " | ativo=" + mActive);
+        String trimmed = response.trim();
+        Log.d(TAG, "[QUEUE] resposta: " + trimmed + " | ativo=" + mActive);
 
-        switch (msg.type) {
+        // OK — comando aceito
+        if ("OK".equalsIgnoreCase(trimmed)) {
+            Log.i(TAG, "[QUEUE] OK recebido para: " + mActive);
+            // OK não finaliza o comando — aguardamos ML: ou PL: como resposta final
+            // Mas para comandos de configuração ($PL:, $TO:), OK pode ser a resposta final
+            if (mActive != null && !mActive.startsWith("$ML:") && !mActive.equals("$LB:")) {
+                completarComando(trimmed);
+            }
+            return;
+        }
 
-            // ── Operacionais ─────────────────────────────────────────────────
-            case ACK:
-                handleAck(msg.commandId);
-                break;
-            case DONE:
-                handleDone(msg.commandId, msg.mlReal, msg.sessionId);
-                break;
-            case DUPLICATE:
-            case ERROR_DUPLICATE:
-                handleDuplicate();
-                break;
+        // ERRO — comando rejeitado
+        if ("ERRO".equalsIgnoreCase(trimmed)) {
+            Log.e(TAG, "[QUEUE] ERRO recebido para: " + mActive);
+            if (mActive != null) {
+                falharComando(mActive, "ESP32 retornou ERRO");
+            }
+            return;
+        }
 
-            // ── Erros com retry ───────────────────────────────────────────────
-            case ERROR_BUSY:
-                handleErrorBusy();
-                break;
-            case ERROR_WATCHDOG:
-                handleErrorWatchdog();
-                break;
+        // ML: — Volume total final (operação de liberação concluída)
+        if (trimmed.startsWith("ML:")) {
+            Log.i(TAG, "[QUEUE] ML recebido — operação concluída: " + trimmed);
+            completarComando(trimmed);
+            return;
+        }
 
-            // ── Erros sem retry (v2.0) ────────────────────────────────────────
-            case ERROR_VOLUME_EXCEEDED:
-                Log.e(TAG, "[QUEUE] ERROR:VOLUME_EXCEEDED — volume solicitado inválido");
-                if (mActive != null) falharComando(mActive, BleCommand.ErrorCode.VOLUME_EXCEEDED);
-                break;
+        // VP: — Volume parcial (não finaliza o comando, apenas notifica)
+        if (trimmed.startsWith("VP:")) {
+            Log.d(TAG, "[QUEUE] VP parcial: " + trimmed);
+            if (mCallback != null && mActive != null) {
+                mCallback.onResponse(mActive, trimmed);
+            }
+            // Renova timeout — ainda esperando ML:
+            if (mActive != null && (mActive.startsWith("$ML:") || mActive.equals("$LB:"))) {
+                iniciarResponseTimeout();
+            }
+            return;
+        }
 
-            case ERROR_HMAC_INVALID:
-                Log.e(TAG, "[SECURITY] ERROR:HMAC_INVALID — token inválido! Verificar chave HMAC.");
-                if (mActive != null) falharComando(mActive, BleCommand.ErrorCode.HMAC_INVALID);
-                break;
+        // QP: — Quantidade de pulsos
+        if (trimmed.startsWith("QP:")) {
+            Log.d(TAG, "[QUEUE] QP: " + trimmed);
+            if (mCallback != null && mActive != null) {
+                mCallback.onResponse(mActive, trimmed);
+            }
+            return;
+        }
 
-            case ERROR_SESSION_MISMATCH:
-                Log.e(TAG, "[QUEUE] ERROR:SESSION_MISMATCH — SESSION_ID não corresponde");
-                if (mActive != null) falharComando(mActive, BleCommand.ErrorCode.SESSION_MISMATCH);
-                break;
+        // PL: — Pulsos por litro (resposta a $PL:0 ou $PL:<valor>)
+        if (trimmed.startsWith("PL:")) {
+            Log.d(TAG, "[QUEUE] PL: " + trimmed);
+            completarComando(trimmed);
+            return;
+        }
 
-            case ERROR_NOT_AUTHENTICATED:
-                Log.e(TAG, "[QUEUE] ERROR:NOT_AUTHENTICATED — aguardando AUTH:OK");
-                if (mActive != null) falharComando(mActive, BleCommand.ErrorCode.NOT_AUTHENTICATED);
-                break;
-            case ERROR_NOT_READY:
-                Log.w(TAG, "[QUEUE] ERROR:NOT_READY — ESP32 ainda não pronto para SERVE");
-                handleErrorNotReady();
-                break;
+        // TO: — Timeout (resposta a $TO: ou $TO:<valor>)
+        if (trimmed.startsWith("TO:")) {
+            Log.d(TAG, "[QUEUE] TO: " + trimmed);
+            completarComando(trimmed);
+            return;
+        }
 
-            case ERROR_TIMEOUT:
-                Log.e(TAG, "[QUEUE] ERROR:TIMEOUT do ESP32");
-                if (mActive != null) falharComando(mActive, BleCommand.ErrorCode.TIMEOUT);
-                break;
-
-            case ERROR_VALVE_STUCK:
-                Log.e(TAG, "[HARDWARE] ERROR:VALVE_STUCK — válvula travada! Verificar hardware.");
-                if (mActive != null) falharComando(mActive, BleCommand.ErrorCode.VALVE_STUCK);
-                break;
-
-            case ERROR_QUEUE_FULL:
-                Log.e(TAG, "[QUEUE] ERROR:QUEUE_FULL — fila do ESP32 cheia");
-                if (mActive != null) falharComando(mActive, BleCommand.ErrorCode.QUEUE_FULL);
-                break;
-
-            // ── Alertas operacionais (NOVO v2.0) ──────────────────────────────
-            case WARN_FLOW_TIMEOUT:
-                Log.w(TAG, "[WARN] FLOW_TIMEOUT — barril vazio ou sem fluxo!");
-                if (mCallback != null) mCallback.onWarning(BleCommand.WarnCode.FLOW_TIMEOUT);
-                // Não falha o comando — o ESP32 enviará DONE com ml_real = 0 ou o volume parcial
-                break;
-
-            case WARN_VOLUME_EXCEEDED:
-                Log.w(TAG, "[WARN] VOLUME_EXCEEDED — volume real excedeu o solicitado");
-                if (mCallback != null) mCallback.onWarning(BleCommand.WarnCode.VOLUME_EXCEEDED);
-                break;
-
-            // ── Heartbeat ─────────────────────────────────────────────────────
-            case PONG:
-                handlePong();
-                break;
-
-            // ── Estados ───────────────────────────────────────────────────────
-            case STATUS_READY:
-                Log.i(TAG, "[QUEUE] STATUS:READY — ESP32 pronto");
-                break;
-            case STATUS_BUSY:
-                Log.w(TAG, "[QUEUE] STATUS:BUSY — ESP32 ocupado");
-                break;
-
-            default:
-                break;
+        // Resposta desconhecida
+        Log.w(TAG, "[QUEUE] Resposta desconhecida: " + trimmed);
+        if (mCallback != null && mActive != null) {
+            mCallback.onResponse(mActive, trimmed);
         }
     }
 
     public synchronized void onBleDisconnected() {
         if (mActive != null) {
-            Log.w(TAG, "[RESET] BLE desconectado durante SERVE — mantendo comando ativo: " + mActive.commandId);
-            cancelAllTimeouts();
+            Log.w(TAG, "[RESET] BLE desconectado durante comando: " + mActive);
+            cancelResponseTimeout();
             mPaused = true;
             return;
         }
@@ -236,115 +220,36 @@ public class CommandQueue {
     }
 
     public synchronized void onBleReady() {
-        Log.i(TAG, "[QUEUE] BLE READY — aguardando novos comandos | ativo="
-                + mActive + " | fila=" + mQueue.size());
+        Log.i(TAG, "[QUEUE] BLE READY — ativo=" + mActive + " | fila=" + mQueue.size());
         mPaused = false;
         processQueue();
     }
 
-    public synchronized BleCommand getActiveCommand() { return mActive; }
-    public synchronized int size()                    { return mQueue.size(); }
+    public synchronized String getActiveCommand() { return mActive; }
+    public synchronized int size()                 { return mQueue.size(); }
 
     public synchronized void reset() {
         Log.w(TAG, "[QUEUE] reset() — limpando fila e cancelando ativo");
-        cancelAllTimeouts();
+        cancelResponseTimeout();
         mQueue.clear();
         mActive = null;
         mPaused = false;
+        mRetryCount = 0;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     // Handlers internos
     // ═══════════════════════════════════════════════════════════════════════
 
-    private void handleAck(String ackId) {
-        if (mActive == null) {
-            Log.w(TAG, "[QUEUE] ACK recebido sem comando ativo");
-            return;
-        }
-        boolean idMatch = (ackId == null || ackId.isEmpty()
-                || mActive.commandId.equalsIgnoreCase(ackId));
-        if (!idMatch) {
-            Log.w(TAG, "[QUEUE] ACK id=" + ackId + " não bate com ativo=" + mActive.commandId);
-            return;
-        }
-        Log.i(TAG, "[QUEUE] ACK → " + mActive.commandId);
-        cancelAckTimeout();
-        mActive.state = BleCommand.State.ACKED;
-        if (mCallback != null) mCallback.onAck(mActive);
-        iniciarDoneTimeout();
-    }
-
-    private void handleDone(String doneId, int mlReal, String sessionId) {
-        if (mActive == null) {
-            Log.w(TAG, "[QUEUE] DONE recebido sem comando ativo — ignorando");
-            return;
-        }
-        if (doneId != null && !doneId.isEmpty()
-                && !doneId.equalsIgnoreCase(mActive.commandId)) {
-            Log.w(TAG, "[QUEUE] DONE id=" + doneId + " não bate com ativo=" + mActive.commandId);
-            return;
-        }
-        Log.i(TAG, "[QUEUE] DONE → " + mActive.commandId
-                + " | ml_real=" + mlReal + " | session=" + sessionId);
-        cancelAllTimeouts();
-        mActive.state  = BleCommand.State.DONE;
-        mActive.mlReal = mlReal;
-        if (mCallback != null) mCallback.onDone(mActive);
+    private void completarComando(String response) {
+        cancelResponseTimeout();
+        String cmd = mActive;
         mActive = null;
+        mRetryCount = 0;
+        if (mCallback != null && cmd != null) {
+            mCallback.onResponse(cmd, response);
+        }
         processQueue();
-    }
-
-    private void handleDuplicate() {
-        Log.w(TAG, "[QUEUE] DUPLICATE — firmware já executou este comando");
-        if (mActive != null) {
-            mActive.state = BleCommand.State.DONE;
-            cancelAllTimeouts();
-            if (mCallback != null) mCallback.onDone(mActive);
-            mActive = null;
-            processQueue();
-        }
-    }
-
-    private void handleErrorBusy() {
-        Log.w(TAG, "[QUEUE] ERROR:BUSY — ESP32 ocupado, aguardando 2s para reenvio");
-        if (mActive != null && mActive.canRetry()) {
-            mActive.retryCount++;
-            mActive.state = BleCommand.State.QUEUED;
-            cancelAllTimeouts();
-            mHandler.postDelayed(this::processQueue, 2_000L);
-        } else if (mActive != null) {
-            falharComando(mActive, BleCommand.ErrorCode.BUSY + " — máximo de retries atingido");
-        }
-    }
-
-    private void handleErrorWatchdog() {
-        Log.e(TAG, "[QUEUE] ERROR:WATCHDOG recebido do ESP32 — placa reiniciando");
-        if (mActive != null) {
-            falharComando(mActive, BleCommand.ErrorCode.WATCHDOG);
-        }
-    }
-
-    private void handleErrorNotReady() {
-        if (mActive == null) return;
-        cancelAckTimeout();
-        if (mActive.canRetry()) {
-            mActive.retryCount++;
-            mActive.state = BleCommand.State.QUEUED;
-            mHandler.postDelayed(this::processQueue, 1_000L);
-        } else {
-            falharComando(mActive, BleCommand.ErrorCode.BLE_NOT_READY);
-        }
-    }
-
-    private void handlePong() {
-        Log.d(TAG, "[QUEUE] PONG — removendo PING ativo");
-        if (mActive != null && mActive.type == BleCommand.Type.PING) {
-            cancelAllTimeouts();
-            mActive.state = BleCommand.State.DONE;
-            mActive = null;
-            processQueue();
-        }
     }
 
     private void processQueue() {
@@ -353,7 +258,7 @@ public class CommandQueue {
             return;
         }
         if (mActive != null) {
-            Log.d(TAG, "[QUEUE] processQueue() — aguardando " + mActive.commandId);
+            Log.d(TAG, "[QUEUE] processQueue() — aguardando resposta de: " + mActive);
             return;
         }
         if (mQueue.isEmpty()) {
@@ -361,104 +266,66 @@ public class CommandQueue {
             return;
         }
         mActive = mQueue.poll();
+        mRetryCount = 0;
         enviarComandoAtivo();
     }
 
     private void enviarComandoAtivo() {
         if (mActive == null) return;
 
-        String bleStr = mActive.toBleString();
-        Log.i(TAG, "[QUEUE] SEND " + mActive.type.name() + " " + mActive.commandId
-                + " | cmd=[" + bleStr + "]");
+        Log.i(TAG, "[QUEUE] SEND [" + mActive + "]");
 
-        boolean ok = mWriter.write(bleStr);
+        boolean ok = mWriter.write(mActive);
         if (ok) {
-            mActive.state = BleCommand.State.SENT;
             if (mCallback != null) mCallback.onSend(mActive);
-            long ackTimeout = (mActive.type == BleCommand.Type.PING) ? 3_000L : ACK_TIMEOUT_MS;
-            iniciarAckTimeout(ackTimeout);
+            iniciarResponseTimeout();
         } else {
-            Log.e(TAG, "[QUEUE] write() falhou para " + mActive.commandId);
-            mActive.retryCount++;
-            if (mActive.canRetry()) {
-                mActive.state = BleCommand.State.QUEUED;
-                mQueue.add(mActive);
-                mActive = null;
-                mHandler.postDelayed(this::processQueue, 1_000L);
+            Log.e(TAG, "[QUEUE] write() falhou para: " + mActive);
+            mRetryCount++;
+            if (mRetryCount <= MAX_RETRIES) {
+                mHandler.postDelayed(this::enviarComandoAtivo, 1_000L);
             } else {
                 falharComando(mActive,
-                        BleCommand.ErrorCode.BLE_WRITE_FAILED
-                                + " após " + MAX_RETRIES + " tentativas");
+                        "BLE write falhou após " + MAX_RETRIES + " tentativas");
             }
         }
     }
 
-    private void falharComando(BleCommand cmd, String reason) {
-        Log.e(TAG, "[QUEUE] ERROR → " + cmd.commandId + " | motivo=" + reason);
-        cancelAllTimeouts();
-        cmd.state        = BleCommand.State.ERROR;
-        cmd.errorMessage = reason;
+    private void falharComando(String cmd, String reason) {
+        Log.e(TAG, "[QUEUE] ERROR → " + cmd + " | motivo=" + reason);
+        cancelResponseTimeout();
         if (mCallback != null) mCallback.onError(cmd, reason);
         mActive = null;
+        mRetryCount = 0;
         mQueue.clear();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Timeouts
+    // Timeout
     // ═══════════════════════════════════════════════════════════════════════
 
-    private void iniciarAckTimeout(long ms) {
-        cancelAckTimeout();
-        mAckTimeoutRunnable = () -> {
+    private void iniciarResponseTimeout() {
+        cancelResponseTimeout();
+        mResponseTimeoutRunnable = () -> {
             synchronized (CommandQueue.this) {
-                if (mActive == null || mActive.state != BleCommand.State.SENT) return;
-                Log.e(TAG, "[QUEUE] ACK TIMEOUT (" + ms + "ms) para " + mActive.commandId
-                        + " | retry=" + mActive.retryCount + "/" + MAX_RETRIES);
-                if (mActive.canRetry()) {
-                    mActive.retryCount++;
-                    mActive.state = BleCommand.State.QUEUED;
+                if (mActive == null) return;
+                Log.e(TAG, "[TIMEOUT] Sem resposta em " + RESPONSE_TIMEOUT_MS + "ms para: " + mActive);
+                mRetryCount++;
+                if (mRetryCount <= MAX_RETRIES) {
+                    Log.w(TAG, "[RETRY] Tentativa " + mRetryCount + "/" + MAX_RETRIES);
                     enviarComandoAtivo();
                 } else {
-                    falharComando(mActive, "ACK timeout após " + MAX_RETRIES + " tentativas");
+                    falharComando(mActive, "Timeout após " + MAX_RETRIES + " tentativas");
                 }
             }
         };
-        mHandler.postDelayed(mAckTimeoutRunnable, ms);
+        mHandler.postDelayed(mResponseTimeoutRunnable, RESPONSE_TIMEOUT_MS);
     }
 
-    private void iniciarDoneTimeout() {
-        cancelDoneTimeout();
-        mDoneTimeoutRunnable = () -> {
-            synchronized (CommandQueue.this) {
-                if (mActive == null || mActive.state != BleCommand.State.ACKED) return;
-                Log.e(TAG, "[TIMEOUT] DONE não recebido em " + DONE_TIMEOUT_MS + "ms"
-                        + " | cmd=" + mActive.commandId);
-                falharComando(mActive, "DONE timeout após " + DONE_TIMEOUT_MS + "ms");
-            }
-        };
-        mHandler.postDelayed(mDoneTimeoutRunnable, DONE_TIMEOUT_MS);
-    }
-
-    private void cancelAckTimeout() {
-        if (mAckTimeoutRunnable != null) {
-            mHandler.removeCallbacks(mAckTimeoutRunnable);
-            mAckTimeoutRunnable = null;
+    private void cancelResponseTimeout() {
+        if (mResponseTimeoutRunnable != null) {
+            mHandler.removeCallbacks(mResponseTimeoutRunnable);
+            mResponseTimeoutRunnable = null;
         }
-    }
-
-    private void cancelDoneTimeout() {
-        if (mDoneTimeoutRunnable != null) {
-            mHandler.removeCallbacks(mDoneTimeoutRunnable);
-            mDoneTimeoutRunnable = null;
-        }
-    }
-
-    private void cancelAllTimeouts() {
-        cancelAckTimeout();
-        cancelDoneTimeout();
-    }
-
-    private static String gerarCmdId() {
-        return UUID.randomUUID().toString().replace("-", "").substring(0, 8).toUpperCase();
     }
 }

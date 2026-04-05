@@ -44,9 +44,9 @@ public class Bluetooth2 extends BleManager {
     public Boolean started = false;
     private TextView txtQtdLocal;
     protected static final UUID CHARACTERISTIC_UPDATE_NOTIFICATION_DESCRIPTOR_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
-    protected static final UUID TX = UUID.fromString("7f0a0003-7b6b-4b5f-9d3e-3c7b9f100001");
-    protected static final UUID RX = UUID.fromString("7f0a0002-7b6b-4b5f-9d3e-3c7b9f100001");
-    protected static final UUID serviceUuid = UUID.fromString("7f0a0001-7b6b-4b5f-9d3e-3c7b9f100001");
+    protected static final UUID TX = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
+    protected static final UUID RX = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
+    protected static final UUID serviceUuid = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
 
     private Integer mlsLiberados = 0;
     private Context localContext;
@@ -141,11 +141,11 @@ public class Bluetooth2 extends BleManager {
 
         if (!connectedGattDevices.isEmpty()) {
             final Integer mlsSolicitado = qtd_ml;
-            String command = "SERVE|" + qtd_ml.toString() + "|DUMMY|DUMMY";
+            String command = "$ML:" + qtd_ml.toString();
             byte[] messageBytes = command.getBytes();
 
             BluetoothDevice device = connectedGattDevices.get(0);
-            Log.d("Bluetooth2", "Iniciando liberação de líquido: " + command);
+            Log.d("Bluetooth2", "Iniciando liberacao de liquido: " + command);
 
             connect(device).done(d -> {
                 Log.d("Bluetooth2", "Conectado com sucesso");
@@ -282,7 +282,7 @@ public class Bluetooth2 extends BleManager {
         List<BluetoothDevice> connectedGattDevices = manager.getConnectedDevices(BluetoothProfile.GATT);
 
         if (!connectedGattDevices.isEmpty()) {
-            String command = "SERVE|" + qtd_ml.toString() + "|DUMMY|DUMMY";
+            String command = "$ML:" + qtd_ml.toString();
             byte[] messageBytes = command.getBytes();
 
             connect(connectedGattDevices.get(0)).done(d -> {

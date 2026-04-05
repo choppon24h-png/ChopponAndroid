@@ -23,9 +23,9 @@ import no.nordicsemi.android.ble.data.Data;
 public class Bluetooth extends BleManager {
     private static final String TAG = "ChoppBleManager";
     private BluetoothGatt bluetoothGatt;
-    private static final UUID NUS_SERVICE_UUID = UUID.fromString("7f0a0001-7b6b-4b5f-9d3e-3c7b9f100001");
-    private static final UUID NUS_CHARACTERISTIC_TX_UUID = UUID.fromString("7f0a0002-7b6b-4b5f-9d3e-3c7b9f100001");
-    private static final UUID NUS_CHARACTERISTIC_RX_UUID = UUID.fromString("7f0a0003-7b6b-4b5f-9d3e-3c7b9f100001");
+    private static final UUID NUS_SERVICE_UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+    private static final UUID NUS_CHARACTERISTIC_TX_UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
+    private static final UUID NUS_CHARACTERISTIC_RX_UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
     private BluetoothGattCharacteristic txCharacteristic;
     private BluetoothGattCharacteristic rxCharacteristic;
 

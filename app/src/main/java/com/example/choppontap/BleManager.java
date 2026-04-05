@@ -3,7 +3,7 @@ package com.example.choppontap;
 import android.util.Log;
 
 /**
- * BleManager — Orquestrador central da camada BLE Industrial v2.3.
+ * BleManager — Orquestrador central da camada BLE para protocolo NUS v4.0.
  *
  * ═══════════════════════════════════════════════════════════════════
  * ARQUITETURA
@@ -12,68 +12,36 @@ import android.util.Log;
  *   BluetoothService
  *        │
  *        ▼
- *   BleManager  ◄──── PagamentoConcluido (via getCommandQueue)
+ *   BleManager
  *        │
- *        ├── BleParser         (parse de mensagens BLE)
- *        ├── ConnectionManager (estados + heartbeat + reconexão)
- *        └── CommandQueue      (fila FIFO ACK/DONE)
+ *        ├── ConnectionManager (estados + keepalive + reconexão)
+ *        └── CommandQueueManager (fila FIFO simplificada)
  *
- * ═══════════════════════════════════════════════════════════════════
- * RESPONSABILIDADES
- * ═══════════════════════════════════════════════════════════════════
+ * Protocolo NUS v4.0:
+ *   - Sem AUTH/HMAC/SESSION_ID/CMD_ID
+ *   - Comandos: $ML:, $LB:, $PL:, $TO:
+ *   - Respostas: OK, ERRO, VP:, ML:, PL:, QP:, TO:
  *
- *   - Recebe dados brutos do ESP32 via onBleDataReceived()
- *   - Roteia mensagens para os módulos corretos
- *   - Coordena reconexão, heartbeat e fila de comandos
- *   - Envia STATUS ao ESP32 após reconexão para sincronizar estado
- *   - Expõe API unificada para BluetoothService e Activities
- *
- * ═══════════════════════════════════════════════════════════════════
- * LOGS INDUSTRIAIS
- * ═══════════════════════════════════════════════════════════════════
- *
- *   [BLE]     — eventos de conexão/desconexão
- *   [QUEUE]   — fila de comandos
- *   [SESSION] — sessão de venda
- *   [API]     — chamadas HTTP
+ * @version 4.0.0
  */
 public class BleManager {
 
     private static final String TAG = "BLE_MANAGER";
 
     // ── Módulos ───────────────────────────────────────────────────────────────
-    private final ConnectionManager mConnectionManager;
-    private final CommandQueue       mCommandQueue;
+    private final ConnectionManager     mConnectionManager;
+    private final CommandQueueManager   mCommandQueue;
 
     // ── Interface de escrita BLE (injetada pelo BluetoothService) ─────────────
-    private CommandQueue.BleWriter mWriter;
+    private CommandQueueManager.BleWriter mWriter;
 
     // ── Callbacks para o BluetoothService ─────────────────────────────────────
     public interface Callback {
-        /** BLE transitou para um novo estado */
         void onStateChanged(ConnectionManager.State newState, ConnectionManager.State oldState);
-
-        /**
-         * Solicitação de conexão GATT.
-         * @param mac         Endereço MAC do dispositivo
-         * @param autoConnect true para reconexão automática (spec v2.3),
-         *                    false para primeira conexão (mais rápido)
-         */
         void onConnectRequested(String mac, boolean autoConnect);
-
-        /** Comando enviado via BLE */
-        void onCommandSent(BleCommand cmd);
-
-        /** ACK recebido do ESP32 */
-        void onCommandAck(BleCommand cmd);
-
-        /** DONE recebido do ESP32 — mlReal disponível */
-        void onCommandDone(BleCommand cmd);
-
-        /** Erro irrecuperável no comando */
-        void onCommandError(BleCommand cmd, String reason);
-
-        /** Heartbeat falhou — deve forçar reconexão GATT */
+        void onCommandSent(String command);
+        void onCommandResponse(String command, String response);
+        void onCommandError(String command, String reason);
         void onHeartbeatFailed();
     }
 
@@ -83,50 +51,37 @@ public class BleManager {
     public BleManager(Callback callback) {
         this.mCallback = callback;
 
-        // Inicializa ConnectionManager com callbacks
+        // Inicializa ConnectionManager
         mConnectionManager = new ConnectionManager(new ConnectionManager.Callback() {
             @Override
             public void onStateChanged(ConnectionManager.State newState,
                                        ConnectionManager.State oldState) {
-                Log.i(TAG, "[BLE] " + oldState.name() + " → " + newState.name());
+                Log.i(TAG, "[BLE] " + oldState.name() + " -> " + newState.name());
                 if (mCallback != null) mCallback.onStateChanged(newState, oldState);
 
                 if (newState == ConnectionManager.State.READY) {
-                    // BLE READY — sincroniza estado do ESP32 e retoma fila
-                    // Envia STATUS para verificar se ESP32 tem comando pendente
-                    if (mWriter != null) {
-                        Log.i(TAG, "[BLE] READY → enviando STATUS para sync pós-reconexão");
-                        mWriter.write("STATUS");
-                    }
                     mCommandQueue.onBleReady();
                 } else if (newState == ConnectionManager.State.DISCONNECTED) {
-                    // BLE desconectado — pausa fila
                     mCommandQueue.onBleDisconnected();
                 }
             }
 
             @Override
-            public void onPingRequested() {
-                // Enfileira PING para heartbeat
-                mCommandQueue.enqueuePing();
-            }
-
-            @Override
             public void onHeartbeatFailed() {
-                Log.e(TAG, "[BLE] Heartbeat falhou — solicitando reconexão");
+                Log.e(TAG, "[BLE] Keepalive falhou — solicitando reconexão");
                 if (mCallback != null) mCallback.onHeartbeatFailed();
             }
 
             @Override
             public void onConnectRequested(String mac, boolean autoConnect) {
-                Log.i(TAG, "[BLE] Conexão solicitada → " + mac
+                Log.i(TAG, "[BLE] Conexão solicitada -> " + mac
                         + " (autoConnect=" + autoConnect + ")");
                 if (mCallback != null) mCallback.onConnectRequested(mac, autoConnect);
             }
         });
 
-        // Inicializa CommandQueue (writer será injetado depois via setWriter)
-        mCommandQueue = new CommandQueue(
+        // Inicializa CommandQueueManager
+        mCommandQueue = new CommandQueueManager(
                 data -> {
                     if (mWriter == null) {
                         Log.e(TAG, "[QUEUE] write() bloqueado — BleWriter não configurado");
@@ -139,35 +94,24 @@ public class BleManager {
                     }
                     return mWriter.write(data);
                 },
-                new CommandQueue.Callback() {
+                new CommandQueueManager.Callback() {
                     @Override
-                    public void onSend(BleCommand cmd) {
-                        Log.i(TAG, "[QUEUE] SEND " + cmd.type.name() + " " + cmd.commandId);
-                        if (mCallback != null) mCallback.onCommandSent(cmd);
+                    public void onSend(String command) {
+                        Log.i(TAG, "[QUEUE] SEND " + command);
+                        if (mCallback != null) mCallback.onCommandSent(command);
                     }
 
                     @Override
-                    public void onAck(BleCommand cmd) {
-                        Log.i(TAG, "[QUEUE] ACK " + cmd.commandId);
-                        mConnectionManager.onDataReceived(); // reseta ping failures
-                        if (mCallback != null) mCallback.onCommandAck(cmd);
+                    public void onResponse(String command, String response) {
+                        Log.i(TAG, "[QUEUE] RESPONSE " + command + " -> " + response);
+                        mConnectionManager.onDataReceived();
+                        if (mCallback != null) mCallback.onCommandResponse(command, response);
                     }
 
                     @Override
-                    public void onDone(BleCommand cmd) {
-                        Log.i(TAG, "[QUEUE] DONE " + cmd.commandId + " | ml_real=" + cmd.mlReal);
-                        if (mCallback != null) mCallback.onCommandDone(cmd);
-                    }
-
-                    @Override
-                    public void onError(BleCommand cmd, String reason) {
-                        Log.e(TAG, "[QUEUE] ERROR " + cmd.commandId + " | " + reason);
-                        if (mCallback != null) mCallback.onCommandError(cmd, reason);
-                    }
-
-                    @Override
-                    public void onQueueFull() {
-                        Log.e(TAG, "[QUEUE] Fila cheia — comando rejeitado");
+                    public void onError(String command, String reason) {
+                        Log.e(TAG, "[QUEUE] ERROR " + command + " | " + reason);
+                        if (mCallback != null) mCallback.onCommandError(command, reason);
                     }
                 }
         );
@@ -177,79 +121,59 @@ public class BleManager {
     // Configuração
     // ═════════════════════════════════════════════════════════════════════════
 
-    /** Injeta o BleWriter (deve ser chamado pelo BluetoothService após inicialização). */
-    public void setWriter(CommandQueue.BleWriter writer) {
+    public void setWriter(CommandQueueManager.BleWriter writer) {
         this.mWriter = writer;
     }
 
-    /** Define o MAC alvo para reconexão automática. */
     public void setTargetMac(String mac) {
         mConnectionManager.setTargetMac(mac);
     }
 
-    /** Habilita ou desabilita reconexão automática. */
     public void setAutoReconnect(boolean enabled) {
         mConnectionManager.setAutoReconnect(enabled);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // Eventos de scan (chamados pelo BluetoothService)
+    // Eventos de scan
     // ═════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Notifica que o scan BLE foi iniciado.
-     * Transiciona para SCANNING.
-     */
     public void onScanStarted() {
         mConnectionManager.onScanStarted();
     }
 
-    /**
-     * Notifica que um dispositivo CHOPP_* foi encontrado no scan.
-     * Agenda conexão após delay de 800ms (spec BLE Industrial v2.3).
-     *
-     * REGRA CRÍTICA: NÃO conectar dentro do callback do scan.
-     *
-     * @param mac  Endereço MAC do dispositivo encontrado
-     */
     public void onDeviceFoundInScan(String mac) {
         mConnectionManager.onDeviceFoundInScan(mac);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // Eventos GATT (chamados pelo BluetoothService)
+    // Eventos GATT
     // ═════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Notifica que o GATT foi conectado (STATE_CONNECTED).
-     */
     public void onGattConnected(String mac) {
-        Log.i(TAG, "[BLE] CONNECTED → " + mac);
+        Log.i(TAG, "[BLE] CONNECTED -> " + mac);
         mConnectionManager.setTargetMac(mac);
         mConnectionManager.onGattConnected();
     }
 
-    /**
-     * Notifica que o GATT foi desconectado.
-     *
-     * REGRA STATUS=8 (Connection Supervision Timeout):
-     *   - NÃO chamar gatt.close() em status=8
-     *   - Apenas disconnect() e aguardar reconexão automática
-     *
-     * @param status     Código de status GATT (8=timeout, 257=connect precoce)
-     * @param closeGatt  true se deve fechar o GATT antes de reconectar
-     */
     public void onGattDisconnected(int status, boolean closeGatt) {
         Log.w(TAG, "[BLE] DISCONNECTED | status=" + status);
         mConnectionManager.onGattDisconnected(status, closeGatt);
     }
 
     /**
-     * Notifica que AUTH:OK foi recebido — transiciona para READY.
+     * Notifica que as notificações NUS foram habilitadas — transiciona para READY.
+     * No protocolo NUS v4.0, não há AUTH:OK.
+     */
+    public void onNotificationsEnabled() {
+        Log.i(TAG, "[BLE] Notificações NUS habilitadas -> READY");
+        mConnectionManager.onNotificationsEnabled();
+    }
+
+    /**
+     * Compatibilidade: chamado por código que ainda usa onAuthOk().
      */
     public void onAuthOk() {
-        Log.i(TAG, "[BLE] AUTH:OK → READY");
-        mConnectionManager.onAuthOk();
+        onNotificationsEnabled();
     }
 
     /**
@@ -259,95 +183,37 @@ public class BleManager {
     public void onBleDataReceived(String raw) {
         if (raw == null || raw.isEmpty()) return;
 
-        // Notifica ConnectionManager de qualquer RX (reseta ping failures)
+        // Notifica ConnectionManager de qualquer RX (reseta keepalive)
         mConnectionManager.onDataReceived();
 
-        // Faz parse centralizado
-        BleParser.ParsedMessage msg = BleParser.parse(raw);
-
-        Log.d(TAG, "[BLE] RX " + msg.type.name()
-                + (msg.commandId != null ? " " + msg.commandId : "")
-                + (msg.mlReal > 0 ? " " + msg.mlReal + "ml" : ""));
-
-        // Roteia para os módulos corretos
-        switch (msg.type) {
-            case AUTH_OK:
-                onAuthOk();
-                break;
-
-            case PONG:
-                mConnectionManager.onPongReceived();
-                mCommandQueue.onBleResponse(msg);
-                break;
-
-            case ACK:
-            case DONE:
-            case DUPLICATE:
-            case ERROR_BUSY:
-            case ERROR_WATCHDOG:
-                mCommandQueue.onBleResponse(msg);
-                break;
-
-            case STATUS_READY:
-                // ESP32 respondeu READY a um STATUS query — fila pode continuar
-                Log.i(TAG, "[BLE] STATUS:READY — ESP32 pronto, retomando fila");
-                mCommandQueue.onBleResponse(msg);
-                break;
-
-            case STATUS_BUSY:
-                // ESP32 ainda ocupado — aguarda DONE
-                Log.w(TAG, "[BLE] STATUS:BUSY — ESP32 ocupado, aguardando DONE");
-                mCommandQueue.onBleResponse(msg);
-                break;
-
-            case VP:
-                // Progresso parcial — apenas log (tratado pela Activity via broadcast)
-                Log.d(TAG, "[BLE] VP: " + msg.mlReal + "ml");
-                break;
-
-            case AUTH_FAIL:
-                Log.e(TAG, "[BLE] AUTH:FAIL — PIN incorreto ou bond inválido");
-                break;
-
-            case UNKNOWN:
-            default:
-                Log.d(TAG, "[BLE] Mensagem não reconhecida: [" + raw + "]");
-                break;
-        }
+        // Roteia para a fila de comandos
+        mCommandQueue.onBleResponse(raw);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
     // API para Activities e BluetoothService
     // ═════════════════════════════════════════════════════════════════════════
 
-    /** Retorna o estado de conexão atual. */
     public ConnectionManager.State getConnectionState() {
         return mConnectionManager.getState();
     }
 
-    /** Retorna true se o BLE está READY para enviar comandos. */
     public boolean isReady() {
         return mConnectionManager.isReady();
     }
 
-    /** Retorna true se está conectado (CONNECTED ou READY). */
     public boolean isConnected() {
         return mConnectionManager.isConnected();
     }
 
-    /** Retorna a fila de comandos para uso pelas Activities. */
-    public CommandQueue getCommandQueue() {
+    public CommandQueueManager getCommandQueue() {
         return mCommandQueue;
     }
 
-    /** Retorna o ConnectionManager para uso pelo BluetoothService. */
     public ConnectionManager getConnectionManager() {
         return mConnectionManager;
     }
 
-    /**
-     * Para tudo — chamado no onDestroy() do BluetoothService.
-     */
     public void destroy() {
         mConnectionManager.destroy();
         mCommandQueue.reset();

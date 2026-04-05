@@ -30,6 +30,17 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import com.google.android.material.snackbar.Snackbar;
 
+/**
+ * CalibrarPulsos — Tela de calibração de pulsos e teste de fluxo.
+ *
+ * Protocolo NUS v4.0:
+ *   $PL:<pulsos>  — Configurar/consultar pulsos por litro
+ *   $ML:100       — Liberar 100ml para teste
+ *   $LB:          — Liberação contínua
+ *   $ML:0         — Parar liberação contínua
+ *
+ * NÃO usa mais: SERVE|100|CALIBRATE|DUMMY, SERVE|9999|..., SERVE|0|...
+ */
 public class CalibrarPulsos extends AppCompatActivity {
 
     private static final String TAG = "CALIBRAR_PULSOS";
@@ -63,7 +74,7 @@ public class CalibrarPulsos extends AppCompatActivity {
                 if (status == null) return;
                 Log.d(TAG, "Status BLE: " + status);
 
-                if (status.equals("disconnected")) {
+                if (status.startsWith("disconnected")) {
                     changeButtons(false);
                     mLiberacaoContinuaAtiva = false;
                     View contextView = findViewById(R.id.mainCalibrar);
@@ -73,7 +84,7 @@ public class CalibrarPulsos extends AppCompatActivity {
                                     if (mBluetoothService != null) mBluetoothService.scanLeDevice(true);
                                 }).show();
                     }
-                } else if (status.equals("connected")) {
+                } else if (status.equals("connected") || status.equals("ready")) {
                     changeButtons(true);
                     // Solicita valor atual de pulsos ao conectar
                     if (mBluetoothService != null) mBluetoothService.write("$PL:0");
@@ -84,14 +95,14 @@ public class CalibrarPulsos extends AppCompatActivity {
                 if (receivedData == null) return;
                 Log.d(TAG, "Dado BLE recebido: " + receivedData);
 
-                // Atualiza quantidade de pulsos atual
-                if (receivedData.contains("PL")) {
+                // Atualiza quantidade de pulsos atual (resposta PL:<valor>)
+                if (receivedData.startsWith("PL:")) {
                     qtdAtual.setText(receivedData.replace("\n", "").trim());
                 }
-                // Atualiza volume liberado
-                if (receivedData.contains("VP")) {
+                // Atualiza volume liberado (VP:<valor>)
+                if (receivedData.startsWith("VP:")) {
                     try {
-                        String vp = receivedData.replace("VP:", "").trim();
+                        String vp = receivedData.substring(3).trim();
                         Double mlsFloat = Double.valueOf(vp);
                         int mls = (int) Math.round(mlsFloat);
                         txtVolumeLiberado.setText(mls + "ML");
@@ -99,11 +110,22 @@ public class CalibrarPulsos extends AppCompatActivity {
                         Log.e(TAG, "Erro parse VP: " + e.getMessage());
                     }
                 }
-                // Encerramento de liberação contínua
-                if (receivedData.startsWith("ML:") || receivedData.equals("ML")) {
-                    Log.d(TAG, "Liberação concluída: " + receivedData);
+                // Encerramento de liberação (ML:<valor> = conclusão)
+                if (receivedData.startsWith("ML:")) {
+                    Log.d(TAG, "Liberacao concluida: " + receivedData);
                     mLiberacaoContinuaAtiva = false;
-                    runOnUiThread(() -> btnLiberacaoContinua.setText("Liberação continua"));
+                    runOnUiThread(() -> btnLiberacaoContinua.setText("Liberacao continua"));
+                }
+                // OK — comando aceito
+                if ("OK".equalsIgnoreCase(receivedData.trim())) {
+                    Log.d(TAG, "Comando aceito pelo ESP32");
+                }
+                // ERRO — comando com erro
+                if ("ERRO".equalsIgnoreCase(receivedData.trim())) {
+                    Log.e(TAG, "ESP32 reportou ERRO no comando");
+                    runOnUiThread(() ->
+                        Toast.makeText(CalibrarPulsos.this, "Erro no comando BLE", Toast.LENGTH_SHORT).show()
+                    );
                 }
 
             } else if (BluetoothServiceIndustrial.ACTION_DEVICE_FOUND.equals(action)) {
@@ -133,6 +155,7 @@ public class CalibrarPulsos extends AppCompatActivity {
 
             if (mBluetoothService.connected()) {
                 changeButtons(true);
+                // Protocolo NUS v4.0: $PL:0 consulta pulsos/litro atuais
                 mBluetoothService.write("$PL:0");
             } else {
                 changeButtons(false);
@@ -160,7 +183,7 @@ public class CalibrarPulsos extends AppCompatActivity {
         setupFullscreen();
 
         // Bind de views
-        qtdAtual          = findViewById(R.id.txtTimeoutAtual);
+        qtdAtual           = findViewById(R.id.txtTimeoutAtual);
         txtVolumeLiberado  = findViewById(R.id.txtVolumeLiberado);
         main               = findViewById(R.id.mainCalibrar);
         btnPulsos          = findViewById(R.id.btnChangePulsos);
@@ -171,7 +194,7 @@ public class CalibrarPulsos extends AppCompatActivity {
         Button btnVoltar   = findViewById(R.id.btnVoltar);
         EditText novaQtd   = findViewById(R.id.edtNovoTimeout);
 
-        // Garante que a tela está visível (defesa contra visibility=gone residual)
+        // Garante que a tela está visível
         if (main != null) main.setVisibility(View.VISIBLE);
 
         // Desabilita botões até BLE conectar
@@ -206,34 +229,35 @@ public class CalibrarPulsos extends AppCompatActivity {
                 int pulsosAtual = Integer.parseInt(pulsoStr);
                 int qtd = (pulsosAtual * 100) / volumeAferido;
                 Log.d(TAG, "Calibrando: pulsosAtual=" + pulsosAtual + " volumeAferido=" + volumeAferido + " novosPL=" + qtd);
+                // Protocolo NUS v4.0: $PL:<novos_pulsos>
                 if (mBluetoothService != null) mBluetoothService.write("$PL:" + qtd);
             } catch (NumberFormatException e) {
-                Toast.makeText(this, "Valor inválido", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "Valor invalido", Toast.LENGTH_SHORT).show();
             } catch (Exception e) {
                 Log.e(TAG, "Erro ao calibrar: " + e.getMessage());
                 Toast.makeText(this, "Erro ao calcular pulsos", Toast.LENGTH_SHORT).show();
             }
         });
 
-        // Liberar líquido: envia SERVE|100|CALIBRATE|DUMMY (libera 100ml para teste)
+        // Liberar líquido: envia $ML:100 (libera 100ml para teste)
         btnLiberar.setOnClickListener(v -> {
-            Log.d(TAG, "Enviando SERVE|100|CALIBRATE|DUMMY para teste de fluxo");
-            if (mBluetoothService != null) mBluetoothService.write("SERVE|100|CALIBRATE|DUMMY");
+            Log.d(TAG, "Enviando $ML:100 para teste de fluxo");
+            if (mBluetoothService != null) mBluetoothService.write("$ML:100");
         });
 
-        // Liberação contínua: alterna entre iniciar (SERVE|9999|CALIBRATE|DUMMY) e parar (SERVE|0|CALIBRATE|DUMMY)
+        // Liberação contínua: alterna entre $LB: (iniciar) e $ML:0 (parar)
         btnLiberacaoContinua.setOnClickListener(v -> {
             if (mBluetoothService == null) return;
             if (!mLiberacaoContinuaAtiva) {
-                Log.d(TAG, "Iniciando liberação contínua");
-                mBluetoothService.write("SERVE|9999|CALIBRATE|DUMMY");
+                Log.d(TAG, "Iniciando liberacao continua com $LB:");
+                mBluetoothService.write("$LB:");
                 mLiberacaoContinuaAtiva = true;
-                btnLiberacaoContinua.setText("Parar liberação");
+                btnLiberacaoContinua.setText("Parar liberacao");
             } else {
-                Log.d(TAG, "Parando liberação contínua");
-                mBluetoothService.write("SERVE|0|CALIBRATE|DUMMY");
+                Log.d(TAG, "Parando liberacao continua com $ML:0");
+                mBluetoothService.write("$ML:0");
                 mLiberacaoContinuaAtiva = false;
-                btnLiberacaoContinua.setText("Liberação continua");
+                btnLiberacaoContinua.setText("Liberacao continua");
             }
         });
 
@@ -250,7 +274,7 @@ public class CalibrarPulsos extends AppCompatActivity {
             finish();
         });
 
-        Log.d(TAG, "onCreate concluído — layout visível");
+        Log.d(TAG, "onCreate concluido — layout visivel");
     }
 
     @Override
@@ -298,7 +322,6 @@ public class CalibrarPulsos extends AppCompatActivity {
 
     /**
      * Habilita ou desabilita os botões de ação conforme o estado da conexão BLE.
-     * Chamado tanto pelo ServiceConnection quanto pelo BroadcastReceiver.
      */
     public void changeButtons(boolean enabled) {
         runOnUiThread(() -> {

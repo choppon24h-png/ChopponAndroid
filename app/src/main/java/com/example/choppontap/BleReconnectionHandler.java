@@ -8,7 +8,7 @@ import android.util.Log;
  * BleReconnectionHandler — Gerencia reconexões BLE com validação de estado.
  *
  * ═══════════════════════════════════════════════════════════════════
- * FLUXO DE RECONNECT (v2.3.0)
+ * FLUXO DE RECONNECT (NUS v4.0)
  * ═══════════════════════════════════════════════════════════════════
  *
  *   DISCONNECTED (status=8,133,257)
@@ -23,22 +23,17 @@ import android.util.Log;
  *   ↓
  *   habilitarNotificacoes() → CCCD write
  *   ↓
- *   enviarAutenticacao(AUTH) → AUTH_OK timeout 8s
- *   ↓
- *   READY (AUTH_OK recebido)
+ *   READY (notificações habilitadas — sem AUTH)
  *   ↓
  *   [CommandQueue.onBleReady() → resincroniza comando ativo]
  *   ↓
  *   ✓ SINCRONIZADO
  *
- * ═══════════════════════════════════════════════════════════════════
- * PROTEÇÕES (v2.3.0)
- * ═══════════════════════════════════════════════════════════════════
+ * Protocolo NUS v4.0: NÃO existe mais AUTH/AUTH_OK.
+ * A transição para READY ocorre quando as notificações NUS
+ * são habilitadas com sucesso.
  *
- *   ✔ Reset de AUTH retries (permite reauth após reconnect)
- *   ✔ Preservação de GATT em status 8/257 (não recriar desnecessário)
- *   ✔ Reconexão automática com backoff exponencial
- *   ✔ Validação de comando ativo pós-reconnect
+ * @version 4.0.0
  */
 public class BleReconnectionHandler {
 
@@ -50,8 +45,7 @@ public class BleReconnectionHandler {
         CONNECTING,
         CONNECTED,
         DISCOVERING_SERVICES,
-        AUTH_IN_PROGRESS,
-        AUTH_TIMEOUT,
+        ENABLING_NOTIFICATIONS,
         READY,
         SYNC_COMMAND_QUEUE,
         READY_FOR_SERVE
@@ -66,11 +60,8 @@ public class BleReconnectionHandler {
 
     // ── Callbacks ─────────────────────────────────────────────────────────────
     public interface Callback {
-        /** Reconexão iniciada após status X */
         void onReconnectStarted(int gattStatus, int attemptNumber);
-        /** Reconexão completada — BLE READY */
         void onReconnectCompleted();
-        /** Erro de reconexão (timeout, bond fail, etc.) */
         void onReconnectFailed(String reason);
     }
 
@@ -84,10 +75,6 @@ public class BleReconnectionHandler {
     // API pública
     // ═════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Registra uma desconexão com status GATT.
-     * Inicializa fluxo de reconnect.
-     */
     public void onDisconnected(int gattStatus, int reconnectAttempt) {
         mPhase = ReconnectPhase.DISCONNECTED;
         mAttemptNumber = reconnectAttempt;
@@ -103,63 +90,60 @@ public class BleReconnectionHandler {
         }
     }
 
-    /**
-     * Chamado quando BLE conecta sem erros (STATE_CONNECTED).
-     */
     public void onConnected() {
         mPhase = ReconnectPhase.CONNECTED;
         Log.i(TAG, "[RECONNECT] CONECTADO! (" + getElapsedTimeSinceDisconnect() + "ms)");
     }
 
-    /**
-     * Chamado após descober serviços.
-     */
     public void onServicesDiscovered() {
         mPhase = ReconnectPhase.DISCOVERING_SERVICES;
         Log.i(TAG, "[RECONNECT] Serviços descobertos");
     }
 
     /**
-     * Chamado ao enviar AUTH.
+     * Chamado quando as notificações NUS são habilitadas.
+     * No protocolo NUS v4.0, isso equivale ao antigo onAuthOk().
      */
-    public void onAuthSent() {
-        mPhase = ReconnectPhase.AUTH_IN_PROGRESS;
-        Log.i(TAG, "[RECONNECT] AUTH enviado — aguardando AUTH_OK...");
-    }
-
-    /**
-     * Chamado quando AUTH_OK é recebido.
-     */
-    public void onAuthOk() {
+    public void onNotificationsEnabled() {
         mPhase = ReconnectPhase.READY;
-        Log.i(TAG, "[RECONNECT] AUTH_OK recebido! (" + getElapsedTimeSinceDisconnect() + "ms) → PRONTO");
+        Log.i(TAG, "[RECONNECT] Notificações habilitadas! (" + getElapsedTimeSinceDisconnect() + "ms) -> PRONTO");
         if (mCallback != null) {
             mCallback.onReconnectCompleted();
         }
     }
 
     /**
-     * Chamado quando AUTH timeout (8s).
+     * Compatibilidade: chamado por código que ainda usa onAuthOk().
+     */
+    public void onAuthOk() {
+        onNotificationsEnabled();
+    }
+
+    /**
+     * Compatibilidade: chamado por código que ainda usa onAuthSent().
+     * No protocolo NUS v4.0, não há AUTH — apenas habilitar notificações.
+     */
+    public void onAuthSent() {
+        mPhase = ReconnectPhase.ENABLING_NOTIFICATIONS;
+        Log.i(TAG, "[RECONNECT] Habilitando notificações NUS...");
+    }
+
+    /**
+     * Compatibilidade: chamado por código que ainda usa onAuthTimeout().
+     * No protocolo NUS v4.0, timeout de notificações.
      */
     public void onAuthTimeout() {
-        mPhase = ReconnectPhase.AUTH_TIMEOUT;
-        Log.e(TAG, "[RECONNECT] AUTH timeout — BLE permanece bloqueado");
+        Log.e(TAG, "[RECONNECT] Timeout habilitando notificações");
         if (mCallback != null) {
-            mCallback.onReconnectFailed("AUTH timeout");
+            mCallback.onReconnectFailed("Notifications timeout");
         }
     }
 
-    /**
-     * Chamado ao sincronizar CommandQueue (após READY).
-     */
     public void onCommandQueueSync() {
         mPhase = ReconnectPhase.SYNC_COMMAND_QUEUE;
-        Log.i(TAG, "[RECONNECT] CommandQueue sincronizado —reenvio de comando ativo se necessário");
+        Log.i(TAG, "[RECONNECT] CommandQueue sincronizado");
     }
 
-    /**
-     * Chamado quando reconexão falha (bond fail, gatt close, etc.).
-     */
     public void onReconnectFailed(String reason) {
         Log.e(TAG, "[RECONNECT] FALHA: " + reason + " | attempt=" + mAttemptNumber);
         mPhase = ReconnectPhase.DISCONNECTED;
@@ -184,17 +168,11 @@ public class BleReconnectionHandler {
         return mLastGattStatus;
     }
 
-    /**
-     * Retorna tempo decorrido desde a desconexão (ms).
-     */
     public long getElapsedTimeSinceDisconnect() {
         if (mDisconnectTimestamp == 0) return 0;
         return System.currentTimeMillis() - mDisconnectTimestamp;
     }
 
-    /**
-     * Retorna true se a reconexão está em andamento (não DISCONNECTED, não READY).
-     */
     public boolean isReconnecting() {
         return mPhase != ReconnectPhase.DISCONNECTED
                 && mPhase != ReconnectPhase.READY_FOR_SERVE;
