@@ -240,6 +240,14 @@ public class BluetoothServiceIndustrial extends Service {
     /** Timeout para aguardar o bond completar (30s — suficiente para PIN manual). */
     private static final long BOND_TIMEOUT_MS = 30_000L;
 
+    /**
+     * Contador de falhas consecutivas de bond.
+     * Após 2 falhas, tenta conectarGatt() diretamente
+     * (o pareamento físico já foi feito e o ESP32 pode já ter o bond salvo).
+     */
+    private int mBondFailCount = 0;
+    private static final int MAX_BOND_FAILS_BEFORE_DIRECT = 2;
+
     // ═══════════════════════════════════════════════════════════════════════════
     // GUARD-BAND — Sincronização após READY
     // ═══════════════════════════════════════════════════════════════════════════
@@ -327,17 +335,25 @@ public class BluetoothServiceIndustrial extends Service {
             Log.i(TAG, "[SERVICE] MAC salvo: " + (mTargetMac != null ? mTargetMac : "nenhum"));
 
             // Registra receivers de pareamento e bond
+            // ACTION_PAIRING_REQUEST é broadcast de sistema — DEVE usar RECEIVER_EXPORTED
+            // no Android 13+ para receber broadcasts de sistema (não de outros apps)
+            // Prioridade máxima para interceptar ANTES do diálogo nativo do sistema
             IntentFilter pf = new IntentFilter(BluetoothDevice.ACTION_PAIRING_REQUEST);
-            pf.setPriority(IntentFilter.SYSTEM_HIGH_PRIORITY - 1);
+            pf.setPriority(IntentFilter.SYSTEM_HIGH_PRIORITY); // Máxima prioridade
             IntentFilter bf = new IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
+            bf.setPriority(IntentFilter.SYSTEM_HIGH_PRIORITY);
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) { // Android 13+
+                // RECEIVER_EXPORTED é necessário para receber broadcasts de sistema
                 registerReceiver(mPairingReceiver,   pf, Context.RECEIVER_EXPORTED);
                 registerReceiver(mBondStateReceiver, bf, Context.RECEIVER_EXPORTED);
+                Log.d(TAG, "[PAIR] Receivers registrados com RECEIVER_EXPORTED (Android 13+)");
             } else {
                 registerReceiver(mPairingReceiver,   pf);
                 registerReceiver(mBondStateReceiver, bf);
+                Log.d(TAG, "[PAIR] Receivers registrados (Android < 13)");
             }
+            Log.i(TAG, "[PAIR] mPairingReceiver registrado para ACTION_PAIRING_REQUEST");
 
             // NÃO inicia conexão aqui.
             // A conexão só inicia quando connectWithMac(mac) for chamado.
@@ -528,28 +544,74 @@ public class BluetoothServiceIndustrial extends Service {
 
             } else if (bondState == BluetoothDevice.BOND_NONE
                     && prevBondState == BluetoothDevice.BOND_BONDING) {
-                Log.e(TAG, "[BOND] Bond FALHOU — reagendando reconexão com backoff");
+                mBondFailCount++;
+                Log.e(TAG, "[BOND] Bond FALHOU (tentativa #" + mBondFailCount + ") — "
+                        + (mBondFailCount >= MAX_BOND_FAILS_BEFORE_DIRECT
+                           ? "tentando GATT direto (pareamento físico já feito)"
+                           : "reagendando com backoff"));
                 cancelarBondTimeout();
-                mMainHandler.post(() -> reconectarComBackoff());
+
+                if (mBondFailCount >= MAX_BOND_FAILS_BEFORE_DIRECT) {
+                    // O pareamento físico já foi feito — o ESP32 pode já ter o bond salvo
+                    // mesmo que o Android não mostre BOND_BONDED. Tenta GATT direto.
+                    Log.w(TAG, "[BOND] Fallback: conectarGatt() direto após "
+                            + mBondFailCount + " falhas de bond");
+                    mBondFailCount = 0; // reset para próxima rodada
+                    mMainHandler.postDelayed(() -> {
+                        if (mTargetMac != null && hasConnectPermission()) {
+                            BluetoothDevice d = mBluetoothAdapter.getRemoteDevice(mTargetMac);
+                            conectarGatt(d);
+                        }
+                    }, 1_000L);
+                } else {
+                    mMainHandler.post(() -> reconectarComBackoff());
+                }
             }
         }
     };
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // BroadcastReceiver — Pairing request (PIN automático)
+    // BroadcastReceiver — Pairing request (PIN automático — todos os tipos)
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Tipos de pairing variant do Android:
+     *   0 = PAIRING_VARIANT_PIN              — PIN numérico/alfanumérico
+     *   1 = PAIRING_VARIANT_PASSKEY          — Passkey de 6 dígitos
+     *   2 = PAIRING_VARIANT_PASSKEY_CONFIRMATION — Confirmar passkey exibido
+     *   3 = PAIRING_VARIANT_CONSENT          — Apenas confirmar (sim/não)
+     *   4 = PAIRING_VARIANT_DISPLAY_PASSKEY  — Exibir passkey (sem input)
+     *   5 = PAIRING_VARIANT_DISPLAY_PIN      — Exibir PIN (sem input)
+     *   6 = PAIRING_VARIANT_OOB_CONSENT      — OOB consent
+     *   7 = PAIRING_VARIANT_PIN_16_DIGITS    — PIN de 16 dígitos
+     *
+     * O ESP32 com NimBLE usa PAIRING_VARIANT_PIN (0) ou PAIRING_VARIANT_PASSKEY (1)
+     * dependendo da configuração de IO capabilities.
+     */
     private final BroadcastReceiver mPairingReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             if (!BluetoothDevice.ACTION_PAIRING_REQUEST.equals(intent.getAction())) return;
             BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
             if (device == null) return;
-            if (mTargetMac != null && !device.getAddress().equalsIgnoreCase(mTargetMac)) return;
+
+            // Aceita pairing do dispositivo alvo OU de qualquer CHOPP_ se MAC ainda não definido
+            String deviceMac = device.getAddress();
+            if (mTargetMac != null && !deviceMac.equalsIgnoreCase(mTargetMac)) {
+                Log.d(TAG, "[PAIR] PAIRING_REQUEST ignorado — MAC " + deviceMac
+                        + " != target " + mTargetMac);
+                return;
+            }
 
             int pairingType = intent.getIntExtra(BluetoothDevice.EXTRA_PAIRING_VARIANT, -1);
-            Log.i(TAG, "[PAIR] PAIRING_REQUEST | mac=" + device.getAddress()
-                    + " | type=" + pairingType);
+            int pairingKey  = intent.getIntExtra(BluetoothDevice.EXTRA_PAIRING_KEY, -1);
+
+            Log.i(TAG, "[PAIR] ══════════════════════════════════════════");
+            Log.i(TAG, "[PAIR] ACTION_PAIRING_REQUEST recebido!");
+            Log.i(TAG, "[PAIR]   mac         = " + deviceMac);
+            Log.i(TAG, "[PAIR]   pairingType = " + pairingType + " (" + pairingTypeName(pairingType) + ")");
+            Log.i(TAG, "[PAIR]   pairingKey  = " + pairingKey);
+            Log.i(TAG, "[PAIR] ══════════════════════════════════════════");
 
             if (!hasConnectPermission()) {
                 Log.e(TAG, "[PAIR] BLUETOOTH_CONNECT não concedida — PIN não pode ser injetado");
@@ -557,17 +619,91 @@ public class BluetoothServiceIndustrial extends Service {
             }
 
             try {
-                if (pairingType == BluetoothDevice.PAIRING_VARIANT_PIN) {
-                    device.setPin("259087".getBytes(StandardCharsets.UTF_8));
-                    Log.i(TAG, "[PAIR] PIN 259087 injetado automaticamente");
-                } else if (pairingType == BluetoothDevice.PAIRING_VARIANT_PASSKEY_CONFIRMATION) {
-                    device.setPairingConfirmation(true);
-                    Log.i(TAG, "[PAIR] Confirmação de passkey aceita automaticamente");
-                }
+                // IMPORTANTE: abortBroadcast() ANTES de qualquer ação
+                // Isso suprime o diálogo nativo de pareamento do sistema
                 abortBroadcast();
+                Log.d(TAG, "[PAIR] Broadcast abortado — suprimindo diálogo do sistema");
+
+                switch (pairingType) {
+                    case BluetoothDevice.PAIRING_VARIANT_PIN:          // 0 — PIN numérico
+                    case 7: /* PAIRING_VARIANT_PIN_16_DIGITS */        // 7 — PIN 16 dígitos
+                        // Tenta setPin() padrão primeiro
+                        boolean pinOk = device.setPin("259087".getBytes(StandardCharsets.UTF_8));
+                        Log.i(TAG, "[PAIR] setPin(259087) → " + (pinOk ? "OK" : "FALHOU"));
+                        if (!pinOk) {
+                            // Fallback via reflection (alguns dispositivos Android exigem)
+                            injetarPinViaReflection(device, "259087");
+                        }
+                        break;
+
+                    case 1: /* PAIRING_VARIANT_PASSKEY */              // 1 — Passkey 6 dígitos
+                        // O ESP32 pode enviar passkey numérico — tentamos confirmar com 259087
+                        boolean passOk = device.setPin("259087".getBytes(StandardCharsets.UTF_8));
+                        Log.i(TAG, "[PAIR] setPin(passkey=259087) → " + (passOk ? "OK" : "FALHOU"));
+                        if (!passOk) {
+                            device.setPairingConfirmation(true);
+                            Log.i(TAG, "[PAIR] setPairingConfirmation(true) como fallback");
+                        }
+                        break;
+
+                    case BluetoothDevice.PAIRING_VARIANT_PASSKEY_CONFIRMATION: // 2
+                    case 3: /* PAIRING_VARIANT_CONSENT */
+                    case 6: /* PAIRING_VARIANT_OOB_CONSENT */
+                        device.setPairingConfirmation(true);
+                        Log.i(TAG, "[PAIR] setPairingConfirmation(true) — type=" + pairingType);
+                        break;
+
+                    case 4: /* PAIRING_VARIANT_DISPLAY_PASSKEY */
+                    case 5: /* PAIRING_VARIANT_DISPLAY_PIN */
+                        // Apenas exibição — o ESP32 mostra o código, Android confirma
+                        device.setPairingConfirmation(true);
+                        Log.i(TAG, "[PAIR] Display variant — confirmação automática");
+                        break;
+
+                    default:
+                        // Tipo desconhecido — tenta PIN e confirmação
+                        Log.w(TAG, "[PAIR] Tipo desconhecido (" + pairingType + ") — tentando PIN + confirmação");
+                        boolean defPin = device.setPin("259087".getBytes(StandardCharsets.UTF_8));
+                        if (!defPin) device.setPairingConfirmation(true);
+                        break;
+                }
+
+            } catch (SecurityException se) {
+                Log.e(TAG, "[PAIR] SecurityException — BLUETOOTH_CONNECT negada: " + se.getMessage());
             } catch (Exception e) {
-                Log.e(TAG, "[PAIR] Erro ao injetar PIN: " + e.getMessage());
+                Log.e(TAG, "[PAIR] Erro ao processar pairing: " + e.getMessage(), e);
             }
+        }
+    };
+
+    /**
+     * Injeta PIN via reflection — necessário em alguns dispositivos Android
+     * onde device.setPin() retorna false mas o método interno funciona.
+     */
+    private void injetarPinViaReflection(BluetoothDevice device, String pin) {
+        try {
+            Method setPin = device.getClass().getMethod("setPin", byte[].class);
+            boolean ok = (boolean) setPin.invoke(device, pin.getBytes(StandardCharsets.UTF_8));
+            Log.i(TAG, "[PAIR] setPin via reflection → " + (ok ? "OK" : "FALHOU"));
+        } catch (Exception e) {
+            Log.e(TAG, "[PAIR] Reflection setPin falhou: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Retorna o nome legível do tipo de pairing variant.
+     */
+    private static String pairingTypeName(int type) {
+        switch (type) {
+            case 0: return "PIN";
+            case 1: return "PASSKEY";
+            case 2: return "PASSKEY_CONFIRMATION";
+            case 3: return "CONSENT";
+            case 4: return "DISPLAY_PASSKEY";
+            case 5: return "DISPLAY_PIN";
+            case 6: return "OOB_CONSENT";
+            case 7: return "PIN_16_DIGITS";
+            default: return "UNKNOWN(" + type + ")";
         }
     };
 
@@ -803,10 +939,11 @@ public class BluetoothServiceIndustrial extends Service {
     // ═══════════════════════════════════════════════════════════════════════════
 
     private void handleGattConnected(BluetoothGatt gatt, int status) {
-        Log.i(TAG, "[GATT] CONECTADO ✓ → " + gatt.getDevice().getAddress()
+        Log.i(TAG, "[GATT] CONECTADO \u2713 \u2192 " + gatt.getDevice().getAddress()
                 + " | status=" + status);
         cancelarBondTimeout();
         pararReconexao();
+        mBondFailCount = 0; // Reset contador de falhas de bond após conexão bem-sucedida
         mBluetoothGatt = gatt;
         mWriteCharacteristic = null;
         mNotifyCharacteristic = null;
