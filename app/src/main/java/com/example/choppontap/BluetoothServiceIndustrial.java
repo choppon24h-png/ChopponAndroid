@@ -242,11 +242,11 @@ public class BluetoothServiceIndustrial extends Service {
 
     /**
      * Contador de falhas consecutivas de bond.
-     * Após 2 falhas, tenta conectarGatt() diretamente
-     * (o pareamento físico já foi feito e o ESP32 pode já ter o bond salvo).
+     * Após a 1ª falha: removeBond() + espera 2s + retry.
+     * Após a 2ª falha: para retries e loga erro claro.
      */
     private int mBondFailCount = 0;
-    private static final int MAX_BOND_FAILS_BEFORE_DIRECT = 2;
+    private static final int MAX_BOND_RETRIES = 1; // apenas 1 retry após removeBond()
 
     // ═══════════════════════════════════════════════════════════════════════════
     // GUARD-BAND — Sincronização após READY
@@ -531,40 +531,46 @@ public class BluetoothServiceIndustrial extends Service {
             if (device == null) return;
             if (mTargetMac != null && !device.getAddress().equalsIgnoreCase(mTargetMac)) return;
 
-            int bondState    = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1);
+            int bondState     = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1);
             int prevBondState = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, -1);
 
             Log.i(TAG, "[BOND] STATE_CHANGED | mac=" + device.getAddress()
                     + " | " + bondStateName(prevBondState) + " → " + bondStateName(bondState));
 
             if (bondState == BluetoothDevice.BOND_BONDED) {
+                // ✅ Bond concluído com sucesso
                 Log.i(TAG, "[BOND] BOND_BONDED ✓ → conectarGatt()");
                 cancelarBondTimeout();
+                mBondFailCount = 0;
                 mMainHandler.post(() -> conectarGatt(device));
+
+            } else if (bondState == BluetoothDevice.BOND_BONDING) {
+                // ⏳ Bond em andamento — NÃO reconectar, NÃO chamar connectGatt, NÃO reiniciar fluxo
+                Log.i(TAG, "[BOND] BOND_BONDING — aguardando conclusão do pareamento...");
 
             } else if (bondState == BluetoothDevice.BOND_NONE
                     && prevBondState == BluetoothDevice.BOND_BONDING) {
+                // ❌ Bond falhou (autenticação rejeitada pelo ESP32)
                 mBondFailCount++;
-                Log.e(TAG, "[BOND] Bond FALHOU (tentativa #" + mBondFailCount + ") — "
-                        + (mBondFailCount >= MAX_BOND_FAILS_BEFORE_DIRECT
-                           ? "tentando GATT direto (pareamento físico já feito)"
-                           : "reagendando com backoff"));
+                Log.e(TAG, "[BOND] falhou → limpando bond (tentativa #" + mBondFailCount + ")");
                 cancelarBondTimeout();
 
-                if (mBondFailCount >= MAX_BOND_FAILS_BEFORE_DIRECT) {
-                    // O pareamento físico já foi feito — o ESP32 pode já ter o bond salvo
-                    // mesmo que o Android não mostre BOND_BONDED. Tenta GATT direto.
-                    Log.w(TAG, "[BOND] Fallback: conectarGatt() direto após "
-                            + mBondFailCount + " falhas de bond");
-                    mBondFailCount = 0; // reset para próxima rodada
+                if (mBondFailCount <= MAX_BOND_RETRIES) {
+                    // Primeira falha: removeBond() + esperar 2000ms + retry
+                    Log.i(TAG, "[BOND] retry após limpeza — aguardando 2000ms...");
+                    removerBondViaReflection(device);
                     mMainHandler.postDelayed(() -> {
-                        if (mTargetMac != null && hasConnectPermission()) {
-                            BluetoothDevice d = mBluetoothAdapter.getRemoteDevice(mTargetMac);
-                            conectarGatt(d);
-                        }
-                    }, 1_000L);
+                        if (mTargetMac == null || !hasConnectPermission()) return;
+                        Log.i(TAG, "[BOND] retry após limpeza → createBond()");
+                        BluetoothDevice d = mBluetoothAdapter.getRemoteDevice(mTargetMac);
+                        iniciarBondEConectar(d);
+                    }, 2_000L);
                 } else {
-                    mMainHandler.post(() -> reconectarComBackoff());
+                    // Segunda falha: parar retries agressivos
+                    Log.e(TAG, "[BOND] falhou definitivamente após " + mBondFailCount
+                            + " tentativas — parando retries. Verifique PIN e configuração do ESP32.");
+                    mBondFailCount = 0;
+                    broadcastConnectionStatus("bond_failed");
                 }
             }
         }
@@ -595,83 +601,62 @@ public class BluetoothServiceIndustrial extends Service {
             BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
             if (device == null) return;
 
-            // Aceita pairing do dispositivo alvo OU de qualquer CHOPP_ se MAC ainda não definido
+            // Aceita pairing apenas do dispositivo alvo
             String deviceMac = device.getAddress();
             if (mTargetMac != null && !deviceMac.equalsIgnoreCase(mTargetMac)) {
-                Log.d(TAG, "[PAIR] PAIRING_REQUEST ignorado — MAC " + deviceMac
+                Log.d(TAG, "[BOND] PAIRING_REQUEST ignorado — MAC " + deviceMac
                         + " != target " + mTargetMac);
                 return;
             }
 
-            int pairingType = intent.getIntExtra(BluetoothDevice.EXTRA_PAIRING_VARIANT, -1);
-            int pairingKey  = intent.getIntExtra(BluetoothDevice.EXTRA_PAIRING_KEY, -1);
-
-            Log.i(TAG, "[PAIR] ══════════════════════════════════════════");
-            Log.i(TAG, "[PAIR] ACTION_PAIRING_REQUEST recebido!");
-            Log.i(TAG, "[PAIR]   mac         = " + deviceMac);
-            Log.i(TAG, "[PAIR]   pairingType = " + pairingType + " (" + pairingTypeName(pairingType) + ")");
-            Log.i(TAG, "[PAIR]   pairingKey  = " + pairingKey);
-            Log.i(TAG, "[PAIR] ══════════════════════════════════════════");
-
+            // VERIFICAR PERMISSÃO ANTES DE QUALQUER AÇÃO
             if (!hasConnectPermission()) {
-                Log.e(TAG, "[PAIR] BLUETOOTH_CONNECT não concedida — PIN não pode ser injetado");
+                Log.e(TAG, "[BOND] BLUETOOTH_CONNECT não concedida — não é possível responder ao pairing");
                 return;
             }
 
+            int pairingVariant = intent.getIntExtra(BluetoothDevice.EXTRA_PAIRING_VARIANT, -1);
+            int pairingKey     = intent.getIntExtra(BluetoothDevice.EXTRA_PAIRING_KEY, -1);
+
+            // LOG OBRIGATÓRIO
+            Log.i(TAG, "[BOND] ══════════════════════════════════════════");
+            Log.i(TAG, "[BOND] ACTION_PAIRING_REQUEST recebido");
+            Log.i(TAG, "[BOND] pairingVariant=" + pairingVariant
+                    + " (" + pairingTypeName(pairingVariant) + ")");
+            Log.i(TAG, "[BOND] pairingKey=" + pairingKey);
+            Log.i(TAG, "[BOND] mac=" + deviceMac);
+            Log.i(TAG, "[BOND] ══════════════════════════════════════════");
+
             try {
-                // IMPORTANTE: abortBroadcast() ANTES de qualquer ação
-                // Isso suprime o diálogo nativo de pareamento do sistema
+                // abortBroadcast() ANTES de qualquer ação — suprime diálogo nativo do sistema
                 abortBroadcast();
-                Log.d(TAG, "[PAIR] Broadcast abortado — suprimindo diálogo do sistema");
 
-                switch (pairingType) {
-                    case BluetoothDevice.PAIRING_VARIANT_PIN:          // 0 — PIN numérico
-                    case 7: /* PAIRING_VARIANT_PIN_16_DIGITS */        // 7 — PIN 16 dígitos
-                        // Tenta setPin() padrão primeiro
-                        boolean pinOk = device.setPin("259087".getBytes(StandardCharsets.UTF_8));
-                        Log.i(TAG, "[PAIR] setPin(259087) → " + (pinOk ? "OK" : "FALHOU"));
-                        if (!pinOk) {
-                            // Fallback via reflection (alguns dispositivos Android exigem)
-                            injetarPinViaReflection(device, "259087");
-                        }
-                        break;
+                if (pairingVariant == BluetoothDevice.PAIRING_VARIANT_PIN) {
+                    // Tipo 0: PIN numérico — enviar PIN 259087
+                    boolean pinOk = device.setPin("259087".getBytes(StandardCharsets.UTF_8));
+                    Log.i(TAG, "[BOND] usando PIN → setPin(259087) = " + (pinOk ? "OK" : "FALHOU"));
+                    if (!pinOk) {
+                        // Fallback via reflection para dispositivos que ignoram setPin() direto
+                        injetarPinViaReflection(device, "259087");
+                    }
+                    device.setPairingConfirmation(true);
 
-                    case 1: /* PAIRING_VARIANT_PASSKEY */              // 1 — Passkey 6 dígitos
-                        // O ESP32 pode enviar passkey numérico — tentamos confirmar com 259087
-                        boolean passOk = device.setPin("259087".getBytes(StandardCharsets.UTF_8));
-                        Log.i(TAG, "[PAIR] setPin(passkey=259087) → " + (passOk ? "OK" : "FALHOU"));
-                        if (!passOk) {
-                            device.setPairingConfirmation(true);
-                            Log.i(TAG, "[PAIR] setPairingConfirmation(true) como fallback");
-                        }
-                        break;
+                } else if (pairingVariant == BluetoothDevice.PAIRING_VARIANT_PASSKEY_CONFIRMATION
+                        || pairingVariant == 3 /* PAIRING_VARIANT_CONSENT */) {
+                    // Tipos 2 e 3: Just Works / confirmação automática — NÃO forçar PIN
+                    device.setPairingConfirmation(true);
+                    Log.i(TAG, "[BOND] usando confirmação automática (Just Works) — type=" + pairingVariant);
 
-                    case BluetoothDevice.PAIRING_VARIANT_PASSKEY_CONFIRMATION: // 2
-                    case 3: /* PAIRING_VARIANT_CONSENT */
-                    case 6: /* PAIRING_VARIANT_OOB_CONSENT */
-                        device.setPairingConfirmation(true);
-                        Log.i(TAG, "[PAIR] setPairingConfirmation(true) — type=" + pairingType);
-                        break;
-
-                    case 4: /* PAIRING_VARIANT_DISPLAY_PASSKEY */
-                    case 5: /* PAIRING_VARIANT_DISPLAY_PIN */
-                        // Apenas exibição — o ESP32 mostra o código, Android confirma
-                        device.setPairingConfirmation(true);
-                        Log.i(TAG, "[PAIR] Display variant — confirmação automática");
-                        break;
-
-                    default:
-                        // Tipo desconhecido — tenta PIN e confirmação
-                        Log.w(TAG, "[PAIR] Tipo desconhecido (" + pairingType + ") — tentando PIN + confirmação");
-                        boolean defPin = device.setPin("259087".getBytes(StandardCharsets.UTF_8));
-                        if (!defPin) device.setPairingConfirmation(true);
-                        break;
+                } else {
+                    // Tipos desconhecidos ou não tratados — NÃO interferir
+                    Log.w(TAG, "[BOND] Tipo de pareamento desconhecido (" + pairingVariant
+                            + ") → não interferir");
                 }
 
             } catch (SecurityException se) {
-                Log.e(TAG, "[PAIR] SecurityException — BLUETOOTH_CONNECT negada: " + se.getMessage());
+                Log.e(TAG, "[BOND] SecurityException ao responder pairing: " + se.getMessage());
             } catch (Exception e) {
-                Log.e(TAG, "[PAIR] Erro ao processar pairing: " + e.getMessage(), e);
+                Log.e(TAG, "[BOND] Erro ao processar pairing: " + e.getMessage(), e);
             }
         }
     };
@@ -684,9 +669,23 @@ public class BluetoothServiceIndustrial extends Service {
         try {
             Method setPin = device.getClass().getMethod("setPin", byte[].class);
             boolean ok = (boolean) setPin.invoke(device, pin.getBytes(StandardCharsets.UTF_8));
-            Log.i(TAG, "[PAIR] setPin via reflection → " + (ok ? "OK" : "FALHOU"));
+            Log.i(TAG, "[BOND] setPin via reflection → " + (ok ? "OK" : "FALHOU"));
         } catch (Exception e) {
-            Log.e(TAG, "[PAIR] Reflection setPin falhou: " + e.getMessage());
+            Log.e(TAG, "[BOND] Reflection setPin falhou: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Remove o bond via reflection (BluetoothDevice.removeBond() é método oculto).
+     * Necessário para limpar bond corrompido antes de tentar novamente.
+     */
+    private void removerBondViaReflection(BluetoothDevice device) {
+        try {
+            Method removeBond = device.getClass().getMethod("removeBond");
+            boolean ok = (boolean) removeBond.invoke(device);
+            Log.i(TAG, "[BOND] removeBond() via reflection → " + (ok ? "OK" : "FALHOU"));
+        } catch (Exception e) {
+            Log.e(TAG, "[BOND] Reflection removeBond falhou: " + e.getMessage());
         }
     }
 
