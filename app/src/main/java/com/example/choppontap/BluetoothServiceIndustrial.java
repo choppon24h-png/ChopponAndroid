@@ -162,9 +162,10 @@ public class BluetoothServiceIndustrial extends Service {
             case CONNECTED:
                 break;
             case READY:
-                mReconnectAttempts = 0;
-                mReconnectDelay    = BACKOFF_DELAYS[0];
-                mTotalFailures     = 0;
+                mReconnectAttempts  = 0;
+                mReconnectDelay     = BACKOFF_DELAYS[0];
+                mTotalFailures      = 0;
+                mAutoConnectFallback = false; // Resetar fallback ao conectar com sucesso
                 mReadyTimestamp = System.currentTimeMillis();
                 Log.i(TAG, "[STATE] READY [timestamp=" + mReadyTimestamp + "]");
                 Log.i(TAG, "[FLOW] Aguardando pagamento");
@@ -262,7 +263,7 @@ public class BluetoothServiceIndustrial extends Service {
     private static final long BOND_TIMEOUT_MS = 15_000L;
     private static final long SCAN_TIMEOUT_MS = 15_000L;
     private static final long SCAN_RETRY_DELAY_MS = 5_000L;
-    private static final long CONNECT_TIMEOUT_MS = 8_000L;
+    private static final long CONNECT_TIMEOUT_MS = 20_000L; // Aumentado: bond+connect pode levar 15s
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Campos internos — BLE
@@ -300,6 +301,15 @@ public class BluetoothServiceIndustrial extends Service {
     // ═══════════════════════════════════════════════════════════════════════════
 
     private final java.util.Set<String> mMacsValidando = new java.util.HashSet<>();
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Fallback autoConnect=true após N falhas consecutivas
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /** Após este número de falhas, usa autoConnect=true para deixar o Android gerenciar. */
+    private static final int AUTO_CONNECT_FALLBACK_THRESHOLD = 5;
+    /** Flag que ativa autoConnect=true como fallback. Resetado ao atingir READY. */
+    private boolean mAutoConnectFallback = false;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Binder
@@ -427,8 +437,17 @@ public class BluetoothServiceIndustrial extends Service {
             return;
         }
         if (mTargetMac != null) {
-            Log.i(TAG, "[INDUSTRIAL] MAC conhecido: " + mTargetMac + " — reconectando diretamente");
-            agendarConexaoDireta(mTargetMac);
+            Log.i(TAG, "[INDUSTRIAL] MAC conhecido: " + mTargetMac + " — verificando bond antes de conectar");
+            // CORREÇÃO CRÍTICA: sempre verificar bond antes de conectar.
+            // O ESP32 com PIN 259087 requer BOND_BONDED antes de aceitar conexão GATT.
+            // Usar agendarConexaoDireta() sem bond causa loop de timeout (8s) infinito.
+            if (hasConnectPermission()) {
+                BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mTargetMac);
+                iniciarBondEConectar(device);
+            } else {
+                Log.w(TAG, "[INDUSTRIAL] BLUETOOTH_CONNECT não concedida — agendando retry em 5s");
+                mMainHandler.postDelayed(this::iniciarConexao, 5_000L);
+            }
         } else {
             Log.i(TAG, "[INDUSTRIAL] Sem MAC — iniciando scan BLE por CHOPP_*");
             iniciarScanComRetry();
@@ -525,13 +544,19 @@ public class BluetoothServiceIndustrial extends Service {
             closeGatt();
         }
 
+        // Após AUTO_CONNECT_FALLBACK_THRESHOLD falhas, ativa autoConnect=true:
+        // o Android gerencia a reconexão automaticamente quando o ESP32 anunciar.
+        if (mTotalFailures >= AUTO_CONNECT_FALLBACK_THRESHOLD) {
+            mAutoConnectFallback = true;
+        }
+        boolean useAutoConnect = mAutoConnectFallback;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Log.i(TAG, "[GATT] connectGatt(autoConnect=false, TRANSPORT_LE) → " + device.getAddress());
+            Log.i(TAG, "[GATT] connectGatt(autoConnect=" + useAutoConnect + ", TRANSPORT_LE) → " + device.getAddress());
             mBluetoothGatt = device.connectGatt(
-                    this, false, mGattCallback, BluetoothDevice.TRANSPORT_LE);
+                    this, useAutoConnect, mGattCallback, BluetoothDevice.TRANSPORT_LE);
         } else {
-            Log.i(TAG, "[GATT] connectGatt(autoConnect=false) → " + device.getAddress());
-            mBluetoothGatt = device.connectGatt(this, false, mGattCallback);
+            Log.i(TAG, "[GATT] connectGatt(autoConnect=" + useAutoConnect + ") → " + device.getAddress());
+            mBluetoothGatt = device.connectGatt(this, useAutoConnect, mGattCallback);
         }
 
         if (mBluetoothGatt == null) {
@@ -615,9 +640,16 @@ public class BluetoothServiceIndustrial extends Service {
             mReconnectRunnable = null;
             if (!mAutoReconnect) return;
             if (mTargetMac != null) {
-                Log.i(TAG, "[INDUSTRIAL] Reconectando → " + mTargetMac);
-                BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mTargetMac);
-                conectarGatt(device);
+                Log.i(TAG, "[INDUSTRIAL] Reconectando → " + mTargetMac + " (via bond check)");
+                // CORREÇÃO: sempre verificar bond antes de reconectar.
+                // Sem bond, o ESP32 com PIN 259087 rejeita silenciosamente a conexão GATT.
+                if (hasConnectPermission()) {
+                    BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mTargetMac);
+                    iniciarBondEConectar(device);
+                } else {
+                    Log.w(TAG, "[INDUSTRIAL] BLUETOOTH_CONNECT não concedida — retry em 5s");
+                    mMainHandler.postDelayed(() -> reconectarComBackoff(), 5_000L);
+                }
             } else {
                 Log.i(TAG, "[INDUSTRIAL] Sem MAC — reiniciando scan");
                 iniciarScanComRetry();
@@ -641,8 +673,13 @@ public class BluetoothServiceIndustrial extends Service {
     private void iniciarScanComRetry() {
         if (!mAutoReconnect) return;
         if (mTargetMac != null) {
-            Log.i(TAG, "[SCAN] MAC disponível durante retry → conectando diretamente");
-            agendarConexaoDireta(mTargetMac);
+            Log.i(TAG, "[SCAN] MAC disponível durante retry → verificando bond antes de conectar");
+            if (hasConnectPermission()) {
+                BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mTargetMac);
+                iniciarBondEConectar(device);
+            } else {
+                agendarConexaoDireta(mTargetMac); // fallback sem permissão
+            }
             return;
         }
         iniciarScan();
@@ -692,7 +729,12 @@ public class BluetoothServiceIndustrial extends Service {
                         if (mAutoReconnect && mTargetMac == null) {
                             iniciarScanComRetry();
                         } else if (mAutoReconnect && mTargetMac != null) {
-                            agendarConexaoDireta(mTargetMac);
+                            if (hasConnectPermission()) {
+                                BluetoothDevice dev = mBluetoothAdapter.getRemoteDevice(mTargetMac);
+                                iniciarBondEConectar(dev);
+                            } else {
+                                agendarConexaoDireta(mTargetMac);
+                            }
                         }
                     }, SCAN_RETRY_DELAY_MS);
                 }
@@ -1490,7 +1532,13 @@ public class BluetoothServiceIndustrial extends Service {
         }
         pararScan();
         pararReconexao();
-        agendarConexaoDireta(mac);
+        // Verificar bond antes de conectar
+        if (hasConnectPermission()) {
+            BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mac);
+            iniciarBondEConectar(device);
+        } else {
+            agendarConexaoDireta(mac);
+        }
     }
 
     public void disconnect() {
@@ -1606,7 +1654,13 @@ public class BluetoothServiceIndustrial extends Service {
             disconnect();
         }
         mAutoReconnect = true;
-        agendarConexaoDireta(mac);
+        // Verificar bond antes de conectar ao novo MAC
+        if (hasConnectPermission()) {
+            BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mac);
+            iniciarBondEConectar(device);
+        } else {
+            agendarConexaoDireta(mac);
+        }
     }
 
     public int getQueueSize() {
