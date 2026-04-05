@@ -43,30 +43,27 @@ import okhttp3.ResponseBody;
 /**
  * Imei - Tela de Vínculo de Dispositivo
  *
- * CORREÇÕES v2.1 (fix: timeout e SocketException no carregamento):
+ * CORREÇÕES v3.0 — Crash SecurityException BLUETOOTH_SCAN:
  *
- * CAUSA RAIZ (analisada no log):
- *   - O servidor ochoppoficial.com.br usa PHP compartilhado com cold start lento.
- *   - O warm-up anterior criava um ApiHelper separado do sendPost(), então a
- *     conexão TLS aquecida não era reaproveitada (pool diferente).
- *   - Com callTimeout=90s no OkHttp, o app ficava travado por ~2 minutos antes
- *     de tentar novamente.
+ *   CAUSA RAIZ (analisada no log):
+ *     ChoppOnApplication iniciava BluetoothServiceIndustrial antes das permissões
+ *     de runtime (BLUETOOTH_SCAN/BLUETOOTH_CONNECT) serem solicitadas. O serviço
+ *     tentava fazer scan, lançava SecurityException e o processo morria.
+ *     Resultado: usuário via o diálogo de permissão, clicava "Permitir", mas o
+ *     serviço já havia crashado e nunca reiniciava o scan. ESP32 com LED azul,
+ *     tablet mostrando "Desconectado".
  *
- * SOLUÇÕES APLICADAS:
- *   1. ApiHelper agora usa OkHttpClient SINGLETON — warm-up e sendPost()
- *      compartilham o mesmo connection pool. A conexão TLS aberta no warm-up
- *      é reaproveitada na requisição principal → latência cai de ~65s para ~2s.
- *
- *   2. MAX_RETRY_ATTEMPTS aumentado de 3 → 5 — garante mais chances de sucesso
- *      sem intervenção do usuário.
- *
- *   3. Delays de retry otimizados: 1s, 3s, 5s, 8s (antes: 1s, 5s fixos).
- *      Backoff progressivo sem ser excessivamente longo.
- *
- *   4. Indicador visual de "Conectando..." atualizado a cada tentativa para
- *      o usuário saber que o app está trabalhando.
- *
- *   5. Botão "Tentar Novamente" sempre visível após falha total.
+ *   SOLUÇÕES APLICADAS:
+ *     1. ChoppOnApplication NÃO mais inicia o BLE Service.
+ *     2. checkPermissionsAndRequest() agora verifica se TODAS as permissões já
+ *        foram concedidas. Se sim, inicia o BLE Service imediatamente.
+ *        Se não, solicita as permissões.
+ *     3. onRequestPermissionsResult() inicia o BLE Service após concessão e
+ *        depois dispara a requisição de API.
+ *     4. onResume() verifica se o serviço está rodando e o inicia se necessário,
+ *        garantindo que após retornar do diálogo de permissão o scan seja feito.
+ *     5. startBleServiceIfPermitted() centraliza a lógica de início do serviço
+ *        com verificação de permissão, evitando duplicação.
  */
 public class Imei extends AppCompatActivity {
 
@@ -88,7 +85,7 @@ public class Imei extends AppCompatActivity {
         setupFullscreen();
 
         rootView  = findViewById(R.id.main);
-        txtStatus = findViewById(R.id.txtStatus);  // pode ser null se não existir no layout
+        txtStatus = findViewById(R.id.txtStatus);
         btnUpdate = findViewById(R.id.btnUpdate);
 
         if (rootView == null) {
@@ -113,6 +110,7 @@ public class Imei extends AppCompatActivity {
             Log.e(TAG, "TextView txtTap não encontrado!");
         }
 
+        // Verifica e solicita permissões BLE. Se já concedidas, inicia o serviço.
         checkPermissionsAndRequest();
     }
 
@@ -129,7 +127,68 @@ public class Imei extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         retryAttempt = 0;
+
+        // Garante que o serviço BLE está rodando após retornar do diálogo de permissão.
+        // Se o usuário acabou de conceder a permissão e voltou para esta tela,
+        // o serviço precisa ser iniciado agora.
+        startBleServiceIfPermitted();
+
         warmupAndSendRequest();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // BLE Service — início seguro após permissões
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Inicia o BluetoothServiceIndustrial SOMENTE se as permissões BLE necessárias
+     * já foram concedidas. Caso contrário, não faz nada (o serviço será iniciado
+     * após onRequestPermissionsResult).
+     *
+     * Esta é a única forma segura de iniciar o serviço no Android 12+:
+     * verificar BLUETOOTH_SCAN antes de qualquer operação BLE.
+     */
+    private void startBleServiceIfPermitted() {
+        // Verifica se as permissões necessárias foram concedidas
+        if (!hasBlePermissions()) {
+            Log.w(TAG, "[BLE] Permissões BLE ainda não concedidas — serviço não iniciado");
+            return;
+        }
+
+        // Evita iniciar o serviço se já está rodando
+        if (BluetoothServiceIndustrial.isRunning()) {
+            Log.i(TAG, "[BLE] BluetoothService já está rodando — sem necessidade de reiniciar");
+            return;
+        }
+
+        Log.i(TAG, "[BLE] Permissões OK — iniciando BluetoothServiceIndustrial");
+        Intent serviceIntent = new Intent(this, BluetoothServiceIndustrial.class);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent);
+        } else {
+            startService(serviceIntent);
+        }
+    }
+
+    /**
+     * Verifica se todas as permissões BLE necessárias foram concedidas.
+     */
+    private boolean hasBlePermissions() {
+        if (ContextCompat.checkSelfPermission(this,
+                Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            return false;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this,
+                    Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                return false;
+            }
+            if (ContextCompat.checkSelfPermission(this,
+                    Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -139,11 +198,6 @@ public class Imei extends AppCompatActivity {
     /**
      * Executa o warm-up do servidor em thread separada e, ao concluir,
      * dispara a requisição principal na UI thread.
-     *
-     * CORREÇÃO v3.0: ApiHelper usa HTTP/2 nativo via ALPN.
-     * O warm-up estabelece a conexão TLS+HTTP/2 que é reaproveitada
-     * pelo sendPost() via connection pool (multiplexação HTTP/2).
-     * Tempo esperado: <100ms (vs 20-28s com HTTP/1.1 forçado + Upgrade header).
      */
     private void warmupAndSendRequest() {
         updateStatusText("Conectando ao servidor...");
@@ -157,12 +211,6 @@ public class Imei extends AppCompatActivity {
     // Retry
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Delays de retry — com HTTP/2 o servidor responde em <100ms,
-     * então delays curtos são suficientes. Mantemos backoff progressivo
-     * para casos de instabilidade de rede.
-     */
-    // Delays progressivos: 1s, 3s, 5s, 8s
     private long getRetryDelay(int attemptNumber) {
         switch (attemptNumber) {
             case 1:  return 1000;
@@ -176,7 +224,7 @@ public class Imei extends AppCompatActivity {
     private void sendRequestWithRetry() {
         if (!isNetworkAvailable()) {
             Log.e(TAG, "Sem conexão de internet");
-            showMessage("❌ Sem conexão de internet. Verifique sua rede.", Snackbar.LENGTH_LONG);
+            showMessage("Sem conexão de internet. Verifique sua rede.", Snackbar.LENGTH_LONG);
             updateStatusText("Sem conexão de internet");
             return;
         }
@@ -195,49 +243,28 @@ public class Imei extends AppCompatActivity {
         Map<String, String> body = new HashMap<>();
         body.put("android_id", android_id);
 
-        Log.d(TAG, "Passo 1: Buscando Alvo (API) com ID: " + android_id);
+        Log.d(TAG, "Buscando TAP na API com ID: " + android_id);
 
         new ApiHelper(this).sendPost(body, "verify_tap.php", new Callback() {
             @Override
             public void onFailure(@NonNull Call call, @NonNull IOException e) {
-                Log.e(TAG, "=== CALLBACK onFailure EXECUTADO ===");
-                Log.e(TAG, "Thread: " + Thread.currentThread().getName());
-                Log.e(TAG, "=== ERRO DE REDE ===");
-                Log.e(TAG, "Mensagem: " + e.getMessage());
-                Log.e(TAG, "Causa: " + (e.getCause() != null ? e.getCause().toString() : "N/A"));
-                Log.e(TAG, "Stack trace:", e);
-
-                if (e.getMessage() != null) {
-                    if (e.getMessage().contains("failed to connect")) {
-                        Log.e(TAG, "Tipo: Falha de conexão (timeout ou servidor indisponível)");
-                    } else if (e.getMessage().contains("Network is unreachable")) {
-                        Log.e(TAG, "Tipo: Rede indisponível");
-                    } else if (e.getMessage().contains("Connection refused")) {
-                        Log.e(TAG, "Tipo: Conexão recusada");
-                    } else if (e.getMessage().contains("timeout")) {
-                        Log.e(TAG, "Tipo: Timeout — servidor demorou mais que " +
-                                "callTimeout (45s). Retentando...");
-                    }
-                }
+                Log.e(TAG, "Erro de rede: " + e.getMessage());
 
                 if (retryAttempt < MAX_RETRY_ATTEMPTS) {
                     long delay = getRetryDelay(retryAttempt);
                     Log.i(TAG, "Agendando retry em " + delay + "ms...");
-
                     runOnUiThread(() -> {
-                        showMessage("⏳ Tentativa " + retryAttempt + " falhou. " +
-                                "Retentando em " + (delay / 1000) + "s...",
-                                Snackbar.LENGTH_SHORT);
+                        showMessage("Tentativa " + retryAttempt + " falhou. Retentando em "
+                                + (delay / 1000) + "s...", Snackbar.LENGTH_SHORT);
                         updateStatusText("Retentando em " + (delay / 1000) + "s...");
                     });
-
                     new Handler(Looper.getMainLooper()).postDelayed(
                             Imei.this::sendRequestWithRetry, delay);
                 } else {
                     Log.e(TAG, "Falha após " + MAX_RETRY_ATTEMPTS + " tentativas");
                     runOnUiThread(() -> {
                         updateStatusText("Falha ao conectar. Toque em Tentar Novamente.");
-                        showMessageWithRetry("❌ Erro ao conectar após " +
+                        showMessageWithRetry("Erro ao conectar após " +
                                 MAX_RETRY_ATTEMPTS + " tentativas. Verifique sua conexão.");
                     });
                 }
@@ -245,49 +272,26 @@ public class Imei extends AppCompatActivity {
 
             @Override
             public void onResponse(@NonNull Call call, @NonNull Response response) {
-                Log.i(TAG, "=== CALLBACK onResponse EXECUTADO ===");
-                Log.i(TAG, "Thread: " + Thread.currentThread().getName());
-                Log.i(TAG, "Response code: " + response.code());
-                Log.i(TAG, "Response successful: " + response.isSuccessful());
+                Log.i(TAG, "Resposta da API: HTTP " + response.code());
 
                 final String jsonResponse;
                 final int httpCode = response.code();
                 try (ResponseBody responseBody = response.body()) {
-
-                    // ─────────────────────────────────────────────────────────
-                    // CORREÇÃO: O servidor retorna HTTP 404 com corpo JSON
-                    // {"error":"TAP não encontrada"} quando o android_id não
-                    // está cadastrado na base de dados.
-                    //
-                    // Isso NÃO é um erro de rede nem de código — é uma resposta
-                    // semântica da API. O corpo deve ser lido e exibido ao usuário.
-                    //
-                    // Tratamento por código:
-                    //   200 → TAP encontrada → navegar para Home
-                    //   404 → TAP não cadastrada → exibir mensagem clara
-                    //   401 → Token JWT inválido → erro de autenticação
-                    //   outros → erro genérico com retry
-                    // ─────────────────────────────────────────────────────────
-
                     if (responseBody == null) {
                         Log.e(TAG, "Corpo da resposta nulo (HTTP " + httpCode + ")");
                         runOnUiThread(() ->
-                                showMessage("❌ Resposta vazia do servidor (HTTP " + httpCode + ")",
+                                showMessage("Resposta vazia do servidor (HTTP " + httpCode + ")",
                                         Snackbar.LENGTH_LONG));
                         return;
                     }
 
-                    // Lê o corpo ANTES de verificar isSuccessful() para capturar
-                    // a mensagem de erro do JSON mesmo em respostas 4xx
                     jsonResponse = responseBody.string();
-                    Log.d(TAG, "Corpo JSON recebido (HTTP " + httpCode + ", " +
-                            jsonResponse.length() + " chars): " + jsonResponse);
+                    Log.d(TAG, "JSON recebido (HTTP " + httpCode + "): " + jsonResponse);
 
                     if (!response.isSuccessful()) {
-                        Log.e(TAG, "Resposta da API não-sucesso: HTTP " + httpCode);
+                        Log.e(TAG, "Resposta não-sucesso: HTTP " + httpCode);
 
                         if (httpCode == 404) {
-                            // Tenta extrair a mensagem de erro do JSON
                             String errMsg = "Dispositivo não cadastrado no servidor.";
                             try {
                                 int braceIdx = jsonResponse.indexOf('{');
@@ -304,14 +308,14 @@ public class Imei extends AppCompatActivity {
                             Log.w(TAG, "HTTP 404 — TAP não encontrada: " + finalMsg);
                             runOnUiThread(() -> {
                                 updateStatusText("Dispositivo não cadastrado.");
-                                showMessageWithRetry("⚠️ " + finalMsg +
+                                showMessageWithRetry("" + finalMsg +
                                         "\nVerifique se este tablet está vinculado no painel.");
                             });
                         } else if (httpCode == 401) {
                             Log.e(TAG, "HTTP 401 — Token JWT inválido ou expirado");
                             runOnUiThread(() -> {
                                 updateStatusText("Erro de autenticação.");
-                                showMessage("❌ Erro de autenticação (401). Verifique a chave da API.",
+                                showMessage("Erro de autenticação (401). Verifique a chave da API.",
                                         Snackbar.LENGTH_LONG);
                             });
                         } else {
@@ -323,7 +327,7 @@ public class Imei extends AppCompatActivity {
                                         Imei.this::sendRequestWithRetry, delay);
                             } else {
                                 runOnUiThread(() ->
-                                        showMessageWithRetry("❌ Erro HTTP " + httpCode +
+                                        showMessageWithRetry("Erro HTTP " + httpCode +
                                                 ". Toque em Tentar Novamente."));
                             }
                         }
@@ -332,8 +336,7 @@ public class Imei extends AppCompatActivity {
                 } catch (IOException e) {
                     Log.e(TAG, "Erro ao ler resposta da API.", e);
                     runOnUiThread(() ->
-                            showMessage("❌ Erro ao ler resposta do servidor",
-                                    Snackbar.LENGTH_LONG));
+                            showMessage("Erro ao ler resposta do servidor", Snackbar.LENGTH_LONG));
                     return;
                 }
 
@@ -343,8 +346,7 @@ public class Imei extends AppCompatActivity {
                         return;
                     }
                     try {
-                        Log.i(TAG, "=== PROCESSANDO JSON ===");
-                        Log.d(TAG, "JSON Recebido: " + jsonResponse);
+                        Log.i(TAG, "Processando JSON da API...");
 
                         // Remove possíveis caracteres antes do JSON (BOM, whitespace)
                         String cleanJson = jsonResponse;
@@ -357,8 +359,10 @@ public class Imei extends AppCompatActivity {
                         Tap tap = new Gson().fromJson(cleanJson, Tap.class);
 
                         if (tap != null && tap.bebida != null && !tap.bebida.isEmpty()) {
-                            Log.i(TAG, "✅ Objeto Tap validado. Preparando para navegar.");
-                            showMessage("✅ Conectado com sucesso!", Snackbar.LENGTH_SHORT);
+                            Log.i(TAG, "TAP validada. bebida=" + tap.bebida
+                                    + " mac=" + tap.esp32_mac
+                                    + " status=" + tap.tap_status);
+                            showMessage("Conectado com sucesso!", Snackbar.LENGTH_SHORT);
                             updateStatusText("Conectado!");
 
                             if (tap.esp32_mac != null && !tap.esp32_mac.isEmpty()) {
@@ -378,6 +382,11 @@ public class Imei extends AppCompatActivity {
                                 return;
                             }
 
+                            // CORREÇÃO: Garante que o BLE Service está rodando ANTES de
+                            // navegar para Home. Sem isso, Home.bindBluetoothService()
+                            // tentaria fazer bind em um serviço que ainda não existe.
+                            startBleServiceIfPermitted();
+
                             Intent it = new Intent(getApplicationContext(), Home.class);
                             it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
                                     | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -387,19 +396,18 @@ public class Imei extends AppCompatActivity {
                             it.putExtra("imagem", tap.image);
                             it.putExtra("cartao", (tap.cartao != null) && tap.cartao);
 
-                            Log.d(TAG, ">>> DISPARANDO INTENT PARA HOME...");
+                            Log.d(TAG, "Navegando para Home...");
                             startActivity(it);
-                            Log.d(TAG, ">>> START ACTIVITY EXECUTADO.");
                             finish();
                         } else {
-                            Log.w(TAG, "⚠️ Dispositivo não configurado na API.");
+                            Log.w(TAG, "Dispositivo não configurado na API.");
                             updateStatusText("Dispositivo não configurado no servidor.");
-                            showMessage("⚠️ Dispositivo não configurado no servidor.",
+                            showMessage("Dispositivo não configurado no servidor.",
                                     Snackbar.LENGTH_LONG);
                         }
                     } catch (Throwable t) {
                         Log.e(TAG, "ERRO FATAL no processamento ou navegação.", t);
-                        showMessage("❌ Erro ao processar resposta do servidor.",
+                        showMessage("Erro ao processar resposta do servidor.",
                                 Snackbar.LENGTH_LONG);
                     }
                 });
@@ -415,17 +423,9 @@ public class Imei extends AppCompatActivity {
         try {
             ConnectivityManager cm =
                     (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-            if (cm == null) {
-                Log.w(TAG, "ConnectivityManager não disponível");
-                return false;
-            }
+            if (cm == null) return false;
             NetworkInfo activeNetwork = cm.getActiveNetworkInfo();
-            boolean isConnected = activeNetwork != null && activeNetwork.isConnectedOrConnecting();
-            Log.i(TAG, "Status de rede: " + (isConnected ? "CONECTADO" : "DESCONECTADO"));
-            if (activeNetwork != null) {
-                Log.d(TAG, "Tipo de rede: " + activeNetwork.getTypeName());
-            }
-            return isConnected;
+            return activeNetwork != null && activeNetwork.isConnectedOrConnecting();
         } catch (Exception e) {
             Log.e(TAG, "Erro ao verificar conectividade", e);
             return false;
@@ -467,11 +467,26 @@ public class Imei extends AppCompatActivity {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Permissões
+    // Permissões BLE — Android 12+
     // ─────────────────────────────────────────────────────────────────────────
 
+    /**
+     * Verifica se as permissões BLE necessárias foram concedidas.
+     * Se sim, inicia o serviço BLE imediatamente.
+     * Se não, solicita as permissões ao usuário.
+     *
+     * FLUXO CORRETO Android 12+:
+     *   1. checkPermissionsAndRequest() → solicita permissões se necessário
+     *   2. Usuário clica "Permitir" no diálogo do sistema
+     *   3. onRequestPermissionsResult() → inicia BLE Service + dispara API
+     *
+     * Se as permissões já foram concedidas anteriormente:
+     *   1. checkPermissionsAndRequest() → inicia BLE Service diretamente
+     *   2. warmupAndSendRequest() é chamado em onResume() normalmente
+     */
     private void checkPermissionsAndRequest() {
         List<String> permissionsNeeded = new ArrayList<>();
+
         if (ContextCompat.checkSelfPermission(this,
                 Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             permissionsNeeded.add(Manifest.permission.ACCESS_FINE_LOCATION);
@@ -486,9 +501,15 @@ public class Imei extends AppCompatActivity {
                 permissionsNeeded.add(Manifest.permission.BLUETOOTH_CONNECT);
             }
         }
+
         if (!permissionsNeeded.isEmpty()) {
+            Log.i(TAG, "[PERM] Solicitando " + permissionsNeeded.size() + " permissão(ões) BLE...");
             ActivityCompat.requestPermissions(this,
                     permissionsNeeded.toArray(new String[0]), PERMISSION_REQUEST_CODE);
+        } else {
+            // Todas as permissões já concedidas — inicia o serviço imediatamente
+            Log.i(TAG, "[PERM] Todas as permissões BLE já concedidas — iniciando serviço");
+            startBleServiceIfPermitted();
         }
     }
 
@@ -497,10 +518,27 @@ public class Imei extends AppCompatActivity {
                                            @NonNull String[] permissions,
                                            @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == PERMISSION_REQUEST_CODE
-                && grantResults.length > 0
-                && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            sendRequestWithRetry();
+        if (requestCode == PERMISSION_REQUEST_CODE) {
+            boolean allGranted = true;
+            for (int result : grantResults) {
+                if (result != PackageManager.PERMISSION_GRANTED) {
+                    allGranted = false;
+                    break;
+                }
+            }
+
+            if (allGranted) {
+                Log.i(TAG, "[PERM] Todas as permissões BLE concedidas pelo usuário");
+                // Inicia o serviço BLE agora que as permissões foram concedidas
+                startBleServiceIfPermitted();
+                // Dispara a requisição de API
+                sendRequestWithRetry();
+            } else {
+                Log.w(TAG, "[PERM] Uma ou mais permissões BLE negadas pelo usuário");
+                showMessage("Permissão Bluetooth necessária para o funcionamento do app.",
+                        Snackbar.LENGTH_LONG);
+                updateStatusText("Permissão Bluetooth necessária.");
+            }
         }
     }
 }

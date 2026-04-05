@@ -1,13 +1,26 @@
 package com.example.choppontap;
 
 import android.app.Application;
-import android.content.Intent;
-import android.os.Build;
 import android.util.Log;
 
 /**
- * Application class para inicialização do app
- * Valida configurações críticas na startup
+ * Application class para inicialização do app.
+ *
+ * CORREÇÃO v3.0 — Crash SecurityException BLUETOOTH_SCAN:
+ *   CAUSA: Esta classe iniciava BluetoothServiceIndustrial incondicionalmente
+ *   em onCreate(), antes de qualquer permissão runtime ser solicitada.
+ *   No Android 12+, BLUETOOTH_SCAN é uma permissão de runtime — se o serviço
+ *   tentar fazer scan antes da permissão ser concedida, lança SecurityException
+ *   e o processo morre. Resultado: tela de permissão aparece, usuário clica
+ *   "Permitir", mas o serviço já crashou e nunca reinicia o scan.
+ *
+ *   SOLUÇÃO: Remover o início do BLE daqui. O BluetoothServiceIndustrial é
+ *   iniciado pela Imei.java APÓS as permissões serem concedidas, e pela
+ *   Home.java via bindBluetoothService(). Isso garante que o scan só começa
+ *   quando BLUETOOTH_SCAN já foi autorizado pelo usuário.
+ *
+ *   O serviço usa singleton (sInstance) para evitar instâncias duplicadas,
+ *   então não há risco de múltiplas instâncias mesmo com o início tardio.
  */
 public class ChoppOnApplication extends Application {
     private static final String TAG = "ChoppOn";
@@ -17,62 +30,49 @@ public class ChoppOnApplication extends Application {
         super.onCreate();
 
         Log.i(TAG, "=================================");
-        Log.i(TAG, "[PROCESS] 🚀 PROCESS STARTED - ChoppOn APP INICIALIZADA");
+        Log.i(TAG, "[PROCESS] PROCESS STARTED - ChoppOn APP INICIALIZADA");
         Log.i(TAG, "=================================");
 
         // 1. DETECTAR CRASH OCULTO - UncaughtExceptionHandler global
-        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
-            @Override
-            public void uncaughtException(Thread thread, Throwable throwable) {
-                Log.e(TAG, "[CRASH] 💥 CRASH OCULTO DETECTADO!");
-                Log.e(TAG, "[CRASH] Thread: " + thread.getName());
-                Log.e(TAG, "[CRASH] Exception: " + throwable.getClass().getName());
-                Log.e(TAG, "[CRASH] Message: " + throwable.getMessage());
-                Log.e(TAG, "[CRASH] StackTrace:", throwable);
-
-                // Log adicional para análise
-                Log.e(TAG, "[CRASH] System info - PID: " + android.os.Process.myPid());
-                Log.e(TAG, "[CRASH] System info - TID: " + android.os.Process.myTid());
-
-                // Não chamar System.exit() - deixar o sistema lidar
-                // Isso permite que o log seja enviado antes do crash
-            }
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+            Log.e(TAG, "[CRASH] CRASH OCULTO DETECTADO!");
+            Log.e(TAG, "[CRASH] Thread: " + thread.getName());
+            Log.e(TAG, "[CRASH] Exception: " + throwable.getClass().getName());
+            Log.e(TAG, "[CRASH] Message: " + throwable.getMessage());
+            Log.e(TAG, "[CRASH] StackTrace:", throwable);
+            Log.e(TAG, "[CRASH] PID: " + android.os.Process.myPid());
+            Log.e(TAG, "[CRASH] TID: " + android.os.Process.myTid());
+            // Não chamar System.exit() — deixa o sistema lidar para que o log seja enviado
         });
 
-        // 2. MONITORAR CICLO DE VIDA DA APPLICATION
-        Log.i(TAG, "[LIFECYCLE] Application.onCreate() iniciado");
-
-        // Valida configuração de API
+        // 2. Valida configuração de API
         try {
             ApiConfig.validate();
-            Log.i(TAG, "✅ Configuração OK");
+            Log.i(TAG, "[CONFIG] Configuracao OK");
         } catch (Exception e) {
-            Log.e(TAG, "❌ ERRO NA CONFIGURAÇÃO: " + e.getMessage());
-            throw new RuntimeException("Falha crítica na inicialização", e);
+            Log.e(TAG, "[CONFIG] ERRO NA CONFIGURACAO: " + e.getMessage());
+            throw new RuntimeException("Falha critica na inicializacao", e);
         }
 
-        // FIX: Iniciar BLE Service apenas uma vez no Application
-        Log.i(TAG, "[BLE] Iniciando BluetoothServiceIndustrial no Application...");
-        Intent serviceIntent = new Intent(this, BluetoothServiceIndustrial.class);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent);
-        } else {
-            startService(serviceIntent);
-        }
+        // NOTA: BluetoothServiceIndustrial NÃO é iniciado aqui.
+        // Motivo: No Android 12+, BLUETOOTH_SCAN é permissão de runtime.
+        // O serviço é iniciado por Imei.java após permissões concedidas,
+        // e por Home.java via bindBluetoothService().
+        Log.i(TAG, "[BLE] BluetoothService sera iniciado apos concessao de permissoes (Imei/Home)");
 
-        Log.i(TAG, "[LIFECYCLE] Application.onCreate() concluído");
+        Log.i(TAG, "[LIFECYCLE] Application.onCreate() concluido");
         Log.i(TAG, "=================================");
     }
 
     @Override
     public void onTerminate() {
-        Log.i(TAG, "[PROCESS] 💀 PROCESS ENDED - Application.onTerminate()");
+        Log.i(TAG, "[PROCESS] PROCESS ENDED - Application.onTerminate()");
         super.onTerminate();
     }
 
     @Override
     public void onLowMemory() {
-        Log.w(TAG, "[LIFECYCLE] ⚠️ Application.onLowMemory() - memória baixa!");
+        Log.w(TAG, "[LIFECYCLE] Application.onLowMemory() - memoria baixa!");
         super.onLowMemory();
     }
 

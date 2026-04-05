@@ -617,6 +617,25 @@ public class BluetoothServiceIndustrial extends Service {
             Log.w(TAG, "[SCAN] Bluetooth desativado — scan cancelado");
             return;
         }
+
+        // CORREÇÃO CRÍTICA Android 12+: verificar BLUETOOTH_SCAN antes de startScan().
+        // Sem esta verificação, o serviço lança SecurityException se a permissão
+        // ainda não foi concedida (ex: primeira abertura do app).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (checkSelfPermission(android.Manifest.permission.BLUETOOTH_SCAN)
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                Log.w(TAG, "[SCAN] BLUETOOTH_SCAN não concedido — scan adiado. "
+                        + "Aguardando permissão do usuário em Imei.java");
+                // Agenda retry: quando a permissão for concedida, Imei.java inicia
+                // o serviço novamente via startBleServiceIfPermitted(). Mas caso
+                // o serviço já esteja rodando, tentamos novamente em 5s.
+                mMainHandler.postDelayed(() -> {
+                    if (mAutoReconnect) iniciarConexao();
+                }, 5_000L);
+                return;
+            }
+        }
+
         synchronized (mMacsValidando) { mMacsValidando.clear(); }
         mScanning = true;
         transitionTo(State.SCANNING);

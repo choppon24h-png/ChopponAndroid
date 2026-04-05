@@ -95,6 +95,67 @@ public class Home extends AppCompatActivity {
     private boolean mIsServiceBound = false;
 
     /**
+     * Watchdog de fallback BLE.
+     *
+     * PROBLEMA: O ESP32 pode estar fisicamente conectado (LED azul) mas o
+     * broadcast ACTION_CONNECTION_STATUS não chegar à UI por race condition
+     * (ex: o receiver ainda não estava registrado quando o broadcast foi enviado,
+     * ou o serviço foi iniciado antes do bind estar completo).
+     *
+     * SOLUÇÃO: A cada 3s, o watchdog verifica diretamente o estado do serviço.
+     * Se o serviço reportar READY ou CONNECTED mas os botões ainda estiverem
+     * desabilitados, força a atualização da UI.
+     */
+    private final Handler mBleWatchdogHandler = new Handler();
+    private static final long BLE_WATCHDOG_INTERVAL_MS = 3_000L;
+    private boolean mBleWatchdogRunning = false;
+
+    private final Runnable mBleWatchdogRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!mBleWatchdogRunning || isFinishing() || isDestroyed()) return;
+
+            if (mIsServiceBound && mBluetoothService != null) {
+                boolean serviceReady    = mBluetoothService.isReady();
+                boolean serviceConnected = mBluetoothService.connected();
+                boolean buttonsEnabled  = (btn100 != null && btn100.isEnabled());
+
+                if ((serviceReady || serviceConnected) && !buttonsEnabled) {
+                    // Serviço está conectado mas a UI ainda mostra desconectado
+                    // Força atualização via broadcast sintético
+                    Log.w(TAG, "[WATCHDOG] ESP32 conectado (ready=" + serviceReady
+                            + " connected=" + serviceConnected
+                            + ") mas botões desabilitados — forçando atualização da UI");
+                    String status = serviceReady ? "connected" : "connected";
+                    updateBluetoothStatus(status);
+                    changeButtons(true);
+                } else if (!serviceConnected && buttonsEnabled) {
+                    // Serviço desconectou mas a UI ainda mostra conectado
+                    Log.w(TAG, "[WATCHDOG] ESP32 desconectado mas botões habilitados — corrigindo UI");
+                    updateBluetoothStatus("disconnected");
+                    changeButtons(false);
+                }
+            }
+
+            // Agenda próxima verificação
+            mBleWatchdogHandler.postDelayed(this, BLE_WATCHDOG_INTERVAL_MS);
+        }
+    };
+
+    private void startBleWatchdog() {
+        if (mBleWatchdogRunning) return;
+        mBleWatchdogRunning = true;
+        mBleWatchdogHandler.postDelayed(mBleWatchdogRunnable, BLE_WATCHDOG_INTERVAL_MS);
+        Log.d(TAG, "[WATCHDOG] BLE watchdog iniciado (intervalo=" + BLE_WATCHDOG_INTERVAL_MS + "ms)");
+    }
+
+    private void stopBleWatchdog() {
+        mBleWatchdogRunning = false;
+        mBleWatchdogHandler.removeCallbacks(mBleWatchdogRunnable);
+        Log.d(TAG, "[WATCHDOG] BLE watchdog parado");
+    }
+
+    /**
      * BroadcastReceiver que recebe atualizações de status do BluetoothService.
      * Registrado em onResume() e desregistrado em onPause() para evitar leaks.
      */
@@ -104,10 +165,11 @@ public class Home extends AppCompatActivity {
             if (BluetoothServiceIndustrial.ACTION_CONNECTION_STATUS.equals(intent.getAction())) {
                 String status = intent.getStringExtra(BluetoothServiceIndustrial.EXTRA_STATUS);
                 if (status != null) {
-                    Log.d(TAG, "BLE status recebido via broadcast: " + status);
+                    Log.d(TAG, "[BLE] Status recebido via broadcast: " + status);
                     updateBluetoothStatus(status);
-                    // Habilita os botões SOMENTE quando conectado
-                    changeButtons("connected".equals(status));
+                    // Habilita os botões quando conectado ou pronto
+                    boolean enable = "connected".equals(status) || "ready".equals(status);
+                    changeButtons(enable);
                 }
             }
         }
@@ -208,11 +270,22 @@ public class Home extends AppCompatActivity {
         IntentFilter filter = new IntentFilter(BluetoothServiceIndustrial.ACTION_CONNECTION_STATUS);
         LocalBroadcastManager.getInstance(this).registerReceiver(mServiceUpdateReceiver, filter);
 
-        // Se já vinculado mas desconectado, reinicia o scan
-        if (mIsServiceBound && mBluetoothService != null && !mBluetoothService.connected()) {
-            Log.i(TAG, "onResume: BLE desconectado, reiniciando scan...");
-            mBluetoothService.enableAutoReconnect();
-            mBluetoothService.scanLeDevice(true);
+        // Inicia o watchdog de fallback BLE
+        startBleWatchdog();
+
+        // Se já vinculado, sincroniza o estado da UI com o estado real do serviço
+        if (mIsServiceBound && mBluetoothService != null) {
+            if (mBluetoothService.isReady() || mBluetoothService.connected()) {
+                // Já conectado — garante que a UI reflita isso imediatamente
+                Log.i(TAG, "onResume: BLE já conectado — sincronizando UI");
+                updateBluetoothStatus("connected");
+                changeButtons(true);
+            } else {
+                // Desconectado — reinicia o scan
+                Log.i(TAG, "onResume: BLE desconectado, reiniciando scan...");
+                mBluetoothService.enableAutoReconnect();
+                mBluetoothService.scanLeDevice(true);
+            }
         }
     }
 
@@ -220,12 +293,14 @@ public class Home extends AppCompatActivity {
     protected void onPause() {
         super.onPause();
         LocalBroadcastManager.getInstance(this).unregisterReceiver(mServiceUpdateReceiver);
+        stopBleWatchdog();
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
         stopRandomPulse();
+        stopBleWatchdog();
         if (currentImageTask != null) currentImageTask.cancel(true);
         imageExecutor.shutdown();
         if (mIsServiceBound) {
@@ -698,16 +773,23 @@ public class Home extends AppCompatActivity {
         if (bluetoothStatusIndicator == null) return;
         switch (status.toLowerCase()) {
             case "connected":
+            case "ready":
                 bluetoothStatusIndicator.setStatus(
-                        BluetoothStatusIndicator.STATUS_CONNECTED, "✓ Conectado ao Chopp");
+                        BluetoothStatusIndicator.STATUS_CONNECTED, "Conectado ao Chopp");
                 break;
+            case "scanning":
             case "conectando...":
+            case "connecting":
                 bluetoothStatusIndicator.setStatus(
-                        BluetoothStatusIndicator.STATUS_CONNECTING, "⏳ Conectando...");
+                        BluetoothStatusIndicator.STATUS_CONNECTING, "Conectando...");
+                break;
+            case "scan_timeout":
+                bluetoothStatusIndicator.setStatus(
+                        BluetoothStatusIndicator.STATUS_CONNECTING, "Procurando ESP32...");
                 break;
             default:
                 bluetoothStatusIndicator.setStatus(
-                        BluetoothStatusIndicator.STATUS_ERROR, "🔴 Desconectado");
+                        BluetoothStatusIndicator.STATUS_ERROR, "Desconectado");
         }
     }
 
