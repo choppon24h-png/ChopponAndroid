@@ -449,6 +449,31 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // Verificação de permissão BLUETOOTH_CONNECT (Android 12+)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Verifica se a permissão BLUETOOTH_CONNECT foi concedida (Android 12+).
+     * No Android 11 e abaixo, a permissão não existe e retorna true.
+     *
+     * CORREÇÃO CRÍTICA: No Android 12+, TODAS as operações GATT exigem
+     * BLUETOOTH_CONNECT: connectGatt(), getBondState(), createBond(),
+     * setPin(), setPairingConfirmation(), getConnectedDevices(), etc.
+     * Sem essa verificação, o sistema lança SecurityException fatal.
+     */
+    private boolean hasConnectPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) { // Android 12+
+            boolean granted = checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            if (!granted) {
+                Log.e(TAG, "[PERM] BLUETOOTH_CONNECT NÃO concedida — operação GATT bloqueada");
+            }
+            return granted;
+        }
+        return true; // Android 11 e abaixo: permissão não existe
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // Delay inteligente antes de conectar
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -457,6 +482,12 @@ public class BluetoothServiceIndustrial extends Service {
         Log.i(TAG, "[INDUSTRIAL] Agendando conexão em " + delay + "ms → " + mac);
         mMainHandler.postDelayed(() -> {
             if (!podeConectar()) return;
+            // CORREÇÃO CRÍTICA: verificar BLUETOOTH_CONNECT antes de getRemoteDevice/connectGatt
+            if (!hasConnectPermission()) {
+                Log.w(TAG, "[INDUSTRIAL] BLUETOOTH_CONNECT não concedida — agendando retry em 5s");
+                mMainHandler.postDelayed(() -> agendarConexaoDireta(mac), 5_000L);
+                return;
+            }
             BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mac);
             conectarGatt(device);
         }, delay);
@@ -468,6 +499,12 @@ public class BluetoothServiceIndustrial extends Service {
 
     private void conectarGatt(BluetoothDevice device) {
         if (!podeConectar()) return;
+
+        // CORREÇÃO CRÍTICA: BLUETOOTH_CONNECT é obrigatório para connectGatt() e getBondState()
+        if (!hasConnectPermission()) {
+            Log.w(TAG, "[GATT] BLUETOOTH_CONNECT não concedida — conectarGatt() abortado");
+            return;
+        }
 
         transitionTo(State.CONNECTING);
         iniciarTimeoutConexao(device);
@@ -761,6 +798,12 @@ public class BluetoothServiceIndustrial extends Service {
     // ═══════════════════════════════════════════════════════════════════════════
 
     private void iniciarBondEConectar(BluetoothDevice device) {
+        // CORREÇÃO CRÍTICA: getBondState() e createBond() exigem BLUETOOTH_CONNECT no Android 12+
+        if (!hasConnectPermission()) {
+            Log.w(TAG, "[BOND] BLUETOOTH_CONNECT não concedida — pulando bond, conectando direto");
+            agendarConexaoDireta(device.getAddress());
+            return;
+        }
         int bondState = device.getBondState();
         Log.i(TAG, "[BOND] iniciarBondEConectar() | bond=" + bondStateName(bondState)
                 + " | mac=" + device.getAddress());
@@ -825,6 +868,12 @@ public class BluetoothServiceIndustrial extends Service {
                     + (device != null ? device.getAddress() : "null")
                     + " | variant=" + variant);
             if (device == null) return;
+
+            // CORREÇÃO CRÍTICA: setPin() e setPairingConfirmation() exigem BLUETOOTH_CONNECT no Android 12+
+            if (!hasConnectPermission()) {
+                Log.e(TAG, "[PAIRING] BLUETOOTH_CONNECT não concedida — não é possível confirmar pareamento");
+                return;
+            }
 
             // PIN do firmware ESP32: 259087
             byte[] pinBytes = "259087".getBytes(StandardCharsets.UTF_8);
@@ -1244,6 +1293,12 @@ public class BluetoothServiceIndustrial extends Service {
         if (!isBleStackPronto()) {
             Log.e(TAG, "[WRITE] WRITE BLOQUEADO — BLE não inicializado: \"" + data + "\"");
             logBleHandles("writeImediato");
+            return;
+        }
+        // CORREÇÃO CRÍTICA: writeCharacteristic() exige BLUETOOTH_CONNECT no Android 12+
+        if (!hasConnectPermission()) {
+            Log.e(TAG, "[WRITE] BLUETOOTH_CONNECT não concedida — write bloqueado: \"" + data + "\"");
+            mWriteBusy.set(false);
             return;
         }
         mWriteBusy.set(true);
