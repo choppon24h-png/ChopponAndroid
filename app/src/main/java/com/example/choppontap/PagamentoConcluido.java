@@ -46,39 +46,39 @@ import okhttp3.Response;
 import okhttp3.ResponseBody;
 
 /**
- * PagamentoConcluido — Tela de liberação do chopp após pagamento confirmado.
+ * PagamentoConcluido â Tela de liberaÃ§Ã£o do chopp apÃ³s pagamento confirmado.
  *
  * Protocolo NUS v4.0:
  *   Envio:    $ML:<volume_ml>
  *   Respostas: OK, VP:<parcial>, QP:<pulsos>, ML:<final>
  *
- * NÃO usa mais: READY/READY_OK, SERVE, ACK|, DONE|, PING, HMAC, SESSION_ID, CMD_ID
+ * NÃO usa mais: READY/READY_OK, SERVE, ACK|, DONE|, PING, HMAC, SESSION_ID, CMD_ID
  */
 public class PagamentoConcluido extends AppCompatActivity {
 
     private static final String TAG = "PAGAMENTO_CONCLUIDO";
 
-    // ── Timeouts e delays ─────────────────────────────────────────────────────
+    // ââ Timeouts e delays âââââââââââââââââââââââââââââââââââââââââââââââââââââ
     private static final long ML_SEND_DELAY_MS       = 800L;
     private static final long HOME_NAVIGATE_DELAY_MS = 3_000L;
     private static final long WATCHDOG_TIMEOUT_MS    = 30_000L;
 
-    // ── Handlers ──────────────────────────────────────────────────────────────
+    // ââ Handlers ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     private final Handler mMainHandler     = new Handler(Looper.getMainLooper());
     private final Handler mWatchdogHandler = new Handler(Looper.getMainLooper());
 
-    // ── Estado da liberação ───────────────────────────────────────────────────
+    // ââ Estado da liberaÃ§Ã£o âââââââââââââââââââââââââââââââââââââââââââââââââââ
     private int     qtd_ml               = 0;
     private int     liberado             = 0;
     private boolean mLiberacaoFinalizada = false;
     private boolean mComandoEnviado      = false;
 
-    // ── Dados do pedido ───────────────────────────────────────────────────────
+    // ââ Dados do pedido âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     private String checkout_id;
     private String android_id;
     private String imagemUrl;
 
-    // ── Views ─────────────────────────────────────────────────────────────────
+    // ââ Views âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     private TextView    txtQtd;
     private TextView    txtMls;
     private TextView    txtStatus;
@@ -93,7 +93,7 @@ public class PagamentoConcluido extends AppCompatActivity {
     private boolean          mIsServiceBound = false;
     private SessionManager   mSessionManager;
 
-    // ── Watchdog ──────────────────────────────────────────────────────────────
+    // ââ Watchdog ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     private boolean mWatchdogActive = false;
 
     private final Runnable mWatchdogRunnable = () -> {
@@ -111,9 +111,9 @@ public class PagamentoConcluido extends AppCompatActivity {
         });
     };
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // BroadcastReceiver — escuta eventos do BluetoothServiceIndustrial
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+    // BroadcastReceiver â escuta eventos do BluetoothServiceIndustrial
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     private final BroadcastReceiver mServiceUpdateReceiver = new BroadcastReceiver() {
         @Override
@@ -123,15 +123,15 @@ public class PagamentoConcluido extends AppCompatActivity {
 
             switch (action) {
                 case BluetoothServiceIndustrial.ACTION_WRITE_READY:
-                    // BLE está READY — enviar comando $ML:<volume>
-                    atualizarStatus("Dispositivo pronto. Liberando...");
-                    mMainHandler.postDelayed(() -> {
-                        if (!mComandoEnviado || (!mLiberacaoFinalizada && liberado == 0)) {
-                            mComandoEnviado = false;
-                            iniciarVendaEEnfileirar();
-                        }
-                    }, ML_SEND_DELAY_MS);
-                    break;
+                Log.i(TAG, "[BLE] ACTION_WRITE_READY recebido — BLE pronto");
+                atualizarStatus("Dispositivo pronto. Liberando...");
+                mMainHandler.postDelayed(() -> {
+                    if (!mLiberacaoFinalizada && liberado == 0) {
+                        mComandoEnviado = false;
+                        iniciarVendaEEnfileirar();
+                    }
+                }, ML_SEND_DELAY_MS);
+                break;
 
                 case BluetoothServiceIndustrial.ACTION_CONNECTION_STATUS:
                     String status = intent.getStringExtra(BluetoothServiceIndustrial.EXTRA_STATUS);
@@ -153,14 +153,14 @@ public class PagamentoConcluido extends AppCompatActivity {
         }
     };
 
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     // Processamento de mensagens do ESP32 (protocolo NUS v4.0)
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     private void processarMensagem(String msg) {
         Log.d(TAG, "[ESP32] " + msg);
 
-        // ── OK — comando aceito pelo ESP32 ───────────────────────────────────
+        // ââ OK â comando aceito pelo ESP32 âââââââââââââââââââââââââââââââââââ
         if ("OK".equalsIgnoreCase(msg)) {
             Log.i(TAG, "[BLE] Comando $ML aceito pelo ESP32");
             atualizarStatus("Comando aceito. Liberando chopp...");
@@ -168,7 +168,7 @@ public class PagamentoConcluido extends AppCompatActivity {
             return;
         }
 
-        // ── ERRO — comando com erro ──────────────────────────────────────────
+        // ââ ERRO â comando com erro ââââââââââââââââââââââââââââââââââââââââââ
         if ("ERRO".equalsIgnoreCase(msg)) {
             Log.e(TAG, "[BLE] ESP32 reportou ERRO no comando");
             atualizarStatus("Erro no comando. Tentando novamente...");
@@ -176,7 +176,7 @@ public class PagamentoConcluido extends AppCompatActivity {
             return;
         }
 
-        // ── VP: — volume parcial durante liberação ───────────────────────────
+        // ââ VP: â volume parcial durante liberaÃ§Ã£o âââââââââââââââââââââââââââ
         if (msg.startsWith("VP:")) {
             resetarWatchdog();
             try {
@@ -192,13 +192,13 @@ public class PagamentoConcluido extends AppCompatActivity {
             return;
         }
 
-        // ── QP: — quantidade de pulsos ao final ──────────────────────────────
+        // ââ QP: â quantidade de pulsos ao final ââââââââââââââââââââââââââââââ
         if (msg.startsWith("QP:")) {
             Log.i(TAG, "[BLE] Pulsos reportados: " + msg);
             return;
         }
 
-        // ── ML: — volume final liberado (CONCLUSÃO da liberação) ─────────────
+        // ââ ML: â volume final liberado (CONCLUSÃO da liberaÃ§Ã£o) âââââââââââââ
         if (msg.startsWith("ML:")) {
             cancelarWatchdog();
             try {
@@ -225,19 +225,19 @@ public class PagamentoConcluido extends AppCompatActivity {
             return;
         }
 
-        // ── PL: — resposta de pulsos/litro (não esperado aqui) ───────────────
+        // ââ PL: â resposta de pulsos/litro (nÃ£o esperado aqui) âââââââââââââââ
         if (msg.startsWith("PL:")) {
             Log.d(TAG, "[BLE] Pulsos/litro: " + msg);
             return;
         }
 
-        // ── Mensagem não reconhecida ──────────────────────────────────────────
-        Log.d(TAG, "[BLE] Mensagem não tratada: " + msg);
+        // ââ Mensagem nÃ£o reconhecida ââââââââââââââââââââââââââââââââââââââââââ
+        Log.d(TAG, "[BLE] Mensagem nÃ£o tratada: " + msg);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     // Envio de comando $ML:<volume> ao ESP32
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     /**
      * Envia comando $ML:<volume> diretamente ao ESP32.
@@ -248,28 +248,35 @@ public class PagamentoConcluido extends AppCompatActivity {
             Log.e(TAG, "[BLE] BluetoothService nulo — nao foi possivel enviar $ML");
             return;
         }
-
         String command = "$ML:" + volumeMl;
-        Log.i(TAG, "[BLE] Enviando: " + command);
-        mComandoEnviado = true;
-
-        boolean ok = mBluetoothService.write(command);
-        if (ok) {
-            atualizarStatus("Enviando comando de liberacao...");
+        Log.i(TAG, "[BLE] Enviando: " + command + " | BLE estado=" + mBluetoothService.getState().name());
+        if (mBluetoothService.isReady()) {
+            mComandoEnviado = true;
+            boolean ok = mBluetoothService.write(command);
+            if (ok) {
+                atualizarStatus("Enviando comando de liberacao...");
+                Log.i(TAG, "[BLE] write() OK — $ML enviado imediatamente");
+            } else {
+                Log.e(TAG, "[BLE] write() falhou com isReady()=true — usando pendente");
+                mComandoEnviado = false;
+                mBluetoothService.enqueueServeCommand(volumeMl, checkout_id);
+                atualizarStatus("Aguardando conexao BLE...");
+            }
         } else {
-            Log.e(TAG, "[BLE] Falha ao enviar: " + command);
+            Log.w(TAG, "[BLE] BLE nao READY — armazenando $ML como pendente no service");
             mComandoEnviado = false;
-            atualizarStatus("Falha ao enviar comando. Reconectando...");
+            mBluetoothService.enqueueServeCommand(volumeMl, checkout_id);
+            atualizarStatus("Aguardando conexao BLE...");
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     // Fluxo de venda
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     private void iniciarVendaEEnfileirar() {
         if (!isInternetAvailable()) {
-            Log.e(TAG, "[NET] Sem internet — venda bloqueada, comando BLE NAO enviado");
+            Log.e(TAG, "[NET] Sem internet â venda bloqueada, comando BLE NAO enviado");
             atualizarStatus("Sem internet. Verifique sua rede.");
             runOnUiThread(() ->
                 Toast.makeText(PagamentoConcluido.this,
@@ -279,20 +286,20 @@ public class PagamentoConcluido extends AppCompatActivity {
             return;
         }
         if (mComandoEnviado) {
-            Log.w(TAG, "[PAYMENT] iniciarVendaEEnfileirar() BLOQUEADO — mComandoEnviado=true");
+            Log.w(TAG, "[PAYMENT] iniciarVendaEEnfileirar() BLOQUEADO â mComandoEnviado=true");
             return;
         }
 
-        Log.i(TAG, "[PAYMENT] Iniciando venda v4.0 NUS — checkout_id=" + checkout_id
+        Log.i(TAG, "[PAYMENT] Iniciando venda v4.0 NUS â checkout_id=" + checkout_id
                 + " | qtd_ml=" + qtd_ml);
 
-        // Usa SessionManager se disponível
+        // Usa SessionManager se disponÃ­vel
         if (mSessionManager != null) {
             Log.i(TAG, "[SESSION] Iniciando sessao via SessionManager");
             mSessionManager.startSession(checkout_id, qtd_ml, android_id);
         } else {
             // Fallback: fluxo legado com start_sale.php
-            Log.w(TAG, "[PAYMENT] SessionManager nao disponivel — usando fluxo legado");
+            Log.w(TAG, "[PAYMENT] SessionManager nao disponivel â usando fluxo legado");
             chamarStartSale(checkout_id, qtd_ml, android_id, () -> enviarComandoML(qtd_ml));
         }
     }
@@ -303,9 +310,9 @@ public class PagamentoConcluido extends AppCompatActivity {
         return ni != null && ni.isConnected();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     // Service Connection
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     private final ServiceConnection mServiceConnection = new ServiceConnection() {
         @Override
@@ -333,9 +340,8 @@ public class PagamentoConcluido extends AppCompatActivity {
                 });
             }
 
-            if (mBluetoothService.isReady()) {
-                mMainHandler.postDelayed(() -> iniciarVendaEEnfileirar(), ML_SEND_DELAY_MS);
-            }
+            Log.i(TAG, "[PAYMENT] onServiceConnected | BLE estado=" + mBluetoothService.getState().name());
+            mMainHandler.postDelayed(() -> iniciarVendaEEnfileirar(), ML_SEND_DELAY_MS);
         }
         @Override
         public void onServiceDisconnected(ComponentName name) {
@@ -343,9 +349,9 @@ public class PagamentoConcluido extends AppCompatActivity {
         }
     };
 
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     // Lifecycle
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -371,7 +377,7 @@ public class PagamentoConcluido extends AppCompatActivity {
         txtQtd.setText(qtd_ml + " ML");
         carregarImagemComFallback();
 
-        // Botão "Continuar Servindo" — recuperação após timeout
+        // BotÃ£o "Continuar Servindo" â recuperaÃ§Ã£o apÃ³s timeout
         btnLiberar.setOnClickListener(v -> {
             btnLiberar.setVisibility(View.GONE);
             atualizarStatus("Retomando liberacao...");
@@ -419,9 +425,9 @@ public class PagamentoConcluido extends AppCompatActivity {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     // API calls
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     private void chamarStartSale(String checkoutId, int volumeMl, String deviceId, Runnable onSuccess) {
         Map<String, String> body = new HashMap<>();
@@ -446,9 +452,9 @@ public class PagamentoConcluido extends AppCompatActivity {
         });
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     // Imagem
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     private void carregarImagemComFallback() {
         Sqlite banco = new Sqlite(getApplicationContext());
@@ -472,9 +478,9 @@ public class PagamentoConcluido extends AppCompatActivity {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     // Watchdog
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     private void iniciarWatchdog() {
         cancelarWatchdog();
@@ -494,9 +500,9 @@ public class PagamentoConcluido extends AppCompatActivity {
         mWatchdogHandler.removeCallbacks(mWatchdogRunnable);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     // UI helpers
-    // ═══════════════════════════════════════════════════════════════════════════
+    // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     private void atualizarStatus(String msg) {
         runOnUiThread(() -> { if (txtStatus != null) txtStatus.setText(msg); });
