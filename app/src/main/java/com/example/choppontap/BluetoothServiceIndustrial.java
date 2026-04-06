@@ -92,7 +92,7 @@ import android.util.Log;
 
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
-import com.example.choppontap.ble.BleCommand;
+import com.example.choppontap.BleCommand;
 import com.example.choppontap.ble.CommandQueue;
 
 import java.nio.charset.StandardCharsets;
@@ -1258,10 +1258,11 @@ public class BluetoothServiceIndustrial extends Service {
         return mBluetoothGatt != null ? mBluetoothGatt.getDevice() : null;
     }
 
-    /** @deprecated Não utilizado no protocolo v6.0 NUS */
+     /** @deprecated Não utilizado no protocolo v6.0 NUS */
+    @Deprecated
     public CommandQueueManager getCommandQueue() { return null; }
-
     /** @deprecated Não utilizado no protocolo v6.0 NUS */
+    @Deprecated
     public CommandQueue getCommandQueueV2() { return null; }
 
     /**
@@ -1273,15 +1274,15 @@ public class BluetoothServiceIndustrial extends Service {
             Log.e(TAG, "[SERVE] BLE não está READY — comando descartado");
             return null;
         }
-        String command = "$ML:" + volumeMl;
+        BleCommand cmd = BleCommand.buildMl(volumeMl, sessionId);
+        String command = cmd.toBleString(); // "$ML:<volumeMl>"
         Log.i(TAG, "[BLE] Enviando " + command);
-        BleCommand cmd = new BleCommand(BleCommand.Type.ML, sessionId, volumeMl);
         boolean ok = write(command);
         if (!ok) {
-            Log.e(TAG, "[SERVE] Falha ao enfileirar: " + command);
+            Log.e(TAG, "[SERVE] Falha ao escrever: " + command);
             return null;
         }
-        cmd.state = BleCommand.State.SENT;
+        cmd.state = com.example.choppontap.BleCommand.State.SENT;
         return cmd;
     }
 
