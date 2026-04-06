@@ -158,6 +158,7 @@ public class BluetoothServiceIndustrial extends Service {
                 mNotifyCharacteristic = null;
                 mWriteBusy.set(false);
                 mReadyTimestamp = 0;
+                mBleReady = false;
                 break;
             case READY:
                 mReconnectAttempts = 0;
@@ -169,6 +170,7 @@ public class BluetoothServiceIndustrial extends Service {
                 break;
             case ERROR:
                 pararReconexao();
+                mBleReady = false;
                 Log.e(TAG, "[STATE] ERROR — verifique firmware ESP32");
                 break;
             default:
@@ -237,6 +239,9 @@ public class BluetoothServiceIndustrial extends Service {
     private Runnable                    mReconnectRunnable;
     private final AtomicBoolean         mWriteBusy = new AtomicBoolean(false);
     private final ConcurrentLinkedQueue<String> mCommandQueue = new ConcurrentLinkedQueue<>();
+    // Comando pendente: armazena $ML: se o BLE não estiver READY no momento do pagamento
+    private volatile String              mComandoPendente = null;
+    private volatile boolean             mBleReady        = false;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Binder
@@ -479,13 +484,13 @@ public class BluetoothServiceIndustrial extends Service {
             closeGatt();
         }
 
-        // Cria novo GATT com autoConnect=false (conexão manual, igual ao nRF Connect)
-        Log.i(TAG, "[GATT] connectGatt(autoConnect=false, TRANSPORT_LE) → " + mac);
+        // autoConnect=true: Android usa background scanning nativo — sem timeout, sem GATT_ERROR 133
+        Log.i(TAG, "[GATT] connectGatt(autoConnect=true, TRANSPORT_LE) → " + mac);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             mBluetoothGatt = device.connectGatt(
-                    this, false, mGattCallback, BluetoothDevice.TRANSPORT_LE);
+                    this, true, mGattCallback, BluetoothDevice.TRANSPORT_LE);
         } else {
-            mBluetoothGatt = device.connectGatt(this, false, mGattCallback);
+            mBluetoothGatt = device.connectGatt(this, true, mGattCallback);
         }
 
         if (mBluetoothGatt == null) {
@@ -625,6 +630,14 @@ public class BluetoothServiceIndustrial extends Service {
                     if (isBleStackPronto()) {
                         transitionTo(State.READY);
                         broadcastConnectionStatus("ready");
+                        mBleReady = true;
+                        Log.i(TAG, "[BLE] READY");
+                        // Verificar se há comando pendente do pagamento
+                        if (mComandoPendente != null) {
+                            Log.i(TAG, "[SERVE] Enviando comando pendente: " + mComandoPendente);
+                            writeImediato(mComandoPendente);
+                            mComandoPendente = null;
+                        }
                     } else {
                         Log.e(TAG, "[BLE] READY BLOQUEADO — handles BLE ausentes");
                     }
@@ -636,6 +649,14 @@ public class BluetoothServiceIndustrial extends Service {
                     if (isBleStackPronto()) {
                         transitionTo(State.READY);
                         broadcastConnectionStatus("ready");
+                        mBleReady = true;
+                        Log.i(TAG, "[BLE] READY");
+                        // Verificar se há comando pendente do pagamento
+                        if (mComandoPendente != null) {
+                            Log.i(TAG, "[SERVE] Enviando comando pendente: " + mComandoPendente);
+                            writeImediato(mComandoPendente);
+                            mComandoPendente = null;
+                        }
                     }
                 });
             }
@@ -703,32 +724,33 @@ public class BluetoothServiceIndustrial extends Service {
                 + " | mac=" + gatt.getDevice().getAddress()
                 + " | estado_anterior=" + mState.name());
         transitionTo(State.DISCONNECTED);
+        mBleReady = false;
         broadcastConnectionStatus("disconnected:" + status);
 
         if (!mAutoReconnect) {
             Log.i(TAG, "[GATT] autoReconnect=false — não reconectando");
             return;
         }
-
+        // Com autoConnect=true, basta fechar o GATT e reconectar — o Android gerencia o background scan
+        final String mac = mMacAlvo != null ? mMacAlvo : mTargetMac;
+        if (mac == null) {
+            Log.w(TAG, "[GATT] Sem MAC alvo — aguardando connectWithMac()");
+            return;
+        }
         if (status == STATUS_GATT_ERROR) {
-            // GATT error 133 — fecha e recria GATT
-            Log.w(TAG, "[GATT] GATT_ERROR (133) → fechando GATT e reconectando");
+            // GATT error 133: fecha GATT e reconecta após 1s com autoConnect=true
+            Log.w(TAG, "[GATT] GATT_ERROR (133) → closeGatt + reconectar em 1s (autoConnect=true)");
             closeGatt();
-            mMainHandler.postDelayed(() -> reconectarComBackoff(), 1_000L);
+            mMainHandler.postDelayed(() -> {
+                if (mAutoReconnect) conectarGatt(mac);
+            }, 1_000L);
         } else {
-            // Todos os outros status — reconecta com backoff via scan
-            final String mac = mMacAlvo != null ? mMacAlvo : mTargetMac;
-            if (mac != null) {
-                Log.i(TAG, "[GATT] status=" + status + " → reconectando em 3s via scan → " + mac);
-                mMainHandler.postDelayed(() -> {
-                    if (mAutoReconnect) {
-                        Log.i(TAG, "[RECONNECT] Reconectando após desconexão → " + mac);
-                        conectarComScan(mac);
-                    }
-                }, 3_000L);
-            } else {
-                reconectarComBackoff();
-            }
+            // Qualquer outro status: fecha GATT e reconecta com autoConnect=true
+            Log.i(TAG, "[GATT] status=" + status + " → closeGatt + reconectar em 1s (autoConnect=true) → " + mac);
+            closeGatt();
+            mMainHandler.postDelayed(() -> {
+                if (mAutoReconnect) conectarGatt(mac);
+            }, 1_000L);
         }
     }
 
@@ -746,6 +768,13 @@ public class BluetoothServiceIndustrial extends Service {
                 if (isBleStackPronto()) {
                     transitionTo(State.READY);
                     broadcastConnectionStatus("ready");
+                    mBleReady = true;
+                    Log.i(TAG, "[BLE] READY");
+                    if (mComandoPendente != null) {
+                        Log.i(TAG, "[SERVE] Enviando comando pendente: " + mComandoPendente);
+                        writeImediato(mComandoPendente);
+                        mComandoPendente = null;
+                    }
                 }
             });
             return;
@@ -759,6 +788,13 @@ public class BluetoothServiceIndustrial extends Service {
                 if (isBleStackPronto()) {
                     transitionTo(State.READY);
                     broadcastConnectionStatus("ready");
+                    mBleReady = true;
+                    Log.i(TAG, "[BLE] READY");
+                    if (mComandoPendente != null) {
+                        Log.i(TAG, "[SERVE] Enviando comando pendente: " + mComandoPendente);
+                        writeImediato(mComandoPendente);
+                        mComandoPendente = null;
+                    }
                 }
             });
         }
@@ -1270,19 +1306,25 @@ public class BluetoothServiceIndustrial extends Service {
      * Formato: $ML:<volume_ml>
      */
     public BleCommand enqueueServeCommand(int volumeMl, String sessionId) {
-        if (mState != State.READY || !isBleStackPronto()) {
-            Log.e(TAG, "[SERVE] BLE não está READY — comando descartado");
-            return null;
-        }
         BleCommand cmd = BleCommand.buildMl(volumeMl, sessionId);
         String command = cmd.toBleString(); // "$ML:<volumeMl>"
-        Log.i(TAG, "[BLE] Enviando " + command);
-        boolean ok = write(command);
-        if (!ok) {
-            Log.e(TAG, "[SERVE] Falha ao escrever: " + command);
-            return null;
+        if (mBleReady && isBleStackPronto()) {
+            // BLE pronto — envia imediatamente
+            Log.i(TAG, "[SERVE] Comando enviado imediatamente: " + command);
+            boolean ok = write(command);
+            if (!ok) {
+                Log.e(TAG, "[SERVE] Falha ao escrever: " + command + " — armazenando como pendente");
+                mComandoPendente = command;
+                cmd.state = com.example.choppontap.BleCommand.State.PENDING;
+                return cmd;
+            }
+            cmd.state = com.example.choppontap.BleCommand.State.SENT;
+        } else {
+            // BLE não pronto — armazena para enviar quando conectar
+            mComandoPendente = command;
+            cmd.state = com.example.choppontap.BleCommand.State.PENDING;
+            Log.w(TAG, "[SERVE] BLE não pronto — comando pendente: " + command);
         }
-        cmd.state = com.example.choppontap.BleCommand.State.SENT;
         return cmd;
     }
 
