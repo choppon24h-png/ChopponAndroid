@@ -188,8 +188,8 @@ public class Home extends AppCompatActivity {
      *   encontra o ESP32, conecta via GATT, mas ao desconectar por qualquer
      *   motivo, retryConnection() não é chamado porque mAutoReconnect = false.
      *
-     * CORREÇÃO: ao fazer bind, chamar enableAutoReconnect() para resetar a flag
-     *   antes de iniciar o scan.
+     * CORREÇÃO: ao fazer bind, chamar connectWithMac() diretamente com o MAC
+     *   salvo nas SharedPreferences, eliminando o scan de 4 segundos.
      */
     private final ServiceConnection mServiceConnection = new ServiceConnection() {
         @Override
@@ -199,16 +199,19 @@ public class Home extends AppCompatActivity {
             Log.i(TAG, "BluetoothService vinculado. Estado atual: "
                     + (mBluetoothService.connected() ? "CONECTADO" : "DESCONECTADO"));
 
-            // CORREÇÃO CRÍTICA: reabilita o auto-reconnect que foi desativado pelo
-            // disconnect() do ServiceTools ao desativar a TAP. Sem isso, o BLE
-            // conecta uma vez mas nunca reconecta após quedas.
-            mBluetoothService.enableAutoReconnect();
-
             if (!mBluetoothService.connected()) {
-                Log.i(TAG, "Iniciando scan BLE para conectar ao ESP32...");
-                mBluetoothService.scanLeDevice(true);
+                // Conexão direta via MAC — sem scan de 4 segundos
+                String mac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
+                        .getString("esp32_mac", "");
+                if (!mac.isEmpty()) {
+                    Log.i(TAG, "[BLE] Conectando diretamente ao MAC: " + mac);
+                    mBluetoothService.connectWithMac(mac);
+                } else {
+                    Log.e(TAG, "[BLE] MAC não encontrado nas preferências — verifique a API");
+                }
             } else {
                 // Já conectado — atualiza a UI imediatamente
+                Log.i(TAG, "[BLE] Já conectado — sincronizando UI");
                 updateBluetoothStatus("connected");
                 changeButtons(true);
             }
@@ -281,10 +284,15 @@ public class Home extends AppCompatActivity {
                 updateBluetoothStatus("connected");
                 changeButtons(true);
             } else {
-                // Desconectado — reinicia o scan
-                Log.i(TAG, "onResume: BLE desconectado, reiniciando scan...");
-                mBluetoothService.enableAutoReconnect();
-                mBluetoothService.scanLeDevice(true);
+                // Desconectado — reconecta diretamente via MAC
+                String mac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
+                        .getString("esp32_mac", "");
+                if (!mac.isEmpty()) {
+                    Log.i(TAG, "onResume: BLE desconectado — reconectando ao MAC: " + mac);
+                    mBluetoothService.connectWithMac(mac);
+                } else {
+                    Log.e(TAG, "onResume: MAC não encontrado nas preferências");
+                }
             }
         }
     }
