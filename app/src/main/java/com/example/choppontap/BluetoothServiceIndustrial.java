@@ -15,6 +15,11 @@ import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
+import android.bluetooth.le.BluetoothLeScanner;
+import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanFilter;
+import android.bluetooth.le.ScanResult;
+import android.bluetooth.le.ScanSettings;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Binder;
@@ -28,25 +33,29 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Serviço BLE NUS Simplificado — Conexão Direta com ESP32
+ * BluetoothServiceIndustrial — Conexão Direta NUS com ESP32
  *
- * Focado exclusivamente na função "Abrir Válvula → Monitorar Volume → Fechar Válvula".
+ * ESTRATÉGIA DEFINITIVA PARA status=133:
  *
- * MECANISMO DE RECONEXÃO (status=133 / GATT_ERROR):
- * O Android retorna status=133 quando o ESP32 não responde ao pacote de conexão BLE
- * dentro do timeout de ~30 segundos. Isso ocorre porque:
- *   1. O ESP32 ainda não está em modo advertising após boot/reset
- *   2. O cache GATT do Android está corrompido com dados de sessão anterior
- *   3. O stack BLE do Android ficou em estado inconsistente
+ * O status=133 (GATT_ERROR) ocorre porque o Android tenta conectar via
+ * connectGatt() mas o ESP32 não está visível no ar naquele momento.
+ * O Android espera ~30s e devolve 133.
  *
- * A solução implementada usa três camadas:
- *   - Camada 1: Backoff progressivo (1s → 2s → 4s → 8s → 16s → 30s)
- *   - Camada 2: Refresh do cache GATT via reflexão após 3 falhas consecutivas
- *   - Camada 3: Delay de 600ms antes de cada connectGatt() para dar tempo ao stack BLE
+ * SOLUÇÃO: Scan-Before-Connect
+ *   1. Antes de chamar connectGatt(), faz um scan BLE curto (máx 8s)
+ *      filtrando pelo MAC do ESP32.
+ *   2. Só chama connectGatt() DEPOIS de confirmar que o ESP32 está
+ *      em advertising (visível no ar).
+ *   3. Se o scan não encontrar o ESP32 em 8s, aguarda e tenta novamente
+ *      com backoff progressivo.
+ *
+ * Isso elimina o status=133 porque o connectGatt() só é chamado quando
+ * o dispositivo já está confirmadamente visível.
  */
 @SuppressLint("MissingPermission")
 public class BluetoothServiceIndustrial extends Service {
@@ -59,7 +68,7 @@ public class BluetoothServiceIndustrial extends Service {
     public static boolean isRunning() { return sInstance != null; }
 
     // ─── Estados ─────────────────────────────────────────────────────────────
-    public enum State { DISCONNECTED, CONNECTING, CONNECTED, READY, ERROR }
+    public enum State { DISCONNECTED, SCANNING, CONNECTING, CONNECTED, READY, ERROR }
     private volatile State mState = State.DISCONNECTED;
 
     // ─── UUIDs NUS (Nordic UART Service) ─────────────────────────────────────
@@ -83,39 +92,29 @@ public class BluetoothServiceIndustrial extends Service {
     private static final String NOTIF_CHANNEL_ID = "ble_industrial_channel";
     private static final int    NOTIF_ID         = 1001;
 
-    // ─── Reconexão com Backoff Progressivo ───────────────────────────────────
-    /**
-     * Delays de reconexão em milissegundos.
-     * Após cada falha com status=133, o próximo delay aumenta progressivamente.
-     * Após esgotar todos os delays, mantém o último valor (30s) indefinidamente.
-     */
-    private static final long[] RECONNECT_DELAYS_MS = { 1_000, 2_000, 4_000, 8_000, 16_000, 30_000 };
+    // ─── Parâmetros de Scan e Reconexão ──────────────────────────────────────
+    /** Tempo máximo de scan para encontrar o ESP32 antes de desistir e reagendar */
+    private static final long SCAN_TIMEOUT_MS = 8_000L;
 
-    /**
-     * Número de falhas consecutivas com status=133.
-     * Resetado para 0 quando a conexão é bem-sucedida.
-     */
+    /** Delay antes de cada connectGatt() após o scan encontrar o dispositivo */
+    private static final long PRE_CONNECT_DELAY_MS = 500L;
+
+    /** Delays de reconexão com backoff progressivo (em ms) */
+    private static final long[] RECONNECT_DELAYS_MS = { 2_000, 4_000, 8_000, 15_000, 30_000 };
+
+    // ─── Variáveis de Controle ────────────────────────────────────────────────
     private final AtomicInteger mFailCount = new AtomicInteger(0);
-
-    /**
-     * Indica se a reconexão automática está ativa.
-     * Setado como false apenas quando disconnect() é chamado explicitamente.
-     */
     private volatile boolean mAutoReconnect = true;
-
-    /**
-     * Delay antes de cada connectGatt() para dar tempo ao stack BLE do Android
-     * de liberar recursos da tentativa anterior. Sem esse delay, o status=133
-     * ocorre imediatamente na tentativa seguinte.
-     */
-    private static final long PRE_CONNECT_DELAY_MS = 600L;
+    private volatile boolean mScanning = false;
 
     // ─── Variáveis de Instância ───────────────────────────────────────────────
     private BluetoothAdapter mBluetoothAdapter;
+    private BluetoothLeScanner mBleScanner;
     private BluetoothGatt mBluetoothGatt;
     private BluetoothGattCharacteristic mWriteCharacteristic;
     private Handler mMainHandler;
     private String mTargetMac;
+    private String mPendingCommand = null;
 
     // ─── Binder ───────────────────────────────────────────────────────────────
     public class LocalBinder extends Binder {
@@ -137,12 +136,15 @@ public class BluetoothServiceIndustrial extends Service {
         super.onCreate();
         sInstance = this;
         mMainHandler = new Handler(Looper.getMainLooper());
-        Log.i(TAG, "[SERVICE] BluetoothServiceIndustrial iniciado (com reconexão robusta)");
+        Log.i(TAG, "[SERVICE] BluetoothServiceIndustrial iniciado (estratégia: scan-before-connect)");
         criarNotificacaoForeground();
 
         BluetoothManager bm = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
         if (bm != null) {
             mBluetoothAdapter = bm.getAdapter();
+            if (mBluetoothAdapter != null) {
+                mBleScanner = mBluetoothAdapter.getBluetoothLeScanner();
+            }
         }
     }
 
@@ -157,6 +159,7 @@ public class BluetoothServiceIndustrial extends Service {
         mAutoReconnect = false;
         sInstance = null;
         mMainHandler.removeCallbacksAndMessages(null);
+        pararScan();
         closeGatt();
         transitionTo(State.DISCONNECTED);
         super.onDestroy();
@@ -167,8 +170,8 @@ public class BluetoothServiceIndustrial extends Service {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Conecta diretamente ao MAC fornecido, sem scan.
-     * Habilita a reconexão automática com backoff progressivo.
+     * Inicia o processo de conexão com o MAC fornecido.
+     * Usa a estratégia scan-before-connect para evitar status=133.
      */
     public void connectWithMac(String mac) {
         if (mac == null || mac.isEmpty() || mBluetoothAdapter == null) {
@@ -176,11 +179,17 @@ public class BluetoothServiceIndustrial extends Service {
             return;
         }
 
-        mTargetMac = mac;
+        // Evita reconexão desnecessária se já está conectado ao mesmo MAC
+        if ((mState == State.READY || mState == State.CONNECTED) && mac.equalsIgnoreCase(mTargetMac)) {
+            Log.i(TAG, "[CONNECT] Já conectado ao MAC " + mac + " — ignorando chamada duplicada");
+            return;
+        }
+
+        mTargetMac = mac.toUpperCase();
         mAutoReconnect = true;
         mFailCount.set(0);
-        Log.i(TAG, "[CONNECT] Conectando diretamente ao MAC: " + mac);
-        iniciarConexao();
+        Log.i(TAG, "[CONNECT] Iniciando conexão ao MAC: " + mTargetMac);
+        iniciarCicloConexao();
     }
 
     /**
@@ -190,7 +199,7 @@ public class BluetoothServiceIndustrial extends Service {
     public void enviarVolume(int ml) {
         String comando = "$ML:" + ml;
         if (!write(comando)) {
-            Log.e(TAG, "[TX] Falha ao enviar volume — BLE não está READY. Comando: " + comando);
+            Log.e(TAG, "[TX] Falha ao enviar volume — estado=" + mState + " | cmd=" + comando);
         }
     }
 
@@ -200,7 +209,7 @@ public class BluetoothServiceIndustrial extends Service {
      */
     public boolean write(String command) {
         if (mState != State.READY || mWriteCharacteristic == null || mBluetoothGatt == null) {
-            Log.w(TAG, "[TX] write() ignorado — estado=" + mState + " | comando=" + command);
+            Log.w(TAG, "[TX] write() ignorado — estado=" + mState + " | cmd=" + command);
             return false;
         }
 
@@ -208,7 +217,7 @@ public class BluetoothServiceIndustrial extends Service {
         byte[] value = command.getBytes(StandardCharsets.UTF_8);
         mWriteCharacteristic.setValue(value);
 
-        // Tenta WRITE_TYPE_NO_RESPONSE primeiro (mais rápido, sem ACK)
+        // Tenta WRITE_TYPE_NO_RESPONSE primeiro (sem ACK, mais rápido)
         mWriteCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
         boolean ok = mBluetoothGatt.writeCharacteristic(mWriteCharacteristic);
 
@@ -223,42 +232,31 @@ public class BluetoothServiceIndustrial extends Service {
         return ok;
     }
 
-    /**
-     * Envia comando de parada imediata (cancela a tiragem em andamento).
-     */
-    public void pararChopp() {
-        write("$ML:0");
-    }
+    /** Envia comando de parada imediata */
+    public void pararChopp() { write("$ML:0"); }
 
-    /**
-     * Compatibilidade com PagamentoConcluido.java.
-     * Enfileira o comando $ML:volume. Se não estiver READY, armazena como pendente.
-     */
+    /** Compatibilidade com PagamentoConcluido.java */
     public void enqueueServeCommand(int volumeMl, String checkoutId) {
         Log.i(TAG, "[SERVE] enqueueServeCommand | vol=" + volumeMl + " | estado=" + mState);
         if (isReady()) {
             write("$ML:" + volumeMl);
         } else {
-            Log.w(TAG, "[SERVE] BLE não pronto — comando pendente: $ML:" + volumeMl);
             mPendingCommand = "$ML:" + volumeMl;
+            Log.w(TAG, "[SERVE] BLE não pronto — comando pendente: " + mPendingCommand);
         }
     }
-
-    // Comando pendente para envio quando BLE atingir READY
-    private String mPendingCommand = null;
 
     // Getters de estado
     public State getState()    { return mState; }
     public boolean isReady()   { return mState == State.READY; }
     public boolean connected() { return mState == State.CONNECTED || mState == State.READY; }
 
-    /**
-     * Desconecta e desabilita a reconexão automática.
-     */
+    /** Desconecta e desabilita a reconexão automática */
     public void disconnect() {
         Log.i(TAG, "[CONNECT] disconnect() chamado — reconexão desabilitada");
         mAutoReconnect = false;
         mMainHandler.removeCallbacksAndMessages(null);
+        pararScan();
         closeGatt();
         transitionTo(State.DISCONNECTED);
     }
@@ -272,7 +270,7 @@ public class BluetoothServiceIndustrial extends Service {
 
     public void salvarMacExterno(String mac) {
         if (mac != null && !mac.isEmpty()) {
-            mTargetMac = mac;
+            mTargetMac = mac.toUpperCase();
             getSharedPreferences("tap_config", Context.MODE_PRIVATE)
                     .edit().putString("esp32_mac", mac).apply();
             Log.i(TAG, "[CONNECT] MAC externo salvo: " + mac);
@@ -280,57 +278,153 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Lógica de Conexão e Reconexão
+    // Estratégia Scan-Before-Connect
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Inicia a conexão com um delay de PRE_CONNECT_DELAY_MS para garantir que
-     * o stack BLE do Android liberou recursos da tentativa anterior.
+     * Inicia o ciclo completo: scan → connect → discover → ready.
+     * Chamado na primeira conexão e em cada reconexão.
      */
-    private void iniciarConexao() {
-        if (!mAutoReconnect || mTargetMac == null || mBluetoothAdapter == null) return;
+    private void iniciarCicloConexao() {
+        if (!mAutoReconnect || mTargetMac == null) return;
 
-        transitionTo(State.CONNECTING);
-        broadcastConnectionStatus("connecting");
+        pararScan();
+        closeGatt();
+        transitionTo(State.SCANNING);
+        broadcastConnectionStatus("scanning");
 
-        mMainHandler.postDelayed(() -> {
-            if (!mAutoReconnect) return;
-
-            try {
-                BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mTargetMac);
-                Log.i(TAG, "[CONNECT] connectGatt() | MAC=" + mTargetMac
-                        + " | tentativa=" + (mFailCount.get() + 1)
-                        + " | autoConnect=false | TRANSPORT_LE");
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    mBluetoothGatt = device.connectGatt(
-                            BluetoothServiceIndustrial.this,
-                            false,
-                            mGattCallback,
-                            BluetoothDevice.TRANSPORT_LE);
-                } else {
-                    mBluetoothGatt = device.connectGatt(
-                            BluetoothServiceIndustrial.this,
-                            false,
-                            mGattCallback);
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "[CONNECT] Exceção em connectGatt(): " + e.getMessage());
-                agendarReconexao();
-            }
-        }, PRE_CONNECT_DELAY_MS);
+        Log.i(TAG, "[SCAN] Iniciando scan para confirmar presença do ESP32: " + mTargetMac);
+        iniciarScanParaMac(mTargetMac);
     }
 
     /**
-     * Agenda a próxima tentativa de reconexão com backoff progressivo.
-     *
-     * Tabela de delays:
-     *   Falha 1 →  1s
-     *   Falha 2 →  2s
-     *   Falha 3 →  4s  (+ refresh do cache GATT)
-     *   Falha 4 →  8s
-     *   Falha 5 → 16s
-     *   Falha 6+ → 30s
+     * Faz um scan BLE curto filtrando pelo MAC do ESP32.
+     * Quando o dispositivo é encontrado, cancela o scan e chama connectGatt().
+     * Se o timeout de 8s expirar sem encontrar, agenda nova tentativa com backoff.
+     */
+    private void iniciarScanParaMac(String mac) {
+        if (mBleScanner == null) {
+            Log.e(TAG, "[SCAN] BluetoothLeScanner nulo — tentando connectGatt direto");
+            // Fallback: tenta conectar direto sem scan
+            mMainHandler.postDelayed(() -> executarConnectGatt(), PRE_CONNECT_DELAY_MS);
+            return;
+        }
+
+        mScanning = true;
+
+        // Filtro por MAC para scan mais eficiente (não escaneia todos os dispositivos)
+        ScanFilter filtro = new ScanFilter.Builder()
+                .setDeviceAddress(mac)
+                .build();
+
+        ScanSettings settings = new ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY) // Máxima velocidade de detecção
+                .build();
+
+        try {
+            mBleScanner.startScan(Collections.singletonList(filtro), settings, mScanCallback);
+            Log.i(TAG, "[SCAN] Scan iniciado com filtro MAC=" + mac + " | timeout=" + SCAN_TIMEOUT_MS + "ms");
+        } catch (Exception e) {
+            Log.e(TAG, "[SCAN] Erro ao iniciar scan: " + e.getMessage());
+            mScanning = false;
+            // Fallback: tenta conectar direto
+            mMainHandler.postDelayed(() -> executarConnectGatt(), PRE_CONNECT_DELAY_MS);
+            return;
+        }
+
+        // Timeout do scan: se não encontrar em SCAN_TIMEOUT_MS, agenda reconexão
+        mMainHandler.postDelayed(() -> {
+            if (mScanning) {
+                Log.w(TAG, "[SCAN] Timeout! ESP32 não encontrado em " + SCAN_TIMEOUT_MS + "ms — ESP32 pode não estar em advertising");
+                pararScan();
+                transitionTo(State.DISCONNECTED);
+                broadcastConnectionStatus("disconnected:scan_timeout");
+                agendarReconexao();
+            }
+        }, SCAN_TIMEOUT_MS);
+    }
+
+    /** Callback do scan BLE */
+    private final ScanCallback mScanCallback = new ScanCallback() {
+        @Override
+        public void onScanResult(int callbackType, ScanResult result) {
+            BluetoothDevice device = result.getDevice();
+            String mac = device.getAddress();
+            int rssi = result.getRssi();
+
+            Log.i(TAG, "[SCAN] ESP32 encontrado! MAC=" + mac + " | RSSI=" + rssi + "dBm");
+
+            // Para o scan imediatamente — dispositivo confirmado no ar
+            pararScan();
+
+            // Aguarda PRE_CONNECT_DELAY_MS para garantir que o stack BLE
+            // processou o resultado do scan antes de chamar connectGatt()
+            mMainHandler.postDelayed(() -> executarConnectGatt(), PRE_CONNECT_DELAY_MS);
+        }
+
+        @Override
+        public void onScanFailed(int errorCode) {
+            Log.e(TAG, "[SCAN] Falha no scan: errorCode=" + errorCode);
+            mScanning = false;
+            mMainHandler.removeCallbacksAndMessages(null);
+
+            // Tenta conectar direto como fallback
+            mMainHandler.postDelayed(() -> executarConnectGatt(), PRE_CONNECT_DELAY_MS);
+        }
+    };
+
+    /** Para o scan BLE se estiver ativo */
+    private void pararScan() {
+        if (mScanning && mBleScanner != null) {
+            try {
+                mBleScanner.stopScan(mScanCallback);
+                Log.d(TAG, "[SCAN] Scan parado");
+            } catch (Exception e) {
+                Log.w(TAG, "[SCAN] Erro ao parar scan: " + e.getMessage());
+            }
+            mScanning = false;
+        }
+    }
+
+    /**
+     * Executa o connectGatt() após o scan confirmar que o ESP32 está visível.
+     * Com o dispositivo confirmado em advertising, o status=133 não deve ocorrer.
+     */
+    private void executarConnectGatt() {
+        if (!mAutoReconnect || mTargetMac == null || mBluetoothAdapter == null) return;
+
+        try {
+            BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(mTargetMac);
+            int tentativa = mFailCount.get() + 1;
+            Log.i(TAG, "[CONNECT] connectGatt() | MAC=" + mTargetMac
+                    + " | tentativa=" + tentativa
+                    + " | autoConnect=false | TRANSPORT_LE");
+
+            transitionTo(State.CONNECTING);
+            broadcastConnectionStatus("connecting");
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                mBluetoothGatt = device.connectGatt(
+                        BluetoothServiceIndustrial.this,
+                        false,
+                        mGattCallback,
+                        BluetoothDevice.TRANSPORT_LE);
+            } else {
+                mBluetoothGatt = device.connectGatt(
+                        BluetoothServiceIndustrial.this,
+                        false,
+                        mGattCallback);
+            }
+
+        } catch (Exception e) {
+            Log.e(TAG, "[CONNECT] Exceção em connectGatt(): " + e.getMessage());
+            transitionTo(State.DISCONNECTED);
+            agendarReconexao();
+        }
+    }
+
+    /**
+     * Agenda nova tentativa de conexão com backoff progressivo.
      */
     private void agendarReconexao() {
         if (!mAutoReconnect || mTargetMac == null) return;
@@ -339,27 +433,20 @@ public class BluetoothServiceIndustrial extends Service {
         int idx = Math.min(falhas - 1, RECONNECT_DELAYS_MS.length - 1);
         long delay = RECONNECT_DELAYS_MS[idx];
 
-        Log.w(TAG, "[RECONNECT] Falha #" + falhas + " — próxima tentativa em " + delay + "ms");
+        Log.w(TAG, "[RECONNECT] Falha #" + falhas + " — próxima tentativa (com scan) em " + delay + "ms");
 
-        // A partir da 3ª falha consecutiva, tenta limpar o cache GATT
-        // O cache corrompido é uma das causas mais comuns do status=133
+        // Na 3ª falha, tenta limpar o cache GATT
         if (falhas == 3) {
-            Log.w(TAG, "[RECONNECT] 3 falhas consecutivas — tentando refresh do cache GATT");
+            Log.w(TAG, "[RECONNECT] 3 falhas — tentando refresh do cache GATT");
             refreshGattCache();
         }
 
-        mMainHandler.postDelayed(this::iniciarConexao, delay);
+        mMainHandler.postDelayed(this::iniciarCicloConexao, delay);
     }
 
     /**
-     * Limpa o cache GATT do Android via reflexão.
-     *
-     * O Android mantém um cache dos serviços GATT descobertos anteriormente.
-     * Se o ESP32 reiniciou ou mudou seus serviços, o cache fica desatualizado
-     * e causa falhas de conexão (status=133 ou serviços não encontrados).
-     *
-     * BluetoothGatt.refresh() é um método oculto (@hide) não exposto na API pública,
-     * por isso é acessado via reflexão. Funciona em Android 4.3+ (API 18+).
+     * Limpa o cache GATT via reflexão (BluetoothGatt.refresh() é @hide).
+     * Resolve casos onde o Android tem cache desatualizado do ESP32.
      */
     private void refreshGattCache() {
         if (mBluetoothGatt == null) return;
@@ -385,69 +472,56 @@ public class BluetoothServiceIndustrial extends Service {
                     + " | mac=" + (mTargetMac != null ? mTargetMac : "?"));
 
             if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
-                // ✅ Conexão estabelecida com sucesso
-                Log.i(TAG, "[BLE] CONECTADO com sucesso! Resetando contador de falhas.");
+                // ✅ Conexão física estabelecida
+                Log.i(TAG, "[BLE] CONECTADO! Resetando contador de falhas. Solicitando MTU...");
                 mFailCount.set(0);
                 transitionTo(State.CONNECTED);
                 broadcastConnectionStatus("connected");
-
                 // Solicita MTU maior para evitar fragmentação de pacotes NUS
                 gatt.requestMtu(247);
 
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                // ❌ Desconectado — analisa o status para decidir a ação
 
-                if (status == 0) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
                     // Desconexão limpa (solicitada pelo app ou pelo ESP32)
                     Log.i(TAG, "[BLE] Desconexão limpa (status=0).");
                     closeGatt();
                     transitionTo(State.DISCONNECTED);
                     broadcastConnectionStatus("disconnected");
-
-                    // Reconecta automaticamente se não foi um disconnect() explícito
-                    if (mAutoReconnect && mTargetMac != null) {
-                        Log.i(TAG, "[RECONNECT] Desconexão limpa — reagendando conexão em 2s");
-                        mMainHandler.postDelayed(() -> iniciarConexao(), 2_000);
+                    if (mAutoReconnect) {
+                        Log.i(TAG, "[RECONNECT] Desconexão limpa — reagendando ciclo em 2s");
+                        mMainHandler.postDelayed(() -> iniciarCicloConexao(), 2_000);
                     }
 
                 } else if (status == 133) {
-                    // GATT_ERROR (133) — timeout de conexão ou stack BLE inconsistente
-                    // Este é o erro mais comum ao conectar com ESP32
-                    Log.w(TAG, "[BLE] GATT_ERROR (133) — ESP32 não respondeu ao pacote de conexão.");
-                    Log.w(TAG, "[BLE] Causas prováveis: ESP32 não está em advertising, "
-                            + "já tem conexão ativa, ou cache GATT corrompido.");
+                    // GATT_ERROR — não deveria ocorrer com scan-before-connect,
+                    // mas tratamos como fallback de segurança
+                    Log.w(TAG, "[BLE] GATT_ERROR (133) — ocorreu mesmo após scan. "
+                            + "Possível race condition. Reagendando com scan.");
                     closeGatt();
                     transitionTo(State.DISCONNECTED);
                     broadcastConnectionStatus("disconnected:133");
-
-                    // Agenda reconexão com backoff progressivo
                     agendarReconexao();
 
                 } else if (status == 8) {
-                    // GATT_CONN_TIMEOUT — timeout de supervisão (conexão caiu por distância)
-                    Log.w(TAG, "[BLE] GATT_CONN_TIMEOUT (8) — conexão perdida por timeout de supervisão.");
+                    // GATT_CONN_TIMEOUT — conexão caiu por distância/interferência
+                    Log.w(TAG, "[BLE] GATT_CONN_TIMEOUT (8) — conexão perdida. Reconectando...");
                     closeGatt();
                     transitionTo(State.DISCONNECTED);
                     broadcastConnectionStatus("disconnected");
-
                     if (mAutoReconnect) {
-                        Log.i(TAG, "[RECONNECT] Timeout de supervisão — reconectando em 3s");
                         mMainHandler.postDelayed(() -> {
-                            mFailCount.set(0); // Timeout não é falha de cache, reseta contador
-                            iniciarConexao();
+                            mFailCount.set(0);
+                            iniciarCicloConexao();
                         }, 3_000);
                     }
 
                 } else {
-                    // Outros erros GATT
-                    Log.w(TAG, "[BLE] Erro GATT desconhecido: status=" + status);
+                    Log.w(TAG, "[BLE] Erro GATT: status=" + status + ". Reagendando...");
                     closeGatt();
                     transitionTo(State.ERROR);
                     broadcastConnectionStatus("error:" + status);
-
-                    if (mAutoReconnect) {
-                        agendarReconexao();
-                    }
+                    if (mAutoReconnect) agendarReconexao();
                 }
             }
         }
@@ -469,8 +543,7 @@ public class BluetoothServiceIndustrial extends Service {
             BluetoothGattService nusService = gatt.getService(NUS_SERVICE_UUID);
             if (nusService == null) {
                 Log.e(TAG, "[BLE] Serviço NUS (6E400001) não encontrado! "
-                        + "Verifique se o ESP32 está com o firmware NUS correto.");
-                // Tenta refresh do cache e reconecta — pode ser cache desatualizado
+                        + "Verifique o firmware do ESP32.");
                 refreshGattCache();
                 agendarReconexao();
                 return;
@@ -485,19 +558,19 @@ public class BluetoothServiceIndustrial extends Service {
                 return;
             }
 
-            Log.i(TAG, "[BLE] Serviço NUS encontrado. Habilitando notificações no TX...");
+            Log.i(TAG, "[BLE] Serviço NUS OK. RX e TX encontrados. Habilitando notificações...");
             habilitarNotificacoes(gatt, notifyChar);
         }
 
         @Override
         public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.i(TAG, "[BLE] Notificações habilitadas! Estado: READY");
+                Log.i(TAG, "[BLE] Notificações habilitadas! ✅ Estado: READY");
                 mMainHandler.post(() -> {
                     transitionTo(State.READY);
                     broadcastConnectionStatus("ready");
 
-                    // Envia comando pendente se houver (ex: $ML:300 que chegou antes do READY)
+                    // Envia comando pendente se houver
                     if (mPendingCommand != null) {
                         Log.i(TAG, "[BLE] Enviando comando pendente: " + mPendingCommand);
                         write(mPendingCommand);
@@ -505,7 +578,7 @@ public class BluetoothServiceIndustrial extends Service {
                     }
                 });
             } else {
-                Log.e(TAG, "[BLE] Falha ao escrever descritor CCCD: status=" + status);
+                Log.e(TAG, "[BLE] Falha ao escrever CCCD: status=" + status);
             }
         }
 
@@ -515,8 +588,6 @@ public class BluetoothServiceIndustrial extends Service {
             if (raw != null && raw.length > 0) {
                 String data = new String(raw, StandardCharsets.UTF_8).trim();
                 Log.i(TAG, "[RX] Recebido do ESP32: " + data);
-
-                // Repassa para a Activity via broadcast
                 // Formato esperado: "VP:150" (volume parcial) ou "ML:300" (finalizado)
                 broadcastData(data);
             }
@@ -532,7 +603,6 @@ public class BluetoothServiceIndustrial extends Service {
         Log.i(TAG, "=== STATE: " + mState.name() + " → " + newState.name() + " ===");
         mState = newState;
         broadcastBleState(newState);
-
         if (newState == State.DISCONNECTED || newState == State.ERROR) {
             mWriteCharacteristic = null;
         }
