@@ -47,14 +47,27 @@ public final class BleConfigUtils {
         return clean.isEmpty() ? null : clean;
     }
 
+    /**
+     * Deriva o nome BLE esperado a partir do wifiMac retornado pela API.
+     *
+     * Regra do firmware (ESP32):
+     *   bleName = "CHOPP_" + 4 primeiros caracteres HEX do ESP.getEfuseMac()
+     *   Exemplo: wifiMac = "DC:B4:D9:99:B8:E2" → hex = "DCB4D999B8E2" → "CHOPP_DCB4"
+     *
+     * ATENÇÃO: usa os 4 primeiros hex do MAC (bytes 0 e 1 = DC e B4),
+     * NÃO os últimos. O ESP32 usa getEfuseMac() que retorna o MAC base
+     * na mesma ordem que o wifiMac da API.
+     */
     public static String deriveBleNameFromWifiMac(String wifiMac) {
         String mac = normalizeMac(wifiMac);
         if (mac == null) return null;
 
+        // Remove os ':' e pega os 4 primeiros caracteres HEX (2 bytes)
         String hex = mac.replace(":", "");
         if (hex.length() < 4) return null;
 
-        return "CHOPP_" + hex.substring(0, 4);
+        // Exemplo: "DCB4D999B8E2" → "CHOPP_DCB4"
+        return "CHOPP_" + hex.substring(0, 4).toUpperCase(Locale.US);
     }
 
     public static boolean isValidUuid(String raw) {

@@ -123,6 +123,10 @@ public class BluetoothServiceIndustrial extends Service {
         sInstance = this;
         mMainHandler = new Handler(Looper.getMainLooper());
 
+        Log.i(TAG, "[SERVICE] BluetoothServiceIndustrial iniciado");
+        Log.i(TAG, "[SERVICE] Protocolo: Nordic UART Service (NUS)");
+        Log.i(TAG, "[SERVICE] PIN de pareamento: " + BleConfigUtils.DEFAULT_PAIRING_PIN);
+
         criarNotificacaoForeground();
 
         BluetoothManager bm = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
@@ -161,6 +165,7 @@ public class BluetoothServiceIndustrial extends Service {
             return;
         }
 
+        Log.i(TAG, "[CONNECT] connectWithMac(" + mac + ")");
         carregarConfigBle();
 
         String normalized = BleConfigUtils.normalizeMac(mac);
@@ -185,6 +190,7 @@ public class BluetoothServiceIndustrial extends Service {
 
         if ((mState == State.CONNECTED || mState == State.READY)
                 && sameAsCurrentTarget(mTargetBleMac, mConnectedDevice)) {
+            Log.i(TAG, "[CONNECT] Já conectado ao MAC " + mTargetBleMac + " — ignorando");
             return;
         }
 
@@ -252,6 +258,10 @@ public class BluetoothServiceIndustrial extends Service {
         pararScan();
         closeGatt();
 
+        Log.i(TAG, "[SCAN] Iniciando ciclo de conexão");
+        Log.i(TAG, "[SCAN] MAC alvo: " + (mTargetBleMac != null ? mTargetBleMac : "(nenhum)"));
+        Log.i(TAG, "[SCAN] Nome esperado: " + (mExpectedBleName != null ? mExpectedBleName : "(nenhum)"));
+
         transitionTo(State.SCANNING);
         broadcastConnectionStatus("scanning");
         iniciarScanIdentidade();
@@ -303,6 +313,10 @@ public class BluetoothServiceIndustrial extends Service {
             String name = readDeviceName(result);
             if (!isDispositivoEsperado(device, name)) return;
 
+            Log.i(TAG, "[SCAN] ✅ ESP32 encontrado! MAC=" + device.getAddress()
+                    + " | Nome=" + (name != null ? name : "(sem nome)")
+                    + " | RSSI=" + result.getRssi() + "dBm");
+
             mPendingConnectDevice = device;
             broadcastDeviceFound(device);
             pararScan();
@@ -311,6 +325,7 @@ public class BluetoothServiceIndustrial extends Service {
 
         @Override
         public void onScanFailed(int errorCode) {
+            Log.e(TAG, "[SCAN] Falha no scan: errorCode=" + errorCode);
             mScanning = false;
             mMainHandler.postDelayed(() -> executarConnectGatt(mPendingConnectDevice), PRE_CONNECT_DELAY_MS);
         }
@@ -338,6 +353,9 @@ public class BluetoothServiceIndustrial extends Service {
         broadcastConnectionStatus("connecting");
 
         try {
+            Log.i(TAG, "[CONNECT] connectGatt() | MAC=" + device.getAddress()
+                    + " | tentativa=" + (mFailCount.get() + 1)
+                    + " | autoConnect=false | TRANSPORT_LE");
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 mBluetoothGatt = device.connectGatt(this, false, mGattCallback, BluetoothDevice.TRANSPORT_LE);
             } else {
@@ -345,6 +363,7 @@ public class BluetoothServiceIndustrial extends Service {
             }
             mPendingConnectDevice = device;
         } catch (Exception e) {
+            Log.e(TAG, "[CONNECT] Exceção em connectGatt(): " + e.getMessage());
             transitionTo(State.DISCONNECTED);
             agendarReconexao();
         }
@@ -357,7 +376,12 @@ public class BluetoothServiceIndustrial extends Service {
         int idx = Math.min(falhas - 1, RECONNECT_DELAYS_MS.length - 1);
         long delay = RECONNECT_DELAYS_MS[idx];
 
-        if (falhas == 3) refreshGattCache();
+        Log.w(TAG, "[RECONNECT] Falha #" + falhas + " — próxima tentativa (com scan) em " + delay + "ms");
+
+        if (falhas == 3) {
+            Log.w(TAG, "[RECONNECT] 3 falhas — tentando refresh do cache GATT");
+            refreshGattCache();
+        }
         mMainHandler.postDelayed(this::iniciarCicloConexao, delay);
     }
 
@@ -369,6 +393,9 @@ public class BluetoothServiceIndustrial extends Service {
                 mConnectedDevice = gatt.getDevice();
                 mFailCount.set(0);
 
+                Log.i(TAG, "[BLE] ✅ CONECTADO! MAC=" + gatt.getDevice().getAddress()
+                        + " | bondState=" + gatt.getDevice().getBondState());
+
                 transitionTo(State.CONNECTED);
                 broadcastConnectionStatus("connected");
                 iniciarFluxoSegurancaEPareamento(gatt);
@@ -376,10 +403,13 @@ public class BluetoothServiceIndustrial extends Service {
             }
 
             if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                Log.i(TAG, "[BLE] onConnectionStateChange | status=" + status
+                        + " | newState=DISCONNECTED | mac=" + (mTargetBleMac != null ? mTargetBleMac : "?"));
                 stopHeartbeat();
                 mWaitingBond = false;
 
                 if (status == BluetoothGatt.GATT_SUCCESS) {
+                    Log.i(TAG, "[BLE] Desconexão limpa (status=0)");
                     closeGatt();
                     transitionTo(State.DISCONNECTED);
                     broadcastConnectionStatus("disconnected");
@@ -387,11 +417,13 @@ public class BluetoothServiceIndustrial extends Service {
                         mMainHandler.postDelayed(BluetoothServiceIndustrial.this::iniciarCicloConexao, 2_000L);
                     }
                 } else if (status == 133) {
+                    Log.w(TAG, "[BLE] GATT_ERROR (133) — ESP32 não respondeu. Reagendando com scan.");
                     closeGatt();
                     transitionTo(State.DISCONNECTED);
                     broadcastConnectionStatus("disconnected:133");
                     agendarReconexao();
                 } else if (status == 8) {
+                    Log.w(TAG, "[BLE] GATT_CONN_TIMEOUT (8) — conexão perdida por distância/interferência.");
                     closeGatt();
                     transitionTo(State.DISCONNECTED);
                     broadcastConnectionStatus("disconnected");
@@ -402,6 +434,7 @@ public class BluetoothServiceIndustrial extends Service {
                         }, 3_000L);
                     }
                 } else {
+                    Log.w(TAG, "[BLE] Erro GATT desconhecido: status=" + status);
                     closeGatt();
                     transitionTo(State.ERROR);
                     broadcastConnectionStatus("error:" + status);
@@ -412,18 +445,23 @@ public class BluetoothServiceIndustrial extends Service {
 
         @Override
         public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
+            Log.i(TAG, "[BLE] MTU negociado: " + mtu + " bytes (status=" + status + "). Iniciando discoverServices()");
             gatt.discoverServices();
         }
 
         @Override
         public void onServicesDiscovered(BluetoothGatt gatt, int status) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.e(TAG, "[BLE] Falha ao descobrir serviços: status=" + status);
                 agendarReconexao();
                 return;
             }
 
+            Log.i(TAG, "[BLE] Serviços descobertos. Procurando NUS (" + mServiceUuid + ")...");
+
             BluetoothGattService nusService = gatt.getService(mServiceUuid);
             if (nusService == null) {
+                Log.e(TAG, "[BLE] Serviço NUS não encontrado! Verifique o firmware do ESP32.");
                 refreshGattCache();
                 agendarReconexao();
                 return;
@@ -433,10 +471,12 @@ public class BluetoothServiceIndustrial extends Service {
             mNotifyCharacteristic = nusService.getCharacteristic(mTxUuid);
 
             if (mWriteCharacteristic == null || mNotifyCharacteristic == null) {
+                Log.e(TAG, "[BLE] Características RX/TX não encontradas no serviço NUS!");
                 agendarReconexao();
                 return;
             }
 
+            Log.i(TAG, "[BLE] NUS OK — RX e TX encontrados. Habilitando notificações na TX...");
             habilitarNotificacoes(gatt, mNotifyCharacteristic);
         }
 
@@ -446,9 +486,12 @@ public class BluetoothServiceIndustrial extends Service {
             if (!CCCD_UUID.equals(descriptor.getUuid())) return;
 
             if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.e(TAG, "[BLE] Falha ao escrever CCCD (notificações): status=" + status);
                 agendarReconexao();
                 return;
             }
+
+            Log.i(TAG, "[BLE] ✅ Notificações habilitadas! Estado: READY");
 
             mMainHandler.post(() -> {
                 transitionTo(State.READY);
@@ -458,11 +501,12 @@ public class BluetoothServiceIndustrial extends Service {
 
                 mSessionValid = false;
                 mLastPongAtMs = 0L;
-                startHeartbeat();
+                startHeartbeat();  // Inicia PING a cada 5s conforme firmware
 
                 if (mPendingCommand != null) {
                     String cmd = mPendingCommand;
                     mPendingCommand = null;
+                    Log.i(TAG, "[BLE] Enviando comando pendente: " + cmd);
                     write(cmd);
                 }
             });
@@ -502,12 +546,21 @@ public class BluetoothServiceIndustrial extends Service {
 
             String action = intent.getAction();
             if (BluetoothDevice.ACTION_PAIRING_REQUEST.equals(action)) {
+                Log.i(TAG, "[BOND] ACTION_PAIRING_REQUEST — aplicando PIN automaticamente");
                 aplicarPinPareamento(device);
             } else if (BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(action)) {
                 int bondState = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.BOND_NONE);
+                String bondStr = bondState == BluetoothDevice.BOND_BONDED ? "BOND_BONDED"
+                        : bondState == BluetoothDevice.BOND_BONDING ? "BOND_BONDING" : "BOND_NONE";
+                Log.i(TAG, "[BOND] ACTION_BOND_STATE_CHANGED → " + bondStr);
                 if (bondState == BluetoothDevice.BOND_BONDED) {
+                    Log.i(TAG, "[BOND] ✅ Pareamento concluído! Solicitando MTU=" + mPreferredMtu + "...");
                     mWaitingBond = false;
                     requestMtuSegura(mBluetoothGatt);
+                } else if (bondState == BluetoothDevice.BOND_NONE) {
+                    Log.w(TAG, "[BOND] Pareamento falhou ou foi cancelado. Reagendando conexão...");
+                    mWaitingBond = false;
+                    if (mAutoReconnect) agendarReconexao();
                 }
             }
         }
@@ -519,12 +572,18 @@ public class BluetoothServiceIndustrial extends Service {
         BluetoothDevice device = gatt.getDevice();
         int bond = device.getBondState();
 
+        String bondStr = bond == BluetoothDevice.BOND_BONDED ? "BOND_BONDED"
+                : bond == BluetoothDevice.BOND_BONDING ? "BOND_BONDING" : "BOND_NONE";
+        Log.i(TAG, "[BOND] Verificando pareamento | bondState=" + bondStr);
+
         if (bond == BluetoothDevice.BOND_BONDED) {
+            Log.i(TAG, "[BOND] Dispositivo já pareado. Solicitando MTU=" + mPreferredMtu + "...");
             mWaitingBond = false;
             requestMtuSegura(gatt);
             return;
         }
 
+        Log.i(TAG, "[BOND] Iniciando pareamento (createBond). PIN será aplicado automaticamente: " + mPairingPin);
         mWaitingBond = true;
         broadcastConnectionStatus("bonding");
 
@@ -538,14 +597,12 @@ public class BluetoothServiceIndustrial extends Service {
     private void aplicarPinPareamento(BluetoothDevice device) {
         if (device == null) return;
 
+        Log.i(TAG, "[BOND] ACTION_PAIRING_REQUEST recebido. Aplicando PIN: " + mPairingPin);
         try {
             byte[] pinBytes = mPairingPin.getBytes(StandardCharsets.UTF_8);
-            device.setPin(pinBytes);
+            boolean pinOk = device.setPin(pinBytes);
             device.setPairingConfirmation(true);
-            try {
-                abortBroadcast();
-            } catch (Exception ignored) {
-            }
+            Log.i(TAG, "[BOND] setPin() resultado: " + pinOk);
         } catch (Exception e) {
             Log.e(TAG, "[BOND] Erro ao aplicar PIN: " + e.getMessage());
         }
@@ -585,10 +642,34 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     private void tratarMensagemEntrada(String msg) {
+        Log.i(TAG, "[RX] Recebido do ESP32: " + msg);
+
         if ("PONG".equalsIgnoreCase(msg)) {
+            // Resposta ao PING — sessão válida
             mLastPongAtMs = SystemClock.elapsedRealtime();
             mSessionValid = true;
+            Log.d(TAG, "[HB] PONG recebido — sessão válida");
+
+        } else if ("OK".equalsIgnoreCase(msg)) {
+            // ESP32 confirmou recebimento do comando $ML
+            Log.i(TAG, "[RX] OK — ESP32 confirmou o comando");
+
+        } else if ("ERRO".equalsIgnoreCase(msg) || "ERROR".equalsIgnoreCase(msg)) {
+            Log.w(TAG, "[RX] ERRO recebido do ESP32");
+
+        } else if (msg.startsWith("VP:")) {
+            // Volume parcial: VP:50, VP:150...
+            Log.i(TAG, "[RX] Volume parcial: " + msg);
+
+        } else if (msg.startsWith("ML:")) {
+            // Volume final concluído: ML:300
+            Log.i(TAG, "[RX] ✅ Volume final concluído: " + msg);
+
+        } else if (msg.startsWith("QP:")) {
+            // Quantidade de pulsos: QP:1764
+            Log.d(TAG, "[RX] Pulsos: " + msg);
         }
+
         broadcastData(msg);
     }
 
@@ -597,13 +678,14 @@ public class BluetoothServiceIndustrial extends Service {
         public void run() {
             if (mState != State.READY) return;
 
+            Log.d(TAG, "[HB] Enviando PING...");
             writeInternal("PING", true);
 
             if (mLastPongAtMs > 0L) {
                 long delta = SystemClock.elapsedRealtime() - mLastPongAtMs;
                 if (delta > PONG_STALE_MS) {
                     mSessionValid = false;
-                    Log.w(TAG, "[HB] Sem PONG recente (" + delta + "ms)");
+                    Log.w(TAG, "[HB] ⚠️ Sem PONG há " + delta + "ms — sessão inválida");
                 }
             }
 
