@@ -21,10 +21,8 @@ import android.bluetooth.le.ScanFilter;
 import android.bluetooth.le.ScanRecord;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
-import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.os.Binder;
 import android.os.Build;
@@ -74,6 +72,7 @@ public class BluetoothServiceIndustrial extends Service {
     private static final long[] RECONNECT_DELAYS_MS = { 2_000L, 4_000L, 8_000L, 15_000L, 30_000L };
     private static final long HEARTBEAT_INTERVAL_MS = 5_000L;
     private static final long PONG_STALE_MS = 15_000L;
+    private static final int MAX_PING_MISSES = 3;
 
     private static final UUID CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
@@ -81,7 +80,6 @@ public class BluetoothServiceIndustrial extends Service {
     private UUID mRxUuid = UUID.fromString(BleConfigUtils.DEFAULT_RX_UUID);
     private UUID mTxUuid = UUID.fromString(BleConfigUtils.DEFAULT_TX_UUID);
     private int mPreferredMtu = BleConfigUtils.DEFAULT_MTU;
-    private String mPairingPin = BleConfigUtils.DEFAULT_PAIRING_PIN;
     private boolean mConfiguredAutoConnect = false;
     private String mExpectedBleName;
     private String mTargetBleMac;
@@ -90,7 +88,6 @@ public class BluetoothServiceIndustrial extends Service {
     private final AtomicInteger mFailCount = new AtomicInteger(0);
     private volatile boolean mAutoReconnect = true;
     private volatile boolean mScanning = false;
-    private volatile boolean mWaitingBond = false;
 
     private BluetoothAdapter mBluetoothAdapter;
     private BluetoothLeScanner mBleScanner;
@@ -104,6 +101,7 @@ public class BluetoothServiceIndustrial extends Service {
     private String mPendingCommand;
     private long mLastPongAtMs = 0L;
     private boolean mSessionValid = false;
+    private int mPingMisses = 0;
 
     private Handler mMainHandler;
 
@@ -125,7 +123,6 @@ public class BluetoothServiceIndustrial extends Service {
 
         Log.i(TAG, "[SERVICE] BluetoothServiceIndustrial iniciado");
         Log.i(TAG, "[SERVICE] Protocolo: Nordic UART Service (NUS)");
-        Log.i(TAG, "[SERVICE] PIN de pareamento: " + BleConfigUtils.DEFAULT_PAIRING_PIN);
 
         criarNotificacaoForeground();
 
@@ -138,7 +135,6 @@ public class BluetoothServiceIndustrial extends Service {
         }
 
         carregarConfigBle();
-        registrarReceiversPareamento();
     }
 
     @Override
@@ -152,8 +148,6 @@ public class BluetoothServiceIndustrial extends Service {
         stopHeartbeat();
         pararScan();
         closeGatt();
-        unregisterReceiverSafe(mPairingReceiver);
-
         mMainHandler.removeCallbacksAndMessages(null);
         transitionTo(State.DISCONNECTED);
         super.onDestroy();
@@ -253,7 +247,6 @@ public class BluetoothServiceIndustrial extends Service {
         carregarConfigBle();
         stopHeartbeat();
         mPendingConnectDevice = null;
-        mWaitingBond = false;
 
         pararScan();
         closeGatt();
@@ -385,6 +378,10 @@ public class BluetoothServiceIndustrial extends Service {
         mMainHandler.postDelayed(this::iniciarCicloConexao, delay);
     }
 
+    private void reconectarComBackoff() {
+        agendarReconexao();
+    }
+
     private final BluetoothGattCallback mGattCallback = new BluetoothGattCallback() {
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
@@ -394,11 +391,11 @@ public class BluetoothServiceIndustrial extends Service {
                 mFailCount.set(0);
 
                 Log.i(TAG, "[BLE] ✅ CONECTADO! MAC=" + gatt.getDevice().getAddress()
-                        + " | bondState=" + gatt.getDevice().getBondState());
+                        + " | sem pareamento/PIN (firmware atual)");
 
                 transitionTo(State.CONNECTED);
                 broadcastConnectionStatus("connected");
-                iniciarFluxoSegurancaEPareamento(gatt);
+                requestMtuSegura(gatt);
                 return;
             }
 
@@ -406,7 +403,6 @@ public class BluetoothServiceIndustrial extends Service {
                 Log.i(TAG, "[BLE] onConnectionStateChange | status=" + status
                         + " | newState=DISCONNECTED | mac=" + (mTargetBleMac != null ? mTargetBleMac : "?"));
                 stopHeartbeat();
-                mWaitingBond = false;
 
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     Log.i(TAG, "[BLE] Desconexão limpa (status=0)");
@@ -417,11 +413,13 @@ public class BluetoothServiceIndustrial extends Service {
                         mMainHandler.postDelayed(BluetoothServiceIndustrial.this::iniciarCicloConexao, 2_000L);
                     }
                 } else if (status == 133) {
-                    Log.w(TAG, "[BLE] GATT_ERROR (133) — ESP32 não respondeu. Reagendando com scan.");
+                    Log.w(TAG, "[GATT] GATT_ERROR (133) → closeGatt + backoff (autoConnect=false)");
                     closeGatt();
                     transitionTo(State.DISCONNECTED);
                     broadcastConnectionStatus("disconnected:133");
-                    agendarReconexao();
+                    mMainHandler.postDelayed(() -> {
+                        if (mAutoReconnect) reconectarComBackoff();
+                    }, 1_000L);
                 } else if (status == 8) {
                     Log.w(TAG, "[BLE] GATT_CONN_TIMEOUT (8) — conexão perdida por distância/interferência.");
                     closeGatt();
@@ -501,6 +499,7 @@ public class BluetoothServiceIndustrial extends Service {
 
                 mSessionValid = false;
                 mLastPongAtMs = 0L;
+                mPingMisses = 0;
                 startHeartbeat();  // Inicia PING a cada 5s conforme firmware
 
                 if (mPendingCommand != null) {
@@ -528,85 +527,6 @@ public class BluetoothServiceIndustrial extends Service {
             }
         }
     };
-
-    private void registrarReceiversPareamento() {
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(BluetoothDevice.ACTION_PAIRING_REQUEST);
-        filter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
-        registerReceiver(mPairingReceiver, filter);
-    }
-
-    private final BroadcastReceiver mPairingReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            if (intent == null || intent.getAction() == null) return;
-
-            BluetoothDevice device = readDeviceExtra(intent);
-            if (!isCurrentDevice(device)) return;
-
-            String action = intent.getAction();
-            if (BluetoothDevice.ACTION_PAIRING_REQUEST.equals(action)) {
-                Log.i(TAG, "[BOND] ACTION_PAIRING_REQUEST — aplicando PIN automaticamente");
-                aplicarPinPareamento(device);
-            } else if (BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(action)) {
-                int bondState = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.BOND_NONE);
-                String bondStr = bondState == BluetoothDevice.BOND_BONDED ? "BOND_BONDED"
-                        : bondState == BluetoothDevice.BOND_BONDING ? "BOND_BONDING" : "BOND_NONE";
-                Log.i(TAG, "[BOND] ACTION_BOND_STATE_CHANGED → " + bondStr);
-                if (bondState == BluetoothDevice.BOND_BONDED) {
-                    Log.i(TAG, "[BOND] ✅ Pareamento concluído! Solicitando MTU=" + mPreferredMtu + "...");
-                    mWaitingBond = false;
-                    requestMtuSegura(mBluetoothGatt);
-                } else if (bondState == BluetoothDevice.BOND_NONE) {
-                    Log.w(TAG, "[BOND] Pareamento falhou ou foi cancelado. Reagendando conexão...");
-                    mWaitingBond = false;
-                    if (mAutoReconnect) agendarReconexao();
-                }
-            }
-        }
-    };
-
-    private void iniciarFluxoSegurancaEPareamento(BluetoothGatt gatt) {
-        if (gatt == null || gatt.getDevice() == null) return;
-
-        BluetoothDevice device = gatt.getDevice();
-        int bond = device.getBondState();
-
-        String bondStr = bond == BluetoothDevice.BOND_BONDED ? "BOND_BONDED"
-                : bond == BluetoothDevice.BOND_BONDING ? "BOND_BONDING" : "BOND_NONE";
-        Log.i(TAG, "[BOND] Verificando pareamento | bondState=" + bondStr);
-
-        if (bond == BluetoothDevice.BOND_BONDED) {
-            Log.i(TAG, "[BOND] Dispositivo já pareado. Solicitando MTU=" + mPreferredMtu + "...");
-            mWaitingBond = false;
-            requestMtuSegura(gatt);
-            return;
-        }
-
-        Log.i(TAG, "[BOND] Iniciando pareamento (createBond). PIN será aplicado automaticamente: " + mPairingPin);
-        mWaitingBond = true;
-        broadcastConnectionStatus("bonding");
-
-        try {
-            device.createBond();
-        } catch (Exception e) {
-            Log.e(TAG, "[BOND] Falha createBond: " + e.getMessage());
-        }
-    }
-
-    private void aplicarPinPareamento(BluetoothDevice device) {
-        if (device == null) return;
-
-        Log.i(TAG, "[BOND] ACTION_PAIRING_REQUEST recebido. Aplicando PIN: " + mPairingPin);
-        try {
-            byte[] pinBytes = mPairingPin.getBytes(StandardCharsets.UTF_8);
-            boolean pinOk = device.setPin(pinBytes);
-            device.setPairingConfirmation(true);
-            Log.i(TAG, "[BOND] setPin() resultado: " + pinOk);
-        } catch (Exception e) {
-            Log.e(TAG, "[BOND] Erro ao aplicar PIN: " + e.getMessage());
-        }
-    }
 
     private void requestMtuSegura(BluetoothGatt gatt) {
         if (gatt == null) return;
@@ -645,12 +565,15 @@ public class BluetoothServiceIndustrial extends Service {
         Log.i(TAG, "[RX] Recebido do ESP32: " + msg);
 
         if ("PONG".equalsIgnoreCase(msg)) {
-            // Resposta ao PING — sessão válida
             mLastPongAtMs = SystemClock.elapsedRealtime();
             mSessionValid = true;
-            Log.d(TAG, "[HB] PONG recebido — sessão válida");
+            mPingMisses = 0;
+            Log.d(TAG, "[PING] PONG recebido — conexão confirmada ativa");
+            broadcastData(msg);
+            return;
+        }
 
-        } else if ("OK".equalsIgnoreCase(msg)) {
+        if ("OK".equalsIgnoreCase(msg)) {
             // ESP32 confirmou recebimento do comando $ML
             Log.i(TAG, "[RX] OK — ESP32 confirmou o comando");
 
@@ -678,7 +601,8 @@ public class BluetoothServiceIndustrial extends Service {
         public void run() {
             if (mState != State.READY) return;
 
-            Log.d(TAG, "[HB] Enviando PING...");
+            mPingMisses++;
+            Log.d(TAG, "[PING] Enviando PING (miss=" + mPingMisses + "/" + MAX_PING_MISSES + ")");
             writeInternal("PING", true);
 
             if (mLastPongAtMs > 0L) {
@@ -687,6 +611,10 @@ public class BluetoothServiceIndustrial extends Service {
                     mSessionValid = false;
                     Log.w(TAG, "[HB] ⚠️ Sem PONG há " + delta + "ms — sessão inválida");
                 }
+            }
+
+            if (mPingMisses >= MAX_PING_MISSES && !mSessionValid) {
+                Log.w(TAG, "[PING] Limite de misses atingido (" + mPingMisses + "/" + MAX_PING_MISSES + ")");
             }
 
             mMainHandler.postDelayed(this, HEARTBEAT_INTERVAL_MS);
@@ -701,6 +629,7 @@ public class BluetoothServiceIndustrial extends Service {
     private void stopHeartbeat() {
         mSessionValid = false;
         mLastPongAtMs = 0L;
+        mPingMisses = 0;
         mMainHandler.removeCallbacks(mHeartbeatRunnable);
     }
 
@@ -735,7 +664,6 @@ public class BluetoothServiceIndustrial extends Service {
         if (newState == State.DISCONNECTED || newState == State.ERROR) {
             mWriteCharacteristic = null;
             mNotifyCharacteristic = null;
-            mWaitingBond = false;
         }
     }
 
@@ -878,11 +806,6 @@ public class BluetoothServiceIndustrial extends Service {
             mTargetBleMac = storedMac;
         }
 
-        mPairingPin = BleConfigUtils.firstNonBlank(
-                prefs.getString(BleConfigUtils.KEY_PAIRING_PIN, null),
-                BleConfigUtils.DEFAULT_PAIRING_PIN
-        );
-
         mPreferredMtu = prefs.getInt(BleConfigUtils.KEY_MTU, BleConfigUtils.DEFAULT_MTU);
 
         String serviceRaw = BleConfigUtils.firstNonBlank(
@@ -942,14 +865,6 @@ public class BluetoothServiceIndustrial extends Service {
         Intent i = new Intent(ACTION_DEVICE_FOUND);
         i.putExtra(EXTRA_DEVICE, device);
         LocalBroadcastManager.getInstance(this).sendBroadcast(i);
-    }
-
-    private void unregisterReceiverSafe(BroadcastReceiver receiver) {
-        if (receiver == null) return;
-        try {
-            unregisterReceiver(receiver);
-        } catch (Exception ignored) {
-        }
     }
 
     private void criarNotificacaoForeground() {
