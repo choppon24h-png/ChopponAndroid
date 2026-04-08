@@ -3,7 +3,6 @@ package com.example.choppontap;
 import android.Manifest;
 import android.content.Context;
 import android.content.Intent;
-import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.net.ConnectivityManager;
@@ -365,9 +364,7 @@ public class Imei extends AppCompatActivity {
                             showMessage("Conectado com sucesso!", Snackbar.LENGTH_SHORT);
                             updateStatusText("Conectado!");
 
-                            if (tap.esp32_mac != null && !tap.esp32_mac.isEmpty()) {
-                                saveMacLocally(tap.esp32_mac);
-                            }
+                            BleConfigUtils.persistFromTap(Imei.this, tap);
 
                             // Verifica se a TAP está desativada
                             if (tap.tap_status != null && tap.tap_status == 0) {
@@ -458,12 +455,6 @@ public class Imei extends AppCompatActivity {
         } else {
             Log.w(TAG, "rootView não disponível. Mensagem: " + message);
         }
-    }
-
-    private void saveMacLocally(String mac) {
-        SharedPreferences prefs = getSharedPreferences("tap_config", Context.MODE_PRIVATE);
-        prefs.edit().putString("esp32_mac", mac).apply();
-        Log.i(TAG, "MAC " + mac + " salvo localmente.");
     }
 
     // ─────────────────────────────────────────────────────────────────────────

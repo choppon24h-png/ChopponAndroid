@@ -203,12 +203,8 @@ public class Home extends AppCompatActivity {
                 // Conexão direta via MAC — sem scan de 4 segundos
                 String mac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
                         .getString("esp32_mac", "");
-                if (!mac.isEmpty()) {
-                    Log.i(TAG, "[BLE] Conectando diretamente ao MAC: " + mac);
-                    mBluetoothService.connectWithMac(mac);
-                } else {
-                    Log.e(TAG, "[BLE] MAC não encontrado nas preferências — verifique a API");
-                }
+                Log.i(TAG, "[BLE] Iniciando conexao BLE com configuracao atual. MAC=" + mac);
+                mBluetoothService.connectWithMac(mac);
             } else {
                 // Já conectado — atualiza a UI imediatamente
                 Log.i(TAG, "[BLE] Já conectado — sincronizando UI");
@@ -287,12 +283,8 @@ public class Home extends AppCompatActivity {
                 // Desconectado — reconecta diretamente via MAC
                 String mac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
                         .getString("esp32_mac", "");
-                if (!mac.isEmpty()) {
-                    Log.i(TAG, "onResume: BLE desconectado — reconectando ao MAC: " + mac);
-                    mBluetoothService.connectWithMac(mac);
-                } else {
-                    Log.e(TAG, "onResume: MAC não encontrado nas preferências");
-                }
+                Log.i(TAG, "onResume: BLE desconectado - reiniciando fluxo com config BLE. MAC=" + mac);
+                mBluetoothService.connectWithMac(mac);
             }
         }
     }
@@ -517,22 +509,13 @@ public class Home extends AppCompatActivity {
                             + " tap_status=" + tap.tap_status
                             + " esp32_mac=" + tap.esp32_mac);
 
-                    // v2.3.1 FIX: sincroniza o MAC salvo com o retornado pela API.
-                    // Resolve o problema de novo Android compilado com MAC antigo em
-                    // SharedPreferences (de outro dispositivo ou sessao anterior).
-                    if (tap.esp32_mac != null && !tap.esp32_mac.isEmpty()) {
-                        String macAtual = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
-                                .getString("esp32_mac", null);
-                        if (!tap.esp32_mac.equalsIgnoreCase(macAtual)) {
-                            Log.w(TAG, "[MAC] MAC desatualizado! API=" + tap.esp32_mac
-                                    + " | Salvo=" + macAtual + " → atualizando");
-                            getSharedPreferences("tap_config", Context.MODE_PRIVATE)
-                                    .edit().putString("esp32_mac", tap.esp32_mac).apply();
-                            // Notifica o BluetoothService para usar o novo MAC imediatamente
-                            if (mBluetoothService != null) {
-                                mBluetoothService.salvarMacExterno(tap.esp32_mac);
-                            }
-                        }
+                    BleConfigUtils.persistFromTap(Home.this, tap);
+                    String bleMac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
+                            .getString(BleConfigUtils.KEY_BLE_MAC,
+                                    getSharedPreferences("tap_config", Context.MODE_PRIVATE)
+                                            .getString("esp32_mac", ""));
+                    if (mBluetoothService != null) {
+                        mBluetoothService.salvarMacExterno(bleMac);
                     }
 
                     boolean cartaoHabilitado = (tap.cartao != null) && tap.cartao;
@@ -876,3 +859,5 @@ public class Home extends AppCompatActivity {
         });
     }
 }
+
+
