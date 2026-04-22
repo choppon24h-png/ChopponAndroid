@@ -285,18 +285,17 @@ public class FormaPagamento extends AppCompatActivity {
                         if (method.equals("pix")) {
                             updateUIState(STATE_PIX);
                             updateQrCode(qr);
-                            // Exibir o pix_code em texto, se disponível (debug):
+                            // Mantém o campo PIX copia e cola oculto.
                             runOnUiThread(() -> {
                                 if (txtPixCode != null) {
                                     txtPixCode.setText(qr.pix_code);
-                                    txtPixCode.setVisibility(View.VISIBLE);
+                                    txtPixCode.setVisibility(View.GONE);
                                 }
                                 if (txtPixCodeLabel != null) {
-                                    txtPixCodeLabel.setText("PIX Copia e Cola:");
-                                    txtPixCodeLabel.setVisibility(View.VISIBLE);
+                                    txtPixCodeLabel.setVisibility(View.GONE);
                                 }
                                 if (btnCopiarPix != null) {
-                                    btnCopiarPix.setVisibility(View.VISIBLE);
+                                    btnCopiarPix.setVisibility(View.GONE);
                                 }
                             });
                             startCountDown(180);
