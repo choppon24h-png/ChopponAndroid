@@ -140,6 +140,7 @@ public class BluetoothServiceIndustrial extends Service {
 
     private BluetoothGattCharacteristic mWriteCharacteristic;
     private BluetoothGattCharacteristic mNotifyCharacteristic;
+    private final Object mGattLock = new Object();
 
     private String mPendingCommand;
     private long mLastPongAtMs = 0L;
@@ -538,6 +539,33 @@ public class BluetoothServiceIndustrial extends Service {
             return;
         }
 
+        final String nextMac = BleConfigUtils.normalizeMac(device.getAddress());
+        synchronized (mGattLock) {
+            if (mState == State.CONNECTING) {
+                Log.w(TAG, "[CONNECT] Ja existe tentativa CONNECTING em andamento. Ignorando novo connectGatt para "
+                        + nextMac);
+                return;
+            }
+
+            String currentMac = null;
+            if (mBluetoothGatt != null && mBluetoothGatt.getDevice() != null) {
+                currentMac = BleConfigUtils.normalizeMac(mBluetoothGatt.getDevice().getAddress());
+            }
+
+            boolean busy = (mState == State.CONNECTING || mState == State.CONNECTED || mState == State.READY);
+            if (busy && currentMac != null && nextMac != null && currentMac.equalsIgnoreCase(nextMac)) {
+                Log.w(TAG, "[CONNECT] Tentativa duplicada de connectGatt ignorada | MAC=" + nextMac
+                        + " | estado=" + mState);
+                return;
+            }
+
+            if (mBluetoothGatt != null) {
+                Log.w(TAG, "[CONNECT] Ja existe instância GATT ativa (" + currentMac
+                        + "). Fechando antes de novo connectGatt para " + nextMac);
+                closeGattLocked();
+            }
+        }
+
         transitionTo(State.CONNECTING);
         broadcastConnectionStatus("connecting");
 
@@ -545,10 +573,20 @@ public class BluetoothServiceIndustrial extends Service {
             Log.i(TAG, "[CONNECT] connectGatt() | MAC=" + device.getAddress()
                     + " | tentativa=" + (mFailCount.get() + 1)
                     + " | autoConnect=false | TRANSPORT_LE");
+            BluetoothGatt newGatt;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                mBluetoothGatt = device.connectGatt(this, false, mGattCallback, BluetoothDevice.TRANSPORT_LE);
+                newGatt = device.connectGatt(this, false, mGattCallback, BluetoothDevice.TRANSPORT_LE);
             } else {
-                mBluetoothGatt = device.connectGatt(this, false, mGattCallback);
+                newGatt = device.connectGatt(this, false, mGattCallback);
+            }
+            if (newGatt == null) {
+                Log.e(TAG, "[CONNECT] connectGatt retornou null para MAC=" + device.getAddress());
+                transitionTo(State.DISCONNECTED);
+                agendarReconexao();
+                return;
+            }
+            synchronized (mGattLock) {
+                mBluetoothGatt = newGatt;
             }
             mPendingConnectDevice = device;
         } catch (Exception e) {
@@ -592,6 +630,19 @@ public class BluetoothServiceIndustrial extends Service {
     private final BluetoothGattCallback mGattCallback = new BluetoothGattCallback() {
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+            synchronized (mGattLock) {
+                if (gatt != null && mBluetoothGatt != null && gatt != mBluetoothGatt) {
+                    Log.w(TAG, "[GATT] Callback de instancia antiga ignorado; fechando GATT orfao.");
+                    closeSingleGatt(gatt);
+                    return;
+                }
+                if (gatt != null && mBluetoothGatt == null) {
+                    Log.w(TAG, "[GATT] Callback sem instancia ativa; fechando GATT orfao.");
+                    closeSingleGatt(gatt);
+                    return;
+                }
+            }
+
             if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
                 mBluetoothGatt = gatt;
                 mConnectedDevice = gatt.getDevice();
@@ -990,22 +1041,31 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     private void closeGatt() {
-        if (mBluetoothGatt == null) return;
-
-        try {
-            mBluetoothGatt.disconnect();
-        } catch (Exception ignored) {
+        synchronized (mGattLock) {
+            closeGattLocked();
         }
+    }
 
-        try {
-            mBluetoothGatt.close();
-        } catch (Exception ignored) {
+    private void closeGattLocked() {
+        if (mBluetoothGatt != null) {
+            closeSingleGatt(mBluetoothGatt);
         }
-
         mBluetoothGatt = null;
         mConnectedDevice = null;
         mWriteCharacteristic = null;
         mNotifyCharacteristic = null;
+    }
+
+    private void closeSingleGatt(BluetoothGatt gatt) {
+        if (gatt == null) return;
+        try {
+            gatt.disconnect();
+        } catch (Exception ignored) {
+        }
+        try {
+            gatt.close();
+        } catch (Exception ignored) {
+        }
     }
 
     private void refreshGattCache() {
