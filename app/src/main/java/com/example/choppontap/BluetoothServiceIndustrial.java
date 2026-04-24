@@ -114,6 +114,21 @@ public class BluetoothServiceIndustrial extends Service {
      */
     private volatile boolean mFallbackScanAtivo = false;
 
+    /**
+     * MAC BLE real confirmado após conexão bem-sucedida via scan de fallback.
+     * O ESP32-C3 expõe 3 MACs distintos: Wi-Fi base (cadastrado no servidor),
+     * Wi-Fi AP (base+1) e BLE (base+2). O servidor armazena o MAC Wi-Fi base,
+     * mas o GATT deve conectar ao MAC BLE real. Este campo guarda o MAC BLE
+     * confirmado para que os ciclos de scan subsequentes usem o endereço correto
+     * sem alterar o valor persistido no servidor.
+     */
+    private volatile String mConfirmedBleMac = null;
+
+    /** Contador de tentativas de escrita do CCCD para retry automático. */
+    private int mCccdRetryCount = 0;
+    private static final int CCCD_MAX_RETRIES = 3;
+    private static final long CCCD_RETRY_DELAY_MS = 600L;
+
     private BluetoothAdapter mBluetoothAdapter;
     private BluetoothLeScanner mBleScanner;
     private BluetoothGatt mBluetoothGatt;
@@ -275,6 +290,15 @@ public class BluetoothServiceIndustrial extends Service {
         carregarConfigBle();
         stopHeartbeat();
         mPendingConnectDevice = null;
+        mCccdRetryCount = 0;
+
+        // CORREÇÃO 1: Usar o MAC BLE real confirmado (se disponível) em vez do
+        // MAC Wi-Fi base cadastrado no servidor. O ESP32-C3 expõe BLE no MAC+2.
+        if (mConfirmedBleMac != null) {
+            Log.i(TAG, "[SCAN] Usando MAC BLE confirmado: " + mConfirmedBleMac
+                    + " (servidor tem: " + mTargetBleMac + ")");
+            mTargetBleMac = mConfirmedBleMac;
+        }
 
         pararScan();
         closeGatt();
@@ -420,6 +444,14 @@ public class BluetoothServiceIndustrial extends Service {
                 Log.i(TAG, "[FALLBACK] MAC confirmado: " + foundMac
                         + " — a placa está no ar mas não respondeu ao filtro direto."
                         + " Possível causa: anúncio BLE com nome ativo, sem resposta ao filtro de MAC.");
+            }
+
+            // CORREÇÃO 1: Persistir o MAC BLE real para uso nos ciclos seguintes.
+            // Não sobrescrevemos as SharedPreferences (que contêm o MAC Wi-Fi do servidor),
+            // apenas guardamos em memória para o ciclo de scan normal usar o endereço correto.
+            if (mTargetBleMac == null || !mTargetBleMac.equalsIgnoreCase(foundMac)) {
+                Log.i(TAG, "[FALLBACK] Persistindo MAC BLE real em memória: " + foundMac);
+                mConfirmedBleMac = foundMac;
             }
 
             mPendingConnectDevice = device;
@@ -585,6 +617,21 @@ public class BluetoothServiceIndustrial extends Service {
                             iniciarCicloConexao();
                         }, 3_000L);
                     }
+                } else if (status == 19) {
+                    // CORREÇÃO 2: status=19 (GATT_CONN_TERMINATE_PEER_USER) significa que
+                    // o ESP32 encerrou a conexão ativamente — geralmente por timeout de
+                    // inatividade (~30s sem dados) ou porque o CCCD não foi confirmado a tempo.
+                    // Tratar como desconexão limpa (não incrementa failCount) e reconectar
+                    // imediatamente usando o MAC BLE confirmado.
+                    Log.w(TAG, "[BLE] status=19 (ESP32 encerrou conexão — timeout de inatividade ou CCCD pendente)"
+                            + " | Reconectando em 1s sem incrementar failCount...");
+                    closeGatt();
+                    transitionTo(State.DISCONNECTED);
+                    broadcastConnectionStatus("disconnected");
+                    if (mAutoReconnect) {
+                        // Não chama agendarReconexao() para não incrementar mFailCount
+                        mMainHandler.postDelayed(BluetoothServiceIndustrial.this::iniciarCicloConexao, 1_000L);
+                    }
                 } else {
                     Log.w(TAG, "[BLE] Erro GATT desconhecido: status=" + status);
                     closeGatt();
@@ -685,7 +732,15 @@ public class BluetoothServiceIndustrial extends Service {
     private void requestMtuSegura(BluetoothGatt gatt) {
         if (gatt == null) return;
 
-        int targetMtu = mPreferredMtu > 23 ? mPreferredMtu : BleConfigUtils.DEFAULT_MTU;
+        // CORREÇÃO 3: Limitar MTU a 247 bytes (máximo seguro para ESP32-C3 com NimBLE).
+        // O Android pode negociar até 517, mas o ESP32-C3 suporta no máximo 247.
+        // Um MTU maior pode causar fragmentação silenciosa no writeDescriptor do CCCD,
+        // fazendo a habilitação de notificações falhar sem retornar erro explícito.
+        int targetMtu = Math.min(
+                mPreferredMtu > 23 ? mPreferredMtu : BleConfigUtils.DEFAULT_MTU,
+                BleConfigUtils.DEFAULT_MTU  // teto = 247
+        );
+        Log.i(TAG, "[BLE] Solicitando MTU: " + targetMtu + " bytes (teto ESP32-C3=247)");
         boolean mtuRequested = false;
         try {
             mtuRequested = gatt.requestMtu(targetMtu);
@@ -788,20 +843,48 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     private void habilitarNotificacoes(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
+        habilitarNotificacoesComRetry(gatt, characteristic, 0);
+    }
+
+    /**
+     * CORREÇÃO 4: Habilita notificações CCCD com retry automático.
+     * O writeDescriptor pode falhar silenciosamente logo após o discoverServices
+     * se o stack BLE ainda estiver processando. Um retry com delay de 600ms
+     * resolve a condição de corrida sem alterar a lógica de negócio.
+     */
+    private void habilitarNotificacoesComRetry(BluetoothGatt gatt,
+                                               BluetoothGattCharacteristic characteristic,
+                                               int tentativa) {
         if (gatt == null || characteristic == null) return;
 
         gatt.setCharacteristicNotification(characteristic, true);
 
         BluetoothGattDescriptor descriptor = characteristic.getDescriptor(CCCD_UUID);
         if (descriptor == null) {
+            Log.e(TAG, "[CCCD] Descriptor CCCD não encontrado na característica TX!");
             agendarReconexao();
             return;
         }
 
         descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
         boolean cccdOk = gatt.writeDescriptor(descriptor);
+
+        Log.i(TAG, "[CCCD] writeDescriptor tentativa=" + (tentativa + 1)
+                + " | resultado=" + (cccdOk ? "OK" : "FALHOU"));
+
         if (!cccdOk) {
-            agendarReconexao();
+            if (tentativa < CCCD_MAX_RETRIES) {
+                Log.w(TAG, "[CCCD] writeDescriptor falhou — retry " + (tentativa + 1)
+                        + "/" + CCCD_MAX_RETRIES + " em " + CCCD_RETRY_DELAY_MS + "ms");
+                mMainHandler.postDelayed(() -> {
+                    if (mBluetoothGatt != null && mState == State.CONNECTED) {
+                        habilitarNotificacoesComRetry(gatt, characteristic, tentativa + 1);
+                    }
+                }, CCCD_RETRY_DELAY_MS);
+            } else {
+                Log.e(TAG, "[CCCD] Esgotadas " + CCCD_MAX_RETRIES + " tentativas de CCCD — reconectando");
+                agendarReconexao();
+            }
         }
     }
 
