@@ -457,25 +457,42 @@ public class PagamentoConcluido extends AppCompatActivity {
     // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     private void carregarImagemComFallback() {
-        Sqlite banco = new Sqlite(getApplicationContext());
-        byte[] img = banco.getActiveImageData();
-        if (img != null && img.length > 0) {
-            Bitmap bmp = BitmapFactory.decodeByteArray(img, 0, img.length);
-            if (bmp != null && imageView != null) {
-                imageView.setImageBitmap(bmp);
-                return;
-            }
+        if (currentImageTask != null && !currentImageTask.isDone()) {
+            currentImageTask.cancel(true);
         }
-        if (imagemUrl != null && !imagemUrl.isEmpty()) {
-            currentImageTask = imageExecutor.submit(() -> {
-                try {
+
+        currentImageTask = imageExecutor.submit(() -> {
+            try {
+                Sqlite banco = new Sqlite(getApplicationContext());
+                byte[] img = banco.getActiveImageData();
+                if (img != null && img.length > 0) {
+                    Bitmap bmp = BitmapFactory.decodeByteArray(img, 0, img.length);
+                    if (bmp != null) {
+                        runOnUiThread(() -> {
+                            if (!isFinishing() && !isDestroyed() && imageView != null) {
+                                imageView.setImageBitmap(bmp);
+                            }
+                        });
+                        return;
+                    }
+                }
+
+                if (imagemUrl != null && !imagemUrl.isEmpty()) {
                     Tap tempTap = new Tap();
                     tempTap.image = imagemUrl;
                     Bitmap bmp = new ApiHelper(this).getImage(tempTap);
-                    if (bmp != null) runOnUiThread(() -> imageView.setImageBitmap(bmp));
-                } catch (Exception ignored) {}
-            });
-        }
+                    if (bmp != null) {
+                        runOnUiThread(() -> {
+                            if (!isFinishing() && !isDestroyed() && imageView != null) {
+                                imageView.setImageBitmap(bmp);
+                            }
+                        });
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "[IMG] Erro ao carregar imagem: " + e.getMessage());
+            }
+        });
     }
 
     // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ

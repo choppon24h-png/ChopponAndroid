@@ -38,6 +38,8 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import okhttp3.Call;
 import okhttp3.Callback;
@@ -112,6 +114,7 @@ public class FormaPagamento extends AppCompatActivity {
      * Com 7s de intervalo, 5 erros = ~35s de tentativas antes de desistir.
      */
     private static final int MAX_API_ERRORS = 5;
+    private final ExecutorService dbExecutor = Executors.newSingleThreadExecutor();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -608,16 +611,24 @@ public class FormaPagamento extends AppCompatActivity {
     }
 
     public void changeButtonsFunction(Boolean enabled) {
-        Sqlite banco = new Sqlite(getApplicationContext());
-        boolean card = enabled && banco.getCartaoEnabled();
-        runOnUiThread(() -> {
-            btnPix.setEnabled(enabled);
-            btnCard.setEnabled(card);
-            btnCardDebit.setEnabled(card);
-            int color = enabled ? Color.parseColor("#FF8C00") : Color.GRAY;
-            btnPix.setBackgroundColor(color);
-            btnCard.setBackgroundColor(card ? Color.parseColor("#FF8C00") : Color.GRAY);
-            btnCardDebit.setBackgroundColor(card ? Color.parseColor("#FF8C00") : Color.GRAY);
+        dbExecutor.execute(() -> {
+            boolean card = false;
+            try {
+                Sqlite banco = new Sqlite(getApplicationContext());
+                card = enabled && banco.getCartaoEnabled();
+            } catch (Exception e) {
+                Log.e(TAG, "Erro ao consultar SQLite (cartao): " + e.getMessage());
+            }
+            final boolean cardEnabled = card;
+            runOnUiThread(() -> {
+                btnPix.setEnabled(enabled);
+                btnCard.setEnabled(cardEnabled);
+                btnCardDebit.setEnabled(cardEnabled);
+                int color = enabled ? Color.parseColor("#FF8C00") : Color.GRAY;
+                btnPix.setBackgroundColor(color);
+                btnCard.setBackgroundColor(cardEnabled ? Color.parseColor("#FF8C00") : Color.GRAY);
+                btnCardDebit.setBackgroundColor(cardEnabled ? Color.parseColor("#FF8C00") : Color.GRAY);
+            });
         });
     }
 
@@ -674,5 +685,6 @@ public class FormaPagamento extends AppCompatActivity {
         super.onDestroy();
         stopRunnable();
         paymentIdempotencyKey = null;
+        dbExecutor.shutdownNow();
     }
 }
