@@ -7,13 +7,13 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
 import android.bluetooth.BluetoothGattCallback;
 import android.bluetooth.BluetoothGattCharacteristic;
 import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
-import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
@@ -74,6 +74,22 @@ public class BluetoothServiceIndustrial extends Service {
     private static final long PONG_STALE_MS = 15_000L;
     private static final int MAX_PING_MISSES = 3;
 
+    /**
+     * Prefixo do nome BLE anunciado pelo firmware ESP32.
+     * Definido em config.h como BLE_NAME_PREFIX "CHOPP_".
+     * O firmware anexa os 4 últimos dígitos do MAC Wi-Fi em tempo de execução,
+     * resultando em nomes como CHOPP_2768.
+     */
+    private static final String BLE_NAME_PREFIX = "CHOPP_";
+
+    /**
+     * Número de falhas de scan_timeout consecutivas antes de ativar o
+     * scan de fallback permissivo (por prefixo CHOPP_).
+     * Valor 2 garante que o scan normal seja tentado pelo menos duas vezes
+     * antes de escalar para o modo de descoberta.
+     */
+    private static final int FALLBACK_SCAN_THRESHOLD = 2;
+
     private static final UUID CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
     private UUID mServiceUuid = UUID.fromString(BleConfigUtils.DEFAULT_SERVICE_UUID);
@@ -88,6 +104,15 @@ public class BluetoothServiceIndustrial extends Service {
     private final AtomicInteger mFailCount = new AtomicInteger(0);
     private volatile boolean mAutoReconnect = true;
     private volatile boolean mScanning = false;
+
+    /**
+     * Indica se o ciclo de scan atual está operando em modo fallback (permissivo).
+     * No modo fallback, o filtro de MAC é removido e o scan procura qualquer
+     * dispositivo cujo nome anunciado comece com BLE_NAME_PREFIX ("CHOPP_").
+     * Resetado para false sempre que uma conexão bem-sucedida é estabelecida
+     * ou quando connectWithMac() é chamado externamente.
+     */
+    private volatile boolean mFallbackScanAtivo = false;
 
     private BluetoothAdapter mBluetoothAdapter;
     private BluetoothLeScanner mBleScanner;
@@ -190,6 +215,9 @@ public class BluetoothServiceIndustrial extends Service {
 
         mAutoReconnect = true;
         mFailCount.set(0);
+        // Toda chamada externa reseta o fallback para garantir que o scan
+        // normal (com filtro de MAC preciso) seja tentado primeiro.
+        mFallbackScanAtivo = false;
         iniciarCicloConexao();
     }
 
@@ -251,14 +279,24 @@ public class BluetoothServiceIndustrial extends Service {
         pararScan();
         closeGatt();
 
-        Log.i(TAG, "[SCAN] Iniciando ciclo de conexão");
+        Log.i(TAG, "[SCAN] Iniciando ciclo de conexão"
+                + (mFallbackScanAtivo ? " [MODO FALLBACK — prefixo CHOPP_]" : ""));
         Log.i(TAG, "[SCAN] MAC alvo: " + (mTargetBleMac != null ? mTargetBleMac : "(nenhum)"));
         Log.i(TAG, "[SCAN] Nome esperado: " + (mExpectedBleName != null ? mExpectedBleName : "(nenhum)"));
 
         transitionTo(State.SCANNING);
         broadcastConnectionStatus("scanning");
-        iniciarScanIdentidade();
+
+        if (mFallbackScanAtivo) {
+            iniciarScanFallback();
+        } else {
+            iniciarScanIdentidade();
+        }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scan normal — filtro preciso por MAC ou nome esperado
+    // ─────────────────────────────────────────────────────────────────────────
 
     private void iniciarScanIdentidade() {
         if (mBleScanner == null) {
@@ -296,6 +334,109 @@ public class BluetoothServiceIndustrial extends Service {
             agendarReconexao();
         }, SCAN_TIMEOUT_MS);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scan de fallback — sem filtro de MAC, aceita qualquer CHOPP_XXXX
+    // Ativado automaticamente após FALLBACK_SCAN_THRESHOLD falhas consecutivas
+    // de scan_timeout, quando o MAC cadastrado não é encontrado no ar.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private void iniciarScanFallback() {
+        if (mBleScanner == null) {
+            Log.w(TAG, "[FALLBACK] BleScanner nulo — abortando scan de fallback");
+            mFallbackScanAtivo = false;
+            mMainHandler.postDelayed(this::iniciarCicloConexao, PRE_CONNECT_DELAY_MS);
+            return;
+        }
+
+        Log.w(TAG, "[FALLBACK] Iniciando scan permissivo — procurando qualquer dispositivo com prefixo '"
+                + BLE_NAME_PREFIX + "'");
+        Log.w(TAG, "[FALLBACK] MAC esperado (referência): " + (mTargetBleMac != null ? mTargetBleMac : "(nenhum)"));
+
+        // Scan sem filtro: o callback filtrará por prefixo de nome manualmente.
+        // Isso é necessário porque a API Android de ScanFilter não suporta
+        // correspondência parcial de nome (startsWith), apenas nome exato.
+        ScanSettings settings = new ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .build();
+
+        try {
+            mScanning = true;
+            mBleScanner.startScan(null, settings, mFallbackScanCallback);
+        } catch (Exception e) {
+            Log.e(TAG, "[FALLBACK] Erro ao iniciar scan permissivo: " + e.getMessage());
+            mScanning = false;
+            mFallbackScanAtivo = false;
+            agendarReconexao();
+            return;
+        }
+
+        mMainHandler.postDelayed(() -> {
+            if (!mScanning) return;
+            pararScanFallback();
+            Log.w(TAG, "[FALLBACK] Timeout — nenhum dispositivo CHOPP_ encontrado no ar.");
+            transitionTo(State.DISCONNECTED);
+            broadcastConnectionStatus("disconnected:scan_timeout");
+            // Retorna ao modo normal para o próximo ciclo: o backoff normal
+            // continuará e o scan preciso será tentado novamente.
+            mFallbackScanAtivo = false;
+            agendarReconexao();
+        }, SCAN_TIMEOUT_MS);
+    }
+
+    /**
+     * Callback exclusivo do scan de fallback.
+     * Aceita qualquer dispositivo cujo nome anunciado comece com BLE_NAME_PREFIX.
+     * Se o MAC encontrado for diferente do MAC cadastrado, loga um aviso diagnóstico
+     * e atualiza o MAC em memória (sem sobrescrever as SharedPreferences, pois o MAC
+     * cadastrado no servidor permanece como referência).
+     */
+    private final ScanCallback mFallbackScanCallback = new ScanCallback() {
+        @Override
+        public void onScanResult(int callbackType, ScanResult result) {
+            BluetoothDevice device = result.getDevice();
+            if (device == null) return;
+
+            String name = readDeviceName(result);
+            if (name == null || !name.toUpperCase(Locale.US).startsWith(BLE_NAME_PREFIX)) {
+                return; // Ignora dispositivos sem prefixo CHOPP_
+            }
+
+            String foundMac = BleConfigUtils.normalizeMac(device.getAddress());
+
+            Log.w(TAG, "[FALLBACK] ✅ Dispositivo CHOPP_ encontrado!"
+                    + " | Nome=" + name
+                    + " | MAC=" + foundMac
+                    + " | RSSI=" + result.getRssi() + "dBm");
+
+            // Diagnóstico: compara o MAC encontrado com o MAC cadastrado
+            if (mTargetBleMac != null && !mTargetBleMac.equalsIgnoreCase(foundMac)) {
+                Log.w(TAG, "[FALLBACK] ⚠️ MAC DIVERGENTE!"
+                        + " | Cadastrado=" + mTargetBleMac
+                        + " | Encontrado=" + foundMac
+                        + " | Nome=" + name
+                        + " | Verifique se o esp32_mac no servidor está correto.");
+            } else {
+                Log.i(TAG, "[FALLBACK] MAC confirmado: " + foundMac
+                        + " — a placa está no ar mas não respondeu ao filtro direto."
+                        + " Possível causa: anúncio BLE com nome ativo, sem resposta ao filtro de MAC.");
+            }
+
+            mPendingConnectDevice = device;
+            broadcastDeviceFound(device);
+            pararScanFallback();
+            mFallbackScanAtivo = false;
+            mMainHandler.postDelayed(() -> executarConnectGatt(device), PRE_CONNECT_DELAY_MS);
+        }
+
+        @Override
+        public void onScanFailed(int errorCode) {
+            Log.e(TAG, "[FALLBACK] Falha no scan permissivo: errorCode=" + errorCode);
+            mScanning = false;
+            mFallbackScanAtivo = false;
+            agendarReconexao();
+        }
+    };
 
     private final ScanCallback mScanCallback = new ScanCallback() {
         @Override
@@ -375,6 +516,17 @@ public class BluetoothServiceIndustrial extends Service {
             Log.w(TAG, "[RECONNECT] 3 falhas — tentando refresh do cache GATT");
             refreshGattCache();
         }
+
+        // Após FALLBACK_SCAN_THRESHOLD falhas consecutivas de scan_timeout,
+        // ativa o modo de scan permissivo para tentar localizar a placa pelo
+        // prefixo do nome BLE (CHOPP_), independentemente do MAC cadastrado.
+        // O fallback é alternado: um ciclo normal, um ciclo fallback, e assim
+        // por diante, para não abandonar o scan preciso definitivamente.
+        if (!mFallbackScanAtivo && falhas > 0 && (falhas % FALLBACK_SCAN_THRESHOLD) == 0) {
+            Log.w(TAG, "[RECONNECT] " + falhas + " falhas acumuladas — próximo ciclo usará scan de fallback (CHOPP_)");
+            mFallbackScanAtivo = true;
+        }
+
         mMainHandler.postDelayed(this::iniciarCicloConexao, delay);
     }
 
@@ -389,6 +541,8 @@ public class BluetoothServiceIndustrial extends Service {
                 mBluetoothGatt = gatt;
                 mConnectedDevice = gatt.getDevice();
                 mFailCount.set(0);
+                // Conexão bem-sucedida: desativa o fallback para os próximos ciclos
+                mFallbackScanAtivo = false;
 
                 Log.i(TAG, "[BLE] ✅ CONECTADO! MAC=" + gatt.getDevice().getAddress()
                         + " | sem pareamento/PIN (firmware atual)");
@@ -699,6 +853,20 @@ public class BluetoothServiceIndustrial extends Service {
         if (!mScanning || mBleScanner == null) return;
         try {
             mBleScanner.stopScan(mScanCallback);
+        } catch (Exception ignored) {
+        }
+        mScanning = false;
+    }
+
+    /**
+     * Para o scan de fallback, usando o callback correto.
+     * Necessário porque o Android exige que stopScan() receba o mesmo
+     * objeto ScanCallback que foi passado para startScan().
+     */
+    private void pararScanFallback() {
+        if (!mScanning || mBleScanner == null) return;
+        try {
+            mBleScanner.stopScan(mFallbackScanCallback);
         } catch (Exception ignored) {
         }
         mScanning = false;
