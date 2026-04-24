@@ -480,11 +480,17 @@ public class PagamentoConcluido extends AppCompatActivity {
                 if (imagemUrl != null && !imagemUrl.isEmpty()) {
                     Tap tempTap = new Tap();
                     tempTap.image = imagemUrl;
-                    Bitmap bmp = new ApiHelper(this).getImage(tempTap);
+                    Bitmap bmp = new ApiHelper(getApplicationContext()).getImage(tempTap);
                     if (bmp != null) {
                         runOnUiThread(() -> {
                             if (!isFinishing() && !isDestroyed() && imageView != null) {
                                 imageView.setImageBitmap(bmp);
+                            }
+                        });
+                    } else {
+                        runOnUiThread(() -> {
+                            if (!isFinishing() && !isDestroyed() && imageView != null) {
+                                imageView.setImageResource(android.R.drawable.ic_menu_report_image);
                             }
                         });
                     }

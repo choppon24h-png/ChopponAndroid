@@ -5,8 +5,12 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.util.Log;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -78,6 +82,9 @@ import okhttp3.Response;
  */
 public class ApiHelper {
     private static final String TAG = "ApiHelper";
+    private static final String IMAGE_CACHE_DIR = "image_cache";
+    private static final int IMAGE_REQ_SIZE_PX = 720;
+    private static final long IMAGE_RETRY_DELAY_MS = 2_000L;
 
     // FIX: Evitar múltiplas chamadas simultâneas de verify_tap
     private static volatile boolean sVerifyTapInProgress = false;
@@ -85,7 +92,7 @@ public class ApiHelper {
     private Context context;
 
     public ApiHelper(Context context) {
-        this.context = context;
+        this.context = context.getApplicationContext();
     }
 
     // ── Singleton do OkHttpClient ─────────────────────────────────────────────
@@ -356,16 +363,146 @@ public class ApiHelper {
      * Baixa a imagem da bebida de forma síncrona (deve ser chamado em background thread).
      */
     public Bitmap getImage(Tap object) throws IOException {
-        if (object.image == null || object.image.isEmpty()) return null;
-        Request request = new Request.Builder().url(object.image).build();
+        if (object == null || object.image == null || object.image.trim().isEmpty()) {
+            Log.w(TAG, "[IMG] URL de imagem ausente");
+            return getLocalPlaceholder();
+        }
+        final String imageUrl = object.image.trim();
+        final File cacheFile = getImageCacheFile(imageUrl);
+        if (cacheFile.exists() && cacheFile.length() > 0) {
+            Log.d(TAG, "[IMG] Cache HIT: " + cacheFile.getAbsolutePath());
+            Bitmap cached = decodeBitmapFromFile(cacheFile);
+            if (cached != null) {
+                return cached;
+            }
+            Log.w(TAG, "[IMG] Cache corrompido, removendo arquivo: " + cacheFile.getName());
+            //noinspection ResultOfMethodCallIgnored
+            cacheFile.delete();
+        } else {
+            Log.d(TAG, "[IMG] Cache MISS para URL: " + imageUrl);
+        }
+        Bitmap downloaded = downloadAndCacheImage(imageUrl, cacheFile, false);
+        if (downloaded != null) return downloaded;
+        Log.w(TAG, "[IMG] Retry agendado em " + IMAGE_RETRY_DELAY_MS + "ms para: " + imageUrl);
+        try {
+            Thread.sleep(IMAGE_RETRY_DELAY_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            Log.w(TAG, "[IMG] Retry interrompido: " + e.getMessage());
+        }
+        downloaded = downloadAndCacheImage(imageUrl, cacheFile, true);
+        if (downloaded != null) return downloaded;
+        Log.e(TAG, "[IMG] Falha definitiva ap?s retry: " + imageUrl);
+        return getLocalPlaceholder();
+    }
+    private Bitmap downloadAndCacheImage(String imageUrl, File cacheFile, boolean retryAttempt) {
+        Request request = new Request.Builder().url(imageUrl).build();
+        String tag = retryAttempt ? "[IMG][RETRY]" : "[IMG]";
         try (Response response = getClient().newCall(request).execute()) {
-            if (!response.isSuccessful() || response.body() == null) return null;
+            if (!response.isSuccessful() || response.body() == null) {
+                Log.e(TAG, tag + " HTTP inv?lido ao baixar imagem: code=" + response.code());
+                return null;
+            }
             byte[] imageBytes = response.body().bytes();
-            BitmapFactory.Options options = new BitmapFactory.Options();
-            options.inSampleSize = 2;
-            return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.length, options);
+            if (imageBytes.length == 0) {
+                Log.e(TAG, tag + " Corpo vazio no download da imagem");
+                return null;
+            }
+            ensureParentExists(cacheFile);
+            try (FileOutputStream fos = new FileOutputStream(cacheFile, false)) {
+                fos.write(imageBytes);
+                fos.flush();
+            }
+            Log.d(TAG, tag + " Imagem salva no cache: " + cacheFile.getAbsolutePath()
+                    + " (" + imageBytes.length + " bytes)");
+            Bitmap bmp = decodeBitmapFromFile(cacheFile);
+            if (bmp == null) {
+                Log.e(TAG, tag + " Falha ao decodificar imagem salva em disco");
+            }
+            return bmp;
         } catch (Exception e) {
-            Log.e(TAG, "Erro ao baixar imagem: " + e.getMessage());
+            Log.e(TAG, tag + " Erro ao baixar imagem: " + e.getMessage());
+            return null;
+        }
+    }
+    private Bitmap decodeBitmapFromFile(File file) {
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(file.getAbsolutePath(), bounds);
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = calculateInSampleSize(bounds, IMAGE_REQ_SIZE_PX, IMAGE_REQ_SIZE_PX);
+            opts.inPreferredConfig = Bitmap.Config.RGB_565;
+            opts.inDither = true;
+            opts.inJustDecodeBounds = false;
+            Bitmap bmp = BitmapFactory.decodeFile(file.getAbsolutePath(), opts);
+            if (bmp != null) {
+                Log.d(TAG, "[IMG] Decodificada com inSampleSize=" + opts.inSampleSize
+                        + " | size=" + bmp.getWidth() + "x" + bmp.getHeight());
+            }
+            return bmp;
+        } catch (OutOfMemoryError oom) {
+            Log.e(TAG, "[IMG] OutOfMemory ao decodificar bitmap: " + oom.getMessage());
+            return null;
+        } catch (Exception e) {
+            Log.e(TAG, "[IMG] Erro ao decodificar arquivo de imagem: " + e.getMessage());
+            return null;
+        }
+    }
+    private int calculateInSampleSize(BitmapFactory.Options options, int reqWidth, int reqHeight) {
+        int height = options.outHeight;
+        int width = options.outWidth;
+        int inSampleSize = 1;
+        if (height > reqHeight || width > reqWidth) {
+            final int halfHeight = height / 2;
+            final int halfWidth = width / 2;
+            while ((halfHeight / inSampleSize) >= reqHeight
+                    && (halfWidth / inSampleSize) >= reqWidth) {
+                inSampleSize *= 2;
+            }
+        }
+        return Math.max(1, inSampleSize);
+    }
+    private File getImageCacheFile(String imageUrl) {
+        File cacheDir = new File(context.getCacheDir(), IMAGE_CACHE_DIR);
+        String fileName = sha256(imageUrl) + getExtensionFromUrl(imageUrl);
+        return new File(cacheDir, fileName);
+    }
+    private void ensureParentExists(File file) throws IOException {
+        File parent = file.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IOException("N?o foi poss?vel criar pasta de cache: " + parent.getAbsolutePath());
+        }
+    }
+    private String getExtensionFromUrl(String url) {
+        try {
+            int q = url.indexOf('?');
+            String clean = q >= 0 ? url.substring(0, q) : url;
+            int dot = clean.lastIndexOf('.');
+            if (dot > 0 && dot < clean.length() - 1) {
+                String ext = clean.substring(dot).toLowerCase();
+                if (ext.length() <= 5) return ext;
+            }
+        } catch (Exception ignored) {
+        }
+        return ".img";
+    }
+    private String sha256(String value) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(value.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : digest) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            return String.valueOf(value.hashCode());
+        }
+    }
+    private Bitmap getLocalPlaceholder() {
+        try {
+            return BitmapFactory.decodeResource(context.getResources(), android.R.drawable.ic_menu_report_image);
+        } catch (Exception e) {
+            Log.e(TAG, "[IMG] Falha ao carregar placeholder local: " + e.getMessage());
             return null;
         }
     }

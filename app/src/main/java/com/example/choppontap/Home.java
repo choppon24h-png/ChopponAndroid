@@ -684,7 +684,7 @@ public class Home extends AppCompatActivity {
                 Log.d(TAG, "carregarImagem: baixando " + url);
                 Tap tempTap = new Tap();
                 tempTap.image = url;
-                Bitmap bmp = new ApiHelper(this).getImage(tempTap);
+                Bitmap bmp = new ApiHelper(getApplicationContext()).getImage(tempTap);
 
                 if (bmp != null) {
                     Log.i(TAG, "carregarImagem: imagem carregada com sucesso");
@@ -696,6 +696,9 @@ public class Home extends AppCompatActivity {
                 } else {
                     Log.w(TAG, "carregarImagem: getImage retornou null para " + url);
                     runOnUiThread(() -> {
+                        if (!isFinishing() && !isDestroyed() && imageView != null) {
+                            imageView.setImageResource(android.R.drawable.ic_menu_report_image);
+                        }
                         if (txtBebida != null) {
                             txtBebida.setText(bebida + " (sem imagem)");
                         }
