@@ -76,6 +76,10 @@ define('SUMUP_MERCHANT_URL', 'https://api.sumup.com/v0.1/merchants/');
 define('SUMUP_AFFILIATE_KEY',    'sup_afk_bULTbTDP0leInwIXud28LYYVmYiZiKYy');
 define('SUMUP_AFFILIATE_APP_ID', 'CHOPPONALMEIDA');
 
+// Email SumUp para receber pagamentos PIX (OBRIGATÓRIO para PIX)
+// Use o email da conta SumUp autorizada
+define('SUMUP_PAY_TO_EMAIL', 'financeiro@almeida.com.br');
+
 // Configurações JWT
 define('JWT_SECRET', 'teaste');
 define('JWT_ALGORITHM', 'HS256');
