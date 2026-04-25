@@ -62,11 +62,11 @@ public final class BleConfigUtils {
         String mac = normalizeMac(wifiMac);
         if (mac == null) return null;
 
-        // Remove os ':' e pega os 4 primeiros caracteres HEX (2 bytes)
+        // Remove os ':' e pega os 4 PRIMEIROS caracteres HEX (2 bytes)
         String hex = mac.replace(":", "");
         if (hex.length() < 4) return null;
 
-        // Exemplo: "DCB4D999B8E2" → "CHOPP_DCB4"
+        // Exemplo: "48F6EE232A6C" → "CHOPP_48F6"
         return "CHOPP_" + hex.substring(0, 4).toUpperCase(Locale.US);
     }
 

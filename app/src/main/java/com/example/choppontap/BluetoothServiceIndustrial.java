@@ -404,10 +404,9 @@ public class BluetoothServiceIndustrial extends Service {
 
         List<ScanFilter> filters = new ArrayList<>();
         ScanFilter.Builder builder = new ScanFilter.Builder();
+        // Use device name for filtering (more reliable than MAC address)
         if (mExpectedBleName != null && !mExpectedBleName.isEmpty()) {
             builder.setDeviceName(mExpectedBleName);
-        } else if (mTargetBleMac != null && !mTargetBleMac.isEmpty()) {
-            builder.setDeviceAddress(mTargetBleMac);
         }
         filters.add(builder.build());
 
