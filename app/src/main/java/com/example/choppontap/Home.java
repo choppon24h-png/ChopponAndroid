@@ -106,6 +106,12 @@ public class Home extends AppCompatActivity {
      * Se o serviço reportar READY ou CONNECTED mas os botões ainda estiverem
      * desabilitados, força a atualização da UI.
      */
+    private boolean isBleReady() {
+        if (mBluetoothService == null) return false;
+        String status = mBluetoothService.getCurrentStatus();
+        return "ready".equals(status) || "connected".equals(status);
+    }
+
     private final Handler mBleWatchdogHandler = new Handler();
     private static final long BLE_WATCHDOG_INTERVAL_MS = 3_000L;
     private boolean mBleWatchdogRunning = false;
@@ -115,22 +121,17 @@ public class Home extends AppCompatActivity {
         public void run() {
             if (!mBleWatchdogRunning || isFinishing() || isDestroyed()) return;
 
-            if (mIsServiceBound && mBluetoothService != null) {
-                String currentStatus = mBluetoothService.getCurrentStatus();
-                boolean serviceReady    = currentStatus.equals("ready");
-                boolean serviceConnected = currentStatus.equals("connected");
+            if (mIsServiceBound) {
+                boolean bleOk = isBleReady();
                 boolean buttonsEnabled  = (btn100 != null && btn100.isEnabled());
 
-                if ((serviceReady || serviceConnected) && !buttonsEnabled) {
+                if (bleOk && !buttonsEnabled) {
                     // Serviço está conectado mas a UI ainda mostra desconectado
                     // Força atualização via broadcast sintético
-                    Log.w(TAG, "[WATCHDOG] ESP32 conectado (ready=" + serviceReady
-                            + " connected=" + serviceConnected
-                            + ") mas botões desabilitados — forçando atualização da UI");
-                    String status = serviceReady ? "connected" : "connected";
-                    updateBluetoothStatus(status);
+                    Log.w(TAG, "[WATCHDOG] ESP32 conectado mas botões desabilitados — forçando atualização da UI");
+                    updateBluetoothStatus("connected");
                     changeButtons(true);
-                } else if (!serviceConnected && buttonsEnabled) {
+                } else if (!bleOk && buttonsEnabled) {
                     // Serviço desconectou mas a UI ainda mostra conectado
                     Log.w(TAG, "[WATCHDOG] ESP32 desconectado mas botões habilitados — corrigindo UI");
                     updateBluetoothStatus("disconnected");
@@ -168,9 +169,11 @@ public class Home extends AppCompatActivity {
                 if (status != null) {
                     Log.d(TAG, "[BLE] Status recebido via broadcast: " + status);
                     updateBluetoothStatus(status);
-                    // Habilita os botões quando conectado ou pronto
-                    boolean enable = "connected".equals(status) || "ready".equals(status);
-                    changeButtons(enable);
+                    if (status.startsWith("disconnected")) {
+                        changeButtons(false);
+                    } else if ("ready".equals(status) || "connected".equals(status)) {
+                        changeButtons(true);
+                    }
                 }
             }
         }
@@ -197,10 +200,9 @@ public class Home extends AppCompatActivity {
         public void onServiceConnected(ComponentName name, IBinder service) {
             mBluetoothService = ((BluetoothServiceIndustrial.LocalBinder) service).getService();
             mIsServiceBound = true;
-            String status = mBluetoothService.getCurrentStatus();
-            Log.i(TAG, "BluetoothService vinculado. Estado atual: " + status);
+            Log.i(TAG, "BluetoothService vinculado. Estado atual: " + mBluetoothService.getCurrentStatus());
 
-            if (!status.equals("ready") && !status.equals("connected")) {
+            if (!isBleReady()) {
                 // Conexão direta via MAC — sem scan de 4 segundos
                 String mac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
                         .getString("esp32_mac", "");
@@ -275,8 +277,7 @@ public class Home extends AppCompatActivity {
 
         // Se já vinculado, sincroniza o estado da UI com o estado real do serviço
         if (mIsServiceBound && mBluetoothService != null) {
-            String currentStatus = mBluetoothService.getCurrentStatus();
-            if (currentStatus.equals("ready") || currentStatus.equals("connected")) {
+            if (isBleReady()) {
                 // Já conectado — garante que a UI reflita isso imediatamente
                 Log.i(TAG, "onResume: BLE já conectado — sincronizando UI");
                 updateBluetoothStatus("connected");
@@ -802,7 +803,7 @@ public class Home extends AppCompatActivity {
             Toast.makeText(this, "Sem conexão com a internet. Verifique sua rede.", Toast.LENGTH_LONG).show();
             return;
         }
-        if (mBluetoothService != null && (mBluetoothService.getCurrentStatus().equals("ready") || mBluetoothService.getCurrentStatus().equals("connected"))) {
+        if (isBleReady()) {
             int volumeMl = multiplicador * 100;
             float valor  = valorBase != null ? valorBase * multiplicador : 0f;
             Intent it = new Intent(Home.this, FormaPagamento.class);
