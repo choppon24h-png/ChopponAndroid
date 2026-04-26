@@ -1,129 +1,84 @@
 package com.example.choppontap;
 
-import android.content.Context;
-import android.content.SharedPreferences;
+import android.util.Log;
 
-import java.util.Locale;
-import java.util.UUID;
+/**
+ * BleConfigUtils — adaptado para firmware ASOARESBH/ESP32
+ *
+ * UUIDs: Nordic UART Service (NUS) padrão — 6E400001/2/3
+ * Nome BLE: CHOPP_ + 4 primeiros hex do eFuse MAC (= 2 primeiros octetos do wifiMac)
+ * Segurança: Just Works — sem PIN, sem bond
+ *
+ * Regra do nome (espelha geraNomeBle() do firmware):
+ *   ESP.getEfuseMac() armazena o MAC WiFi com bytes invertidos.
+ *   O firmware pega os 4 primeiros caracteres hex do resultado, em maiúsculas.
+ *   Equivalente em Android: pegar os 2 primeiros octetos do wifiMac da API.
+ *   Exemplo: wifiMac = "48:F6:EE:23:2A:6C" -> eFuse bytes 0,1 = 48,F6 -> nome = "CHOPP_48F6"
+ *
+ *   ATENÇÃO: o NRF Connect mostrou "CHOPP_F648" neste dispositivo específico.
+ *   Isso ocorre porque o eFuse MAC pode estar invertido dependendo do chip.
+ *   A função deriveBleNameFromWifiMac() tenta as duas variantes e usa a validação
+ *   por prefix durante o scan — o Android aceita qualquer "CHOPP_XXXX" encontrado
+ *   cujo MAC BLE bata com o esperado da API.
+ */
+public class BleConfigUtils {
 
-public final class BleConfigUtils {
-    private static final String PREF_NAME = "tap_config";
+    private static final String TAG = "BleConfigUtils";
 
-    public static final String KEY_BLE_MAC = "ble_mac";
-    public static final String KEY_WIFI_MAC = "wifi_mac";
-    public static final String KEY_BLE_NAME_EXPECTED = "ble_name_expected";
-    public static final String KEY_BLE_NAME_API = "ble_name_api";
-    public static final String KEY_PAIRING_PIN = "pairing_pin";
-    public static final String KEY_SERVICE_UUID = "ble_service_uuid";
-    public static final String KEY_RX_UUID = "ble_rx_uuid";
-    public static final String KEY_TX_UUID = "ble_tx_uuid";
-    public static final String KEY_MTU = "ble_mtu";
-    public static final String KEY_AUTO_CONNECT = "ble_auto_connect";
+    // UUIDs — Nordic UART Service (NUS) — firmware operaBLE.h
+    public static final String SERVICE_UUID           = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+    public static final String CHARACTERISTIC_UUID_RX = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+    public static final String CHARACTERISTIC_UUID_TX = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 
-    public static final String DEFAULT_PAIRING_PIN = "259087";
-    public static final String DEFAULT_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
-    public static final String DEFAULT_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
-    public static final String DEFAULT_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
-    public static final int DEFAULT_MTU = 247;
+    // Prefixo BLE — igual a BLE_NAME_PREFIX do firmware config.h
+    public static final String BLE_NAME_PREFIX = "CHOPP_";
 
-    private BleConfigUtils() {}
+    // MTU solicitado — conforme ANDROID_BLE_INTEGRACAO.md
+    public static final int MTU_REQUESTED = 247;
 
-    public static String firstNonBlank(String... values) {
-        if (values == null) return null;
-        for (String v : values) {
-            if (v != null) {
-                String trimmed = v.trim();
-                if (!trimmed.isEmpty()) {
-                    return trimmed;
-                }
-            }
-        }
-        return null;
-    }
+    // Segurança — Just Works: sem PIN, sem bond
+    public static final boolean REQUIRES_BOND = false;
+    public static final int BLE_PIN = -1;
 
-    public static String normalizeMac(String raw) {
-        if (raw == null) return null;
-        String clean = raw.trim().toUpperCase(Locale.US).replace('-', ':');
-        return clean.isEmpty() ? null : clean;
-    }
+    // Timeout de scan (ms)
+    public static final long SCAN_TIMEOUT_MS = 8000L;
 
-    /**
-     * Deriva o nome BLE esperado a partir do wifiMac retornado pela API.
-     *
-     * Regra do firmware (ESP32):
-     *   bleName = "CHOPP_" + 4 primeiros caracteres HEX do ESP.getEfuseMac()
-     *   Exemplo: wifiMac = "DC:B4:D9:99:B8:E2" → hex = "DCB4D999B8E2" → "CHOPP_DCB4"
-     *
-     * ATENÇÃO: usa os 4 primeiros hex do MAC (bytes 0 e 1 = DC e B4),
-     * NÃO os últimos. O ESP32 usa getEfuseMac() que retorna o MAC base
-     * na mesma ordem que o wifiMac da API.
-     */
+    /** Retorna o nome BLE esperado: bytes 0+1 do wifiMac em ordem direta. Ex: "48:F6:.." -> "CHOPP_48F6" */
     public static String deriveBleNameFromWifiMac(String wifiMac) {
-        String mac = normalizeMac(wifiMac);
-        if (mac == null) return null;
-
-        // Remove os ':' e pega os 4 PRIMEIROS caracteres HEX (2 bytes)
-        String hex = mac.replace(":", "");
-        if (hex.length() < 4) return null;
-
-        // Exemplo: "48F6EE232A6C" → "CHOPP_48F6"
-        return "CHOPP_" + hex.substring(0, 4).toUpperCase(Locale.US);
-    }
-
-    public static boolean isValidUuid(String raw) {
-        if (raw == null || raw.trim().isEmpty()) return false;
+        if (wifiMac == null || wifiMac.isEmpty()) return BLE_NAME_PREFIX;
         try {
-            UUID.fromString(raw.trim());
-            return true;
-        } catch (Exception ignored) {
-            return false;
+            String[] parts = wifiMac.toUpperCase().split(":");
+            if (parts.length < 2) return BLE_NAME_PREFIX;
+            return BLE_NAME_PREFIX + parts[0] + parts[1];
+        } catch (Exception e) {
+            Log.e(TAG, "Erro ao derivar nome BLE: " + e.getMessage());
+            return BLE_NAME_PREFIX;
         }
     }
 
-    public static void persistFromTap(Context context, Tap tap) {
-        if (context == null || tap == null) return;
-
-        String wifiMac = normalizeMac(firstNonBlank(tap.wifiMac, tap.wifi_mac));
-        String bleNameApi = firstNonBlank(tap.bleName, tap.ble_name);
-        String bleNameDerived = deriveBleNameFromWifiMac(wifiMac);
-        String bleNameExpected = firstNonBlank(bleNameDerived, bleNameApi);
-
-        String bleMac = normalizeMac(firstNonBlank(tap.bleMac, tap.ble_mac, tap.esp32_mac));
-
-        String pairingPin = firstNonBlank(tap.pairingPin, tap.pairing_pin, DEFAULT_PAIRING_PIN);
-
-        String serviceUuid = firstNonBlank(tap.serviceUuid, tap.service_uuid, DEFAULT_SERVICE_UUID);
-        if (!isValidUuid(serviceUuid)) serviceUuid = DEFAULT_SERVICE_UUID;
-
-        String rxUuid = firstNonBlank(tap.rxUuid, tap.rx_uuid, DEFAULT_RX_UUID);
-        if (!isValidUuid(rxUuid)) rxUuid = DEFAULT_RX_UUID;
-
-        String txUuid = firstNonBlank(tap.txUuid, tap.tx_uuid, DEFAULT_TX_UUID);
-        if (!isValidUuid(txUuid)) txUuid = DEFAULT_TX_UUID;
-
-        int mtu = (tap.mtu != null && tap.mtu > 0) ? tap.mtu : DEFAULT_MTU;
-        boolean autoConnect = firstNonBlank(
-                tap.autoConnect != null ? String.valueOf(tap.autoConnect) : null,
-                tap.auto_connect != null ? String.valueOf(tap.auto_connect) : null
-        ) != null && (Boolean.TRUE.equals(tap.autoConnect) || Boolean.TRUE.equals(tap.auto_connect));
-
-        SharedPreferences prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
-        SharedPreferences.Editor editor = prefs.edit();
-
-        if (bleMac != null) {
-            editor.putString(KEY_BLE_MAC, bleMac);
-            editor.putString("esp32_mac", bleMac);
+    /** Variante invertida (little-endian eFuse): bytes 1+0. Ex: "48:F6:.." -> "CHOPP_F648" (observado no NRF Connect) */
+    public static String deriveBleNameFromWifiMacInverted(String wifiMac) {
+        if (wifiMac == null || wifiMac.isEmpty()) return BLE_NAME_PREFIX;
+        try {
+            String[] parts = wifiMac.toUpperCase().split(":");
+            if (parts.length < 2) return BLE_NAME_PREFIX;
+            return BLE_NAME_PREFIX + parts[1] + parts[0];
+        } catch (Exception e) {
+            Log.e(TAG, "Erro ao derivar nome BLE invertido: " + e.getMessage());
+            return BLE_NAME_PREFIX;
         }
-        if (wifiMac != null) editor.putString(KEY_WIFI_MAC, wifiMac);
-        if (bleNameExpected != null) editor.putString(KEY_BLE_NAME_EXPECTED, bleNameExpected.toUpperCase(Locale.US));
-        if (bleNameApi != null) editor.putString(KEY_BLE_NAME_API, bleNameApi.toUpperCase(Locale.US));
+    }
 
-        editor.putString(KEY_PAIRING_PIN, pairingPin);
-        editor.putString(KEY_SERVICE_UUID, serviceUuid.toUpperCase(Locale.US));
-        editor.putString(KEY_RX_UUID, rxUuid.toUpperCase(Locale.US));
-        editor.putString(KEY_TX_UUID, txUuid.toUpperCase(Locale.US));
-        editor.putInt(KEY_MTU, mtu);
-        editor.putBoolean(KEY_AUTO_CONNECT, autoConnect);
-        editor.apply();
+    /** Retorna true se o nome comecar com CHOPP_ (pertence ao firmware). */
+    public static boolean isChoppDevice(String deviceName) {
+        return deviceName != null && deviceName.toUpperCase().startsWith(BLE_NAME_PREFIX);
+    }
+
+    /** Testa as duas variantes (direta e invertida) do nome derivado do wifiMac. */
+    public static boolean matchesBleNameForMac(String foundName, String wifiMac) {
+        if (foundName == null || wifiMac == null) return false;
+        String upper = foundName.toUpperCase();
+        return upper.equals(deriveBleNameFromWifiMac(wifiMac).toUpperCase())
+            || upper.equals(deriveBleNameFromWifiMacInverted(wifiMac).toUpperCase());
     }
 }
