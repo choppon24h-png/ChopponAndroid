@@ -121,34 +121,26 @@ public class PagamentoConcluido extends AppCompatActivity {
             final String action = intent.getAction();
             if (action == null) return;
 
-            switch (action) {
-                case BluetoothServiceIndustrial.ACTION_WRITE_READY:
-                Log.i(TAG, "[BLE] ACTION_WRITE_READY recebido — BLE pronto");
-                atualizarStatus("Dispositivo pronto. Liberando...");
-                mMainHandler.postDelayed(() -> {
-                    if (!mLiberacaoFinalizada && liberado == 0) {
-                        mComandoEnviado = false;
-                        iniciarVendaEEnfileirar();
-                    }
-                }, ML_SEND_DELAY_MS);
-                break;
-
-                case BluetoothServiceIndustrial.ACTION_CONNECTION_STATUS:
-                    String status = intent.getStringExtra(BluetoothServiceIndustrial.EXTRA_STATUS);
-                    if (status != null && status.startsWith("disconnected")) {
-                        atualizarStatus("Reconectando...");
-                        cancelarWatchdog();
-                    } else if ("connected".equals(status)) {
-                        atualizarStatus("Conectado. Aguardando BLE pronto...");
-                    } else if ("ready".equals(status)) {
-                        atualizarStatus("Dispositivo pronto.");
-                    }
-                    break;
-
-                case BluetoothServiceIndustrial.ACTION_DATA_AVAILABLE:
-                    String data = intent.getStringExtra(BluetoothServiceIndustrial.EXTRA_DATA);
-                    if (data != null) processarMensagem(data.trim());
-                    break;
+            if (BluetoothServiceIndustrial.BLE_STATUS_ACTION.equals(action)) {
+                String status = intent.getStringExtra("status");
+                if (status != null && status.startsWith("disconnected")) {
+                    atualizarStatus("Reconectando...");
+                    cancelarWatchdog();
+                } else if ("connected".equals(status)) {
+                    atualizarStatus("Conectado. Aguardando BLE pronto...");
+                } else if ("ready".equals(status)) {
+                    atualizarStatus("Dispositivo pronto.");
+                    // Dispara envio do comando ao ficar pronto
+                    mMainHandler.postDelayed(() -> {
+                        if (!mLiberacaoFinalizada && liberado == 0) {
+                            mComandoEnviado = false;
+                            iniciarVendaEEnfileirar();
+                        }
+                    }, ML_SEND_DELAY_MS);
+                }
+            } else if (BluetoothServiceIndustrial.BLE_DATA_ACTION.equals(action)) {
+                String data = intent.getStringExtra("data");
+                if (data != null) processarMensagem(data.trim());
             }
         }
     };
@@ -249,23 +241,22 @@ public class PagamentoConcluido extends AppCompatActivity {
             return;
         }
         String command = "$ML:" + volumeMl;
-        Log.i(TAG, "[BLE] Enviando: " + command + " | BLE estado=" + mBluetoothService.getState().name());
-        if (mBluetoothService.isReady()) {
+        String status = mBluetoothService.getCurrentStatus();
+        Log.i(TAG, "[BLE] Enviando: " + command + " | BLE status=" + status);
+        if (status.equals("ready")) {
             mComandoEnviado = true;
-            boolean ok = mBluetoothService.write(command);
+            boolean ok = mBluetoothService.sendCommand(command);
             if (ok) {
                 atualizarStatus("Enviando comando de liberacao...");
-                Log.i(TAG, "[BLE] write() OK — $ML enviado imediatamente");
+                Log.i(TAG, "[BLE] sendCommand() OK — $ML enviado imediatamente");
             } else {
-                Log.e(TAG, "[BLE] write() falhou com isReady()=true — usando pendente");
+                Log.e(TAG, "[BLE] sendCommand() falhou mesmo com ready=true");
                 mComandoEnviado = false;
-                mBluetoothService.enqueueServeCommand(volumeMl, checkout_id);
                 atualizarStatus("Aguardando conexao BLE...");
             }
         } else {
-            Log.w(TAG, "[BLE] BLE nao READY — armazenando $ML como pendente no service");
+            Log.w(TAG, "[BLE] BLE nao READY (status=" + status + ") — aguardando ready");
             mComandoEnviado = false;
-            mBluetoothService.enqueueServeCommand(volumeMl, checkout_id);
             atualizarStatus("Aguardando conexao BLE...");
         }
     }
@@ -326,7 +317,7 @@ public class PagamentoConcluido extends AppCompatActivity {
                     @Override
                     public void onSessionStarted(String sessionId, String checkoutId) {
                         Log.i(TAG, "[SESSION] Sessao iniciada | session_id=" + sessionId);
-                        // Protocolo NUS v4.0: envia $ML diretamente, sem READY/SERVE
+                        // Protocolo NUS v4.0: envia $ML diretamente quando a sessão é iniciada
                         enviarComandoML(qtd_ml);
                     }
                     @Override
@@ -340,7 +331,8 @@ public class PagamentoConcluido extends AppCompatActivity {
                 });
             }
 
-            Log.i(TAG, "[PAYMENT] onServiceConnected | BLE estado=" + mBluetoothService.getState().name());
+            String status = mBluetoothService.getCurrentStatus();
+            Log.i(TAG, "[PAYMENT] onServiceConnected | BLE status=" + status);
             mMainHandler.postDelayed(() -> iniciarVendaEEnfileirar(), ML_SEND_DELAY_MS);
         }
         @Override
@@ -395,9 +387,8 @@ public class PagamentoConcluido extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         IntentFilter filter = new IntentFilter();
-        filter.addAction(BluetoothServiceIndustrial.ACTION_CONNECTION_STATUS);
-        filter.addAction(BluetoothServiceIndustrial.ACTION_DATA_AVAILABLE);
-        filter.addAction(BluetoothServiceIndustrial.ACTION_WRITE_READY);
+        filter.addAction(BluetoothServiceIndustrial.BLE_STATUS_ACTION);
+        filter.addAction(BluetoothServiceIndustrial.BLE_DATA_ACTION);
         LocalBroadcastManager.getInstance(this).registerReceiver(mServiceUpdateReceiver, filter);
     }
 

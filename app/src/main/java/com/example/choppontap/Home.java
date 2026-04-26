@@ -116,8 +116,9 @@ public class Home extends AppCompatActivity {
             if (!mBleWatchdogRunning || isFinishing() || isDestroyed()) return;
 
             if (mIsServiceBound && mBluetoothService != null) {
-                boolean serviceReady    = mBluetoothService.isReady();
-                boolean serviceConnected = mBluetoothService.connected();
+                String currentStatus = mBluetoothService.getCurrentStatus();
+                boolean serviceReady    = currentStatus.equals("ready");
+                boolean serviceConnected = currentStatus.equals("connected");
                 boolean buttonsEnabled  = (btn100 != null && btn100.isEnabled());
 
                 if ((serviceReady || serviceConnected) && !buttonsEnabled) {
@@ -162,8 +163,8 @@ public class Home extends AppCompatActivity {
     private final BroadcastReceiver mServiceUpdateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (BluetoothServiceIndustrial.ACTION_CONNECTION_STATUS.equals(intent.getAction())) {
-                String status = intent.getStringExtra(BluetoothServiceIndustrial.EXTRA_STATUS);
+            if (BluetoothServiceIndustrial.BLE_STATUS_ACTION.equals(intent.getAction())) {
+                String status = intent.getStringExtra("status");
                 if (status != null) {
                     Log.d(TAG, "[BLE] Status recebido via broadcast: " + status);
                     updateBluetoothStatus(status);
@@ -196,10 +197,10 @@ public class Home extends AppCompatActivity {
         public void onServiceConnected(ComponentName name, IBinder service) {
             mBluetoothService = ((BluetoothServiceIndustrial.LocalBinder) service).getService();
             mIsServiceBound = true;
-            Log.i(TAG, "BluetoothService vinculado. Estado atual: "
-                    + (mBluetoothService.connected() ? "CONECTADO" : "DESCONECTADO"));
+            String status = mBluetoothService.getCurrentStatus();
+            Log.i(TAG, "BluetoothService vinculado. Estado atual: " + status);
 
-            if (!mBluetoothService.connected()) {
+            if (!status.equals("ready") && !status.equals("connected")) {
                 // Conexão direta via MAC — sem scan de 4 segundos
                 String mac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
                         .getString("esp32_mac", "");
@@ -266,7 +267,7 @@ public class Home extends AppCompatActivity {
         secretClickCount = 0;
 
         // Registra o receiver para receber broadcasts de status BLE
-        IntentFilter filter = new IntentFilter(BluetoothServiceIndustrial.ACTION_CONNECTION_STATUS);
+        IntentFilter filter = new IntentFilter(BluetoothServiceIndustrial.BLE_STATUS_ACTION);
         LocalBroadcastManager.getInstance(this).registerReceiver(mServiceUpdateReceiver, filter);
 
         // Inicia o watchdog de fallback BLE
@@ -274,7 +275,8 @@ public class Home extends AppCompatActivity {
 
         // Se já vinculado, sincroniza o estado da UI com o estado real do serviço
         if (mIsServiceBound && mBluetoothService != null) {
-            if (mBluetoothService.isReady() || mBluetoothService.connected()) {
+            String currentStatus = mBluetoothService.getCurrentStatus();
+            if (currentStatus.equals("ready") || currentStatus.equals("connected")) {
                 // Já conectado — garante que a UI reflita isso imediatamente
                 Log.i(TAG, "onResume: BLE já conectado — sincronizando UI");
                 updateBluetoothStatus("connected");
@@ -802,7 +804,7 @@ public class Home extends AppCompatActivity {
             Toast.makeText(this, "Sem conexão com a internet. Verifique sua rede.", Toast.LENGTH_LONG).show();
             return;
         }
-        if (mBluetoothService != null && mBluetoothService.connected()) {
+        if (mBluetoothService != null && (mBluetoothService.getCurrentStatus().equals("ready") || mBluetoothService.getCurrentStatus().equals("connected"))) {
             int volumeMl = multiplicador * 100;
             float valor  = valorBase != null ? valorBase * multiplicador : 0f;
             Intent it = new Intent(Home.this, FormaPagamento.class);

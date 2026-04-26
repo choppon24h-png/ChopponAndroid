@@ -69,8 +69,8 @@ public class CalibrarPulsos extends AppCompatActivity {
             final String action = intent.getAction();
             if (action == null) return;
 
-            if (BluetoothServiceIndustrial.ACTION_CONNECTION_STATUS.equals(action)) {
-                String status = intent.getStringExtra(BluetoothServiceIndustrial.EXTRA_STATUS);
+            if (BluetoothServiceIndustrial.BLE_STATUS_ACTION.equals(action)) {
+                String status = intent.getStringExtra("status");
                 if (status == null) return;
                 Log.d(TAG, "Status BLE: " + status);
 
@@ -81,7 +81,7 @@ public class CalibrarPulsos extends AppCompatActivity {
                     if (contextView != null) {
                         Snackbar.make(contextView, "TAP Desconectada", Snackbar.LENGTH_SHORT)
                                 .setAction("Conectar", v -> {
-                                    if (mBluetoothService != null) mBluetoothService.scanLeDevice(true);
+                                    if (mBluetoothService != null && mDeviceMac != null) mBluetoothService.connectWithMac(mDeviceMac);
                                 }).show();
                     }
                 } else if (status.equals("connected") || status.equals("ready")) {
@@ -90,8 +90,8 @@ public class CalibrarPulsos extends AppCompatActivity {
                     if (mBluetoothService != null) mBluetoothService.write("$PL:0");
                 }
 
-            } else if (BluetoothServiceIndustrial.ACTION_DATA_AVAILABLE.equals(action)) {
-                String receivedData = intent.getStringExtra(BluetoothServiceIndustrial.EXTRA_DATA);
+            } else if (BluetoothServiceIndustrial.BLE_DATA_ACTION.equals(action)) {
+                String receivedData = intent.getStringExtra("data");
                 if (receivedData == null) return;
                 Log.d(TAG, "Dado BLE recebido: " + receivedData);
 
@@ -128,15 +128,10 @@ public class CalibrarPulsos extends AppCompatActivity {
                     );
                 }
 
-            } else if (BluetoothServiceIndustrial.ACTION_DEVICE_FOUND.equals(action)) {
-                BluetoothDevice device;
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    device = intent.getParcelableExtra(BluetoothServiceIndustrial.EXTRA_DEVICE, BluetoothDevice.class);
-                } else {
-                    device = intent.getParcelableExtra(BluetoothServiceIndustrial.EXTRA_DEVICE);
-                }
+            } else if (BluetoothServiceIndustrial.BLE_DATA_ACTION.equals(action)) {
+                String device = intent.getStringExtra("device");
                 if (device != null) {
-                    Log.d(TAG, "Dispositivo em alcance: " + device.getAddress());
+                    Log.d(TAG, "Dispositivo em alcance: " + device);
                 }
             }
         }
@@ -151,15 +146,16 @@ public class CalibrarPulsos extends AppCompatActivity {
             BluetoothServiceIndustrial.LocalBinder binder = (BluetoothServiceIndustrial.LocalBinder) service;
             mBluetoothService = binder.getService();
             mIsServiceBound = true;
-            Log.d(TAG, "BluetoothService vinculado. Conectado: " + mBluetoothService.connected());
+            String status = mBluetoothService.getCurrentStatus();
+            Log.d(TAG, "BluetoothService vinculado. Status: " + status);
 
-            if (mBluetoothService.connected()) {
+            if (status.equals("ready") || status.equals("connected")) {
                 changeButtons(true);
                 // Protocolo NUS v4.0: $PL:0 consulta pulsos/litro atuais
-                mBluetoothService.write("$PL:0");
+                mBluetoothService.sendCommand("$PL:0");
             } else {
                 changeButtons(false);
-                mBluetoothService.scanLeDevice(true);
+                if (mDeviceMac != null) mBluetoothService.connectWithMac(mDeviceMac);
             }
         }
 
@@ -230,7 +226,7 @@ public class CalibrarPulsos extends AppCompatActivity {
                 int qtd = (pulsosAtual * 100) / volumeAferido;
                 Log.d(TAG, "Calibrando: pulsosAtual=" + pulsosAtual + " volumeAferido=" + volumeAferido + " novosPL=" + qtd);
                 // Protocolo NUS v4.0: $PL:<novos_pulsos>
-                if (mBluetoothService != null) mBluetoothService.write("$PL:" + qtd);
+                if (mBluetoothService != null) mBluetoothService.sendCommand("$PL:" + qtd);
             } catch (NumberFormatException e) {
                 Toast.makeText(this, "Valor invalido", Toast.LENGTH_SHORT).show();
             } catch (Exception e) {
@@ -242,7 +238,7 @@ public class CalibrarPulsos extends AppCompatActivity {
         // Liberar líquido: envia $ML:100 (libera 100ml para teste)
         btnLiberar.setOnClickListener(v -> {
             Log.d(TAG, "Enviando $ML:100 para teste de fluxo");
-            if (mBluetoothService != null) mBluetoothService.write("$ML:100");
+            if (mBluetoothService != null) mBluetoothService.sendCommand("$ML:100");
         });
 
         // Liberação contínua: alterna entre $LB: (iniciar) e $ML:0 (parar)
@@ -250,12 +246,12 @@ public class CalibrarPulsos extends AppCompatActivity {
             if (mBluetoothService == null) return;
             if (!mLiberacaoContinuaAtiva) {
                 Log.d(TAG, "Iniciando liberacao continua com $LB:");
-                mBluetoothService.write("$LB:");
+                mBluetoothService.sendCommand("$LB:");
                 mLiberacaoContinuaAtiva = true;
                 btnLiberacaoContinua.setText("Parar liberacao");
             } else {
                 Log.d(TAG, "Parando liberacao continua com $ML:0");
-                mBluetoothService.write("$ML:0");
+                mBluetoothService.sendCommand("$ML:0");
                 mLiberacaoContinuaAtiva = false;
                 btnLiberacaoContinua.setText("Liberacao continua");
             }
@@ -281,9 +277,8 @@ public class CalibrarPulsos extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         IntentFilter filter = new IntentFilter();
-        filter.addAction(BluetoothServiceIndustrial.ACTION_CONNECTION_STATUS);
-        filter.addAction(BluetoothServiceIndustrial.ACTION_DEVICE_FOUND);
-        filter.addAction(BluetoothServiceIndustrial.ACTION_DATA_AVAILABLE);
+        filter.addAction(BluetoothServiceIndustrial.BLE_STATUS_ACTION);
+        filter.addAction(BluetoothServiceIndustrial.BLE_DATA_ACTION);
         LocalBroadcastManager.getInstance(this).registerReceiver(mServiceUpdateReceiver, filter);
         Log.d(TAG, "onResume — receiver registrado");
     }
