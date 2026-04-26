@@ -364,7 +364,12 @@ public class Imei extends AppCompatActivity {
                             showMessage("Conectado com sucesso!", Snackbar.LENGTH_SHORT);
                             updateStatusText("Conectado!");
 
-                            BleConfigUtils.persistFromTap(Imei.this, tap);
+                            if (tap.esp32_mac != null) {
+                                getSharedPreferences("tap_config", Context.MODE_PRIVATE)
+                                        .edit()
+                                        .putString("esp32_mac", tap.esp32_mac)
+                                        .apply();
+                            }
 
                             // Verifica se a TAP está desativada
                             if (tap.tap_status != null && tap.tap_status == 0) {
