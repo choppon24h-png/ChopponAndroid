@@ -1,202 +1,148 @@
 package com.example.choppontap;
 
+import android.util.Log;
+
 /**
- * ═══════════════════════════════════════════════════════════════════════════════
- * BleCommand.java — Representação de um comando BLE para o ESP32
- * ═══════════════════════════════════════════════════════════════════════════════
+ * BleCommand - Protocolo simples compativel com firmware ASOARESBH/ESP32
  *
- * Versão: 4.0-NUS
- * Protocolo: Nordic UART Service (NUS) — Firmware ESP32 operacional.cpp
+ * Protocolo definido em operacional.cpp / operaBLE.cpp:
  *
- * Comandos suportados:
- *   $ML:<volume_ml>    — Liberar volume em mL
- *   $PL:<pulsos>       — Configurar pulsos/litro
- *   $TO:<timeout_ms>   — Configurar timeout
- *   $LB:               — Liberação contínua
+ *   Android -> ESP32:
+ *     PING         -- keepalive (sem prefixo $)
+ *     $ML:<ml>     -- libera quantidade em mL  ex: "$ML:300"
+ *     $LB:         -- libera fluxo continuo
+ *     $PL:<pulsos> -- configura pulsos por litro
+ *     $TO:<ms>     -- configura timeout do sensor
  *
- * NÃO existe mais: HMAC, SESSION_ID, CMD_ID, AUTH, SERVE, STOP, STATUS, PING
+ *   ESP32 -> Android:
+ *     PONG         -- resposta ao PING
+ *     OK           -- comando aceito
+ *     ERRO         -- comando invalido
+ *     VP:<ml>      -- volume parcial durante liberacao (notificacao a cada 2s)
+ *     QP:<pulsos>  -- quantidade de pulsos ao final
+ *     ML:<ml>      -- volume final liberado (conclusao da operacao)
+ *
+ * Todos os comandos exceto PING devem iniciar com '$'.
+ * O separador e ':' (nao ',').
  */
 public class BleCommand {
 
-    private static final String TAG = "BLE_COMMAND";
+    private static final String TAG = "BleCommand";
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Tipos de comando
-    // ═══════════════════════════════════════════════════════════════════════════
+    // Prefixos de comando (conforme config.h do firmware)
+    public static final String CMD_ML   = "$ML:";  // libera mL
+    public static final String CMD_LB   = "$LB:";  // libera continuo
+    public static final String CMD_PL   = "$PL:";  // pulsos/litro
+    public static final String CMD_TO   = "$TO:";  // timeout sensor
+    public static final String CMD_PING = "PING";  // keepalive (sem $)
 
-    public enum Type {
-        /** $ML:<volume_ml> — Liberar volume em mL */
-        ML,
-        /** $PL:<pulsos> — Configurar/consultar pulsos/litro */
-        PL,
-        /** $TO:<timeout_ms> — Configurar/consultar timeout */
-        TO,
-        /** $LB: — Liberação contínua */
-        LB,
-        /** Comando genérico (string livre) */
-        RAW
-    }
+    // Prefixos de resposta (ESP32 -> Android)
+    public static final String RESP_PONG = "PONG";
+    public static final String RESP_OK   = "OK";
+    public static final String RESP_ERRO = "ERRO";
+    public static final String RESP_VP   = "VP:";   // volume parcial
+    public static final String RESP_QP   = "QP:";   // quantidade pulsos
+    public static final String RESP_ML   = "ML:";   // volume final
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Estados do comando
-    // ═══════════════════════════════════════════════════════════════════════════
+    // -------------------------------------------------------------------------
+    // Construtores de comandos
+    // -------------------------------------------------------------------------
 
-    public enum State {
-        /** Criado, aguardando envio */
-        PENDING,
-        /** Enviado ao ESP32 via BLE */
-        SENT,
-        /** ESP32 respondeu OK */
-        ACCEPTED,
-        /** ESP32 respondeu ERRO */
-        ERROR,
-        /** Liberação concluída (recebeu ML:) */
-        DONE,
-        /** Cancelado */
-        CANCELLED
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Campos
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /** Tipo do comando */
-    public final Type type;
-
-    /** Identificador de sessão (para rastreamento no app — não enviado ao ESP32) */
-    public final String sessionId;
-
-    /** Valor numérico do comando (volume em mL, pulsos, timeout, etc.) */
-    public final int value;
-
-    /** String bruta do comando (para tipo RAW) */
-    public final String rawCommand;
-
-    /** Estado atual do comando */
-    public State state;
-
-    /** Timestamp de criação */
-    public final long createdAt;
-
-    /** Timestamp de envio */
-    public long sentAt;
-
-    /** Timestamp de conclusão */
-    public long completedAt;
-
-    /** Volume real reportado pelo ESP32 (campo ML:) */
-    public int mlReal = 0;
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Construtores
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /**
-     * Construtor principal para comandos tipados.
-     *
-     * @param type      tipo do comando
-     * @param sessionId identificador de sessão (pode ser null)
-     * @param value     valor numérico do comando
-     */
-    public BleCommand(Type type, String sessionId, int value) {
-        this.type = type;
-        this.sessionId = sessionId;
-        this.value = value;
-        this.rawCommand = null;
-        this.state = State.PENDING;
-        this.createdAt = System.currentTimeMillis();
+    /** Comando PING -- keepalive, enviar a cada 5 segundos em estado READY */
+    public static String buildPing() {
+        return CMD_PING;
     }
 
     /**
-     * Construtor para comandos RAW (string livre).
-     *
-     * @param rawCommand string do comando a enviar
+     * Comando de liberacao de volume em mL.
+     * Ex: buildServe(300) -> "$ML:300"
      */
-    public BleCommand(String rawCommand) {
-        this.type = Type.RAW;
-        this.sessionId = null;
-        this.value = 0;
-        this.rawCommand = rawCommand;
-        this.state = State.PENDING;
-        this.createdAt = System.currentTimeMillis();
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Builders de conveniência
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /**
-     * Cria comando de liberação de volume.
-     * Formato BLE: $ML:<volumeMl>
-     */
-    public static BleCommand buildMl(int volumeMl, String sessionId) {
-        return new BleCommand(Type.ML, sessionId, volumeMl);
-    }
-
-    /**
-     * Cria comando de liberação contínua.
-     * Formato BLE: $LB:
-     */
-    public static BleCommand buildLb(String sessionId) {
-        return new BleCommand(Type.LB, sessionId, 0);
-    }
-
-    /**
-     * Cria comando de configuração de pulsos/litro.
-     * Formato BLE: $PL:<pulsos>
-     */
-    public static BleCommand buildPl(int pulsos) {
-        return new BleCommand(Type.PL, null, pulsos);
-    }
-
-    /**
-     * Cria comando de configuração de timeout.
-     * Formato BLE: $TO:<timeout>
-     */
-    public static BleCommand buildTo(int timeout) {
-        return new BleCommand(Type.TO, null, timeout);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Serialização para BLE
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /**
-     * Retorna a string de comando pronta para envio ao ESP32 via BLE.
-     */
-    public String toBleString() {
-        switch (type) {
-            case ML:  return "$ML:" + value;
-            case PL:  return "$PL:" + value;
-            case TO:  return "$TO:" + value;
-            case LB:  return "$LB:";
-            case RAW: return rawCommand != null ? rawCommand : "";
-            default:  return "";
+    public static String buildServe(int ml) {
+        if (ml <= 0) {
+            Log.w(TAG, "buildServe: ml invalido (" + ml + "), ignorado");
+            return null;
         }
+        return CMD_ML + ml;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Utilitários
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /** Retorna true se o comando está em estado terminal (DONE ou ERROR). */
-    public boolean isTerminal() {
-        return state == State.DONE || state == State.ERROR;
+    /** Comando de liberacao continua. */
+    public static String buildLiberar() {
+        return CMD_LB;
     }
 
-    /** Retorna true se o comando expirou (mais de 30s sem resposta). */
-    public boolean isExpired() {
-        return (System.currentTimeMillis() - createdAt) > 30_000L;
+    /** Comando de configuracao de pulsos por litro. */
+    public static String buildSetPulsos(int pulsosPorLitro) {
+        if (pulsosPorLitro <= 0) return null;
+        return CMD_PL + pulsosPorLitro;
     }
 
-    @Override
-    public String toString() {
-        return "BleCommand{" +
-                "type=" + type +
-                ", value=" + value +
-                ", state=" + state +
-                ", sessionId='" + sessionId + '\'' +
-                ", ble='" + toBleString() + '\'' +
-                '}';
+    /** Comando de configuracao do timeout do sensor (ms). */
+    public static String buildSetTimeout(int timeoutMs) {
+        if (timeoutMs <= 0) return null;
+        return CMD_TO + timeoutMs;
+    }
+
+    // -------------------------------------------------------------------------
+    // Parser de respostas recebidas via BLE (ESP32 -> Android)
+    // -------------------------------------------------------------------------
+
+    public static class Response {
+        public enum Type {
+            PONG,
+            OK,
+            ERRO,
+            VOLUME_PARCIAL,    // VP:<ml>
+            PULSOS_FINAL,      // QP:<pulsos>
+            VOLUME_FINAL,      // ML:<ml>
+            DESCONHECIDO
+        }
+
+        public final Type   type;
+        public final String raw;
+        public final float  value;   // para VP, QP, ML
+
+        public Response(Type type, String raw, float value) {
+            this.type  = type;
+            this.raw   = raw;
+            this.value = value;
+        }
+
+        public boolean isPong()          { return type == Type.PONG; }
+        public boolean isOk()            { return type == Type.OK; }
+        public boolean isErro()          { return type == Type.ERRO; }
+        public boolean isVolumeParcial() { return type == Type.VOLUME_PARCIAL; }
+        public boolean isVolumeFinal()   { return type == Type.VOLUME_FINAL; }
+        public boolean isPulsosFinal()   { return type == Type.PULSOS_FINAL; }
+    }
+
+    /**
+     * Parseia uma string recebida via notificacao BLE.
+     * O firmware termina cada mensagem com '\n' -- trim() remove o '\n'.
+     */
+    public static Response parse(String raw) {
+        if (raw == null) return new Response(Response.Type.DESCONHECIDO, "", 0);
+        String msg = raw.trim();
+
+        if (msg.equals(RESP_PONG)) return new Response(Response.Type.PONG,          msg, 0);
+        if (msg.equals(RESP_OK))   return new Response(Response.Type.OK,            msg, 0);
+        if (msg.equals(RESP_ERRO)) return new Response(Response.Type.ERRO,          msg, 0);
+
+        if (msg.startsWith(RESP_VP)) {
+            return new Response(Response.Type.VOLUME_PARCIAL, msg, parseFloat(msg.substring(RESP_VP.length())));
+        }
+        if (msg.startsWith(RESP_QP)) {
+            return new Response(Response.Type.PULSOS_FINAL,   msg, parseFloat(msg.substring(RESP_QP.length())));
+        }
+        if (msg.startsWith(RESP_ML)) {
+            return new Response(Response.Type.VOLUME_FINAL,   msg, parseFloat(msg.substring(RESP_ML.length())));
+        }
+
+        Log.w(TAG, "Resposta desconhecida: " + msg);
+        return new Response(Response.Type.DESCONHECIDO, msg, 0);
+    }
+
+    private static float parseFloat(String s) {
+        try   { return Float.parseFloat(s.trim()); }
+        catch (NumberFormatException e) { return 0f; }
     }
 }
