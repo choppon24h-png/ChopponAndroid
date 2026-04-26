@@ -511,13 +511,11 @@ public class Home extends AppCompatActivity {
                             + " tap_status=" + tap.tap_status
                             + " esp32_mac=" + tap.esp32_mac);
 
-                    BleConfigUtils.persistFromTap(Home.this, tap);
-                    String bleMac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
-                            .getString(BleConfigUtils.KEY_BLE_MAC,
-                                    getSharedPreferences("tap_config", Context.MODE_PRIVATE)
-                                            .getString("esp32_mac", ""));
-                    if (mBluetoothService != null) {
-                        mBluetoothService.salvarMacExterno(bleMac);
+                    if (tap.esp32_mac != null) {
+                        getSharedPreferences("tap_config", Context.MODE_PRIVATE)
+                                .edit()
+                                .putString("esp32_mac", tap.esp32_mac)
+                                .apply();
                     }
 
                     boolean cartaoHabilitado = (tap.cartao != null) && tap.cartao;
@@ -843,7 +841,7 @@ public class Home extends AppCompatActivity {
         runOnUiThread(() -> {
             Log.i(TAG, "TAP desativada → desconectando BT e navegando para OfflineTap");
             if (mIsServiceBound && mBluetoothService != null) {
-                mBluetoothService.disconnect();
+                mBluetoothService.disconnect(true);
             }
             Intent intent = new Intent(Home.this, OfflineTap.class);
             intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP
