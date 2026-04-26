@@ -81,13 +81,17 @@ public class CalibrarPulsos extends AppCompatActivity {
                     if (contextView != null) {
                         Snackbar.make(contextView, "TAP Desconectada", Snackbar.LENGTH_SHORT)
                                 .setAction("Conectar", v -> {
-                                    if (mBluetoothService != null && mDeviceMac != null) mBluetoothService.connectWithMac(mDeviceMac);
+                                    if (mBluetoothService != null) {
+                                        String mac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
+                                                .getString("esp32_mac", "");
+                                        if (mac != null && !mac.isEmpty()) mBluetoothService.connectWithMac(mac);
+                                    }
                                 }).show();
                     }
                 } else if (status.equals("connected") || status.equals("ready")) {
                     changeButtons(true);
                     // Solicita valor atual de pulsos ao conectar
-                    if (mBluetoothService != null) mBluetoothService.write("$PL:0");
+                    if (mBluetoothService != null) mBluetoothService.sendCommand("$PL:0");
                 }
 
             } else if (BluetoothServiceIndustrial.BLE_DATA_ACTION.equals(action)) {
@@ -155,7 +159,9 @@ public class CalibrarPulsos extends AppCompatActivity {
                 mBluetoothService.sendCommand("$PL:0");
             } else {
                 changeButtons(false);
-                if (mDeviceMac != null) mBluetoothService.connectWithMac(mDeviceMac);
+                String mac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
+                        .getString("esp32_mac", "");
+                if (mac != null && !mac.isEmpty()) mBluetoothService.connectWithMac(mac);
             }
         }
 
