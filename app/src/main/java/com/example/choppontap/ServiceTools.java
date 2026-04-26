@@ -122,7 +122,7 @@ public class ServiceTools extends AppCompatActivity {
             mIsServiceBound = true;
             Log.i(TAG, "BluetoothService vinculado ao ServiceTools");
             runOnUiThread(() -> {
-                boolean conectado = mBluetoothService.connected();
+                boolean conectado = mBluetoothService.getCurrentStatus().equals("ready") || mBluetoothService.getCurrentStatus().equals("connected");
                 txtInfoBluetooth.setText("Bluetooth: " + (conectado ? "Conectado ao ESP32" : "Desconectado"));
                 // Atualiza o card BLE with the status de conexão real
                 atualizarStatusBle(conectado);
@@ -707,7 +707,7 @@ public class ServiceTools extends AppCompatActivity {
     private void desconectarBluetooth() {
         if (mIsServiceBound && mBluetoothService != null) {
             Log.i(TAG, "Desconectando Bluetooth (TAP desativada)");
-            mBluetoothService.disconnect();
+            mBluetoothService.disconnect(true);
         } else {
             Log.w(TAG, "BluetoothService não vinculado — não foi possível desconectar");
         }
@@ -719,7 +719,9 @@ public class ServiceTools extends AppCompatActivity {
     private void reconectarBluetooth() {
         if (mIsServiceBound && mBluetoothService != null) {
             Log.i(TAG, "Iniciando reconexão Bluetooth (TAP ativada)");
-            mBluetoothService.scanLeDevice(true);
+            String mac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
+                    .getString("esp32_mac", "");
+            mBluetoothService.connectWithMac(mac);
         } else {
             Log.w(TAG, "BluetoothService não vinculado — Home fará a reconexão no onCreate()");
         }
@@ -793,7 +795,7 @@ public class ServiceTools extends AppCompatActivity {
             txtBleStatus.setText("● CONECTADO");
             txtBleStatus.setTextColor(android.graphics.Color.parseColor("#4CAF50"));
             // Atualiza o MAC se ainda não estava salvo (conexão feita antes de abrir ServiceTools)
-            if (mBluetoothService != null && mBluetoothService.connected()) {
+            if (mBluetoothService != null && (mBluetoothService.getCurrentStatus().equals("ready") || mBluetoothService.getCurrentStatus().equals("connected"))) {
                 String mac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
                         .getString("esp32_mac", null);
                 if (mac != null && txtBleMac != null) {
