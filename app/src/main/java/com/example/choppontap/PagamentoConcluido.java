@@ -29,7 +29,6 @@ import androidx.activity.OnBackPressedCallback;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
-import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import com.google.android.material.snackbar.Snackbar;
 
@@ -140,7 +139,9 @@ public class PagamentoConcluido extends AppCompatActivity {
                 }
             } else if (BluetoothServiceIndustrial.BLE_DATA_ACTION.equals(action)) {
                 String data = intent.getStringExtra("data");
-                if (data != null) processarMensagem(data.trim());
+                if (data != null) {
+                    processarMensagem(data.trim());
+                }
             }
         }
     };
@@ -198,21 +199,34 @@ public class PagamentoConcluido extends AppCompatActivity {
                 liberado = (int) Math.round(mlFinal);
             } catch (Exception ignored) {}
 
-            mLiberacaoFinalizada = true;
             mComandoEnviado = false;
-
-            Log.i(TAG, "[BLE] Liberacao concluida: " + liberado + "mL");
-
-            chamarFinishSale(liberado);
+            Log.i(TAG, "[BLE] Liberacao concluida/interrompida: " + liberado + "mL de " + qtd_ml + "mL");
 
             runOnUiThread(() -> {
                 txtMls.setText(liberado + " ML");
-                if (progressBar != null) progressBar.setProgress(100);
-                atualizarStatus("Dosagem completa!");
-                mMainHandler.postDelayed(() -> {
-                    startActivity(new Intent(PagamentoConcluido.this, Home.class));
-                    finish();
-                }, HOME_NAVIGATE_DELAY_MS);
+                if (progressBar != null && qtd_ml > 0) {
+                    progressBar.setProgress((int) ((liberado / (float) qtd_ml) * 100));
+                }
+
+                if (liberado < qtd_ml) {
+                    // Fluxo interrompido antes do fim
+                    int restante = qtd_ml - liberado;
+                    atualizarStatus("Fluxo interrompido. Faltam " + restante + "ml.");
+                    btnLiberar.setText("Continuar Servindo (" + restante + "ml)");
+                    btnLiberar.setVisibility(View.VISIBLE);
+                    mLiberacaoFinalizada = false;
+                } else {
+                    // Fluxo completo
+                    mLiberacaoFinalizada = true;
+                    btnLiberar.setVisibility(View.GONE);
+                    chamarFinishSale(liberado);
+                    atualizarStatus("Dosagem completa!");
+                    if (progressBar != null) progressBar.setProgress(100);
+                    mMainHandler.postDelayed(() -> {
+                        startActivity(new Intent(PagamentoConcluido.this, Home.class));
+                        finish();
+                    }, HOME_NAVIGATE_DELAY_MS);
+                }
             });
             return;
         }
@@ -232,33 +246,50 @@ public class PagamentoConcluido extends AppCompatActivity {
     // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     /**
-     * Envia comando $ML:<volume> diretamente ao ESP32.
-     * Protocolo NUS v4.0: sem READY, sem SERVE, sem ACK, sem HMAC.
+     * Envia comando $TO:5 seguido de $ML:<volume> ao ESP32.
+     * Protocolo NUS v4.0: timeout de 5s, depois liberação.
      */
     private void enviarComandoML(int volumeMl) {
         if (mBluetoothService == null) {
             Log.e(TAG, "[BLE] BluetoothService nulo — nao foi possivel enviar $ML");
+            atualizarStatus("Aguardando conexao BLE...");
             return;
         }
-        String command = "$ML:" + volumeMl;
+        
         String status = mBluetoothService.getCurrentStatus();
-        Log.i(TAG, "[BLE] Enviando: " + command + " | BLE status=" + status);
-        if (status.equals("ready")) {
-            mComandoEnviado = true;
-            boolean ok = mBluetoothService.sendCommand(command);
-            if (ok) {
-                atualizarStatus("Enviando comando de liberacao...");
-                Log.i(TAG, "[BLE] sendCommand() OK — $ML enviado imediatamente");
-            } else {
-                Log.e(TAG, "[BLE] sendCommand() falhou mesmo com ready=true");
-                mComandoEnviado = false;
-                atualizarStatus("Aguardando conexao BLE...");
-            }
-        } else {
+        Log.i(TAG, "[BLE] Preparando comando $ML:" + volumeMl + " | BLE status=" + status);
+        
+        if (!status.equals("ready")) {
             Log.w(TAG, "[BLE] BLE nao READY (status=" + status + ") — aguardando ready");
             mComandoEnviado = false;
             atualizarStatus("Aguardando conexao BLE...");
+            return;
         }
+        
+        mComandoEnviado = true;
+        atualizarStatus("Configurando timeout do sensor...");
+        
+        // 1. Envia comando de Timeout (5 segundos)
+        boolean toOk = mBluetoothService.sendCommand("$TO:5");
+        if (toOk) {
+            Log.i(TAG, "[BLE] Enviado: $TO:5");
+        } else {
+            Log.e(TAG, "[BLE] Falha ao enviar $TO:5");
+        }
+        
+        // 2. Aguarda 300ms e envia o comando de liberação ($ML)
+        mMainHandler.postDelayed(() -> {
+            String command = "$ML:" + volumeMl;
+            Log.i(TAG, "[BLE] Enviando: " + command);
+            boolean mlOk = mBluetoothService.sendCommand(command);
+            if (mlOk) {
+                atualizarStatus("Enviando comando de liberacao...");
+            } else {
+                Log.e(TAG, "[BLE] Falha ao enviar $ML");
+                mComandoEnviado = false;
+                atualizarStatus("Erro ao enviar comando. Tentando novamente...");
+            }
+        }, 300);
     }
 
     // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -389,13 +420,13 @@ public class PagamentoConcluido extends AppCompatActivity {
         IntentFilter filter = new IntentFilter();
         filter.addAction(BluetoothServiceIndustrial.BLE_STATUS_ACTION);
         filter.addAction(BluetoothServiceIndustrial.BLE_DATA_ACTION);
-        LocalBroadcastManager.getInstance(this).registerReceiver(mServiceUpdateReceiver, filter);
+        registerReceiver(mServiceUpdateReceiver, filter, Context.RECEIVER_EXPORTED);
     }
 
     @Override
     protected void onPause() {
         super.onPause();
-        LocalBroadcastManager.getInstance(this).unregisterReceiver(mServiceUpdateReceiver);
+        unregisterReceiver(mServiceUpdateReceiver);
     }
 
     @Override
