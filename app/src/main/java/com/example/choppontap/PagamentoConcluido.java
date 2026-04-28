@@ -110,6 +110,9 @@ public class PagamentoConcluido extends AppCompatActivity {
         });
     };
 
+    // ââ Auto-Retry â retomada automática após interrupção âââââââââââââââââââââââ
+    private Runnable mAutoRetryRunnable = null;
+
     // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     // BroadcastReceiver â escuta eventos do BluetoothServiceIndustrial
     // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -200,7 +203,7 @@ public class PagamentoConcluido extends AppCompatActivity {
             } catch (Exception ignored) {}
 
             mComandoEnviado = false;
-            Log.i(TAG, "[BLE] Liberacao concluida/interrompida: " + liberado + "mL de " + qtd_ml + "mL");
+            Log.i(TAG, "[BLE] Liberacao encerrada: " + liberado + "mL de " + qtd_ml + "mL");
 
             runOnUiThread(() -> {
                 txtMls.setText(liberado + " ML");
@@ -208,24 +211,37 @@ public class PagamentoConcluido extends AppCompatActivity {
                     progressBar.setProgress((int) ((liberado / (float) qtd_ml) * 100));
                 }
 
-                if (liberado < qtd_ml) {
-                    // Fluxo interrompido antes do fim
-                    int restante = qtd_ml - liberado;
-                    atualizarStatus("Fluxo interrompido. Faltam " + restante + "ml.");
-                    btnLiberar.setText("Continuar Servindo (" + restante + "ml)");
-                    btnLiberar.setVisibility(View.VISIBLE);
-                    mLiberacaoFinalizada = false;
-                } else {
+                if (liberado >= qtd_ml) {
                     // Fluxo completo
                     mLiberacaoFinalizada = true;
                     btnLiberar.setVisibility(View.GONE);
                     chamarFinishSale(liberado);
-                    atualizarStatus("Dosagem completa!");
-                    if (progressBar != null) progressBar.setProgress(100);
+                    atualizarStatus("Dosagem completa! " + liberado + "mL servidos.");
                     mMainHandler.postDelayed(() -> {
                         startActivity(new Intent(PagamentoConcluido.this, Home.class));
                         finish();
                     }, HOME_NAVIGATE_DELAY_MS);
+                } else {
+                    // Fluxo interrompido por inatividade (cliente soltou a alavanca)
+                    int restante = qtd_ml - liberado;
+                    atualizarStatus("Aguardando... Faltam " + restante + "mL.");
+
+                    // Retomada automática após 2 segundos
+                    btnLiberar.setText("Continuar Servindo (" + restante + "mL)");
+                    btnLiberar.setVisibility(View.VISIBLE);
+                    mLiberacaoFinalizada = false;
+
+                    // Auto-retry após 2s se o cliente não interagir
+                    mAutoRetryRunnable = () -> {
+                        if (!mLiberacaoFinalizada && liberado < qtd_ml) {
+                            Log.i(TAG, "[AUTO-RETRY] Retomando automaticamente | restante=" + restante + "mL");
+                            btnLiberar.setVisibility(View.GONE);
+                            atualizarStatus("Retomando dispensação...");
+                            mComandoEnviado = false;
+                            enviarComandoML(restante);
+                        }
+                    };
+                    mMainHandler.postDelayed(mAutoRetryRunnable, 2000);
                 }
             });
             return;
@@ -246,8 +262,8 @@ public class PagamentoConcluido extends AppCompatActivity {
     // âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     /**
-     * Envia comando $TO:5 seguido de $ML:<volume> ao ESP32.
-     * Protocolo NUS v4.0: timeout de 5s, depois liberação.
+     * Envia comando $TO:10 seguido de $ML:<volume> ao ESP32.
+     * Protocolo NUS v4.0: timeout de 10s, depois liberação.
      */
     private void enviarComandoML(int volumeMl) {
         if (mBluetoothService == null) {
@@ -269,12 +285,12 @@ public class PagamentoConcluido extends AppCompatActivity {
         mComandoEnviado = true;
         atualizarStatus("Configurando timeout do sensor...");
         
-        // 1. Envia comando de Timeout (5 segundos)
-        boolean toOk = mBluetoothService.sendCommand("$TO:5");
+        // 1. Envia comando de Timeout (10 segundos)
+        boolean toOk = mBluetoothService.sendCommand("$TO:10");
         if (toOk) {
-            Log.i(TAG, "[BLE] Enviado: $TO:5");
+            Log.i(TAG, "[BLE] Timeout configurado para 10s de inatividade");
         } else {
-            Log.e(TAG, "[BLE] Falha ao enviar $TO:5");
+            Log.e(TAG, "[BLE] Falha ao enviar $TO:10");
         }
         
         // 2. Aguarda 300ms e envia o comando de liberação ($ML)
@@ -402,12 +418,19 @@ public class PagamentoConcluido extends AppCompatActivity {
 
         // BotÃ£o "Continuar Servindo" â recuperaÃ§Ã£o apÃ³s timeout
         btnLiberar.setOnClickListener(v -> {
-            btnLiberar.setVisibility(View.GONE);
-            atualizarStatus("Retomando liberacao...");
+            // Cancela auto-retry pendente para evitar envio duplo
+            if (mAutoRetryRunnable != null) {
+                mMainHandler.removeCallbacks(mAutoRetryRunnable);
+                mAutoRetryRunnable = null;
+            }
+
             int restante = qtd_ml - liberado;
-            if (restante > 0) {
+            if (restante > 0 && !mLiberacaoFinalizada) {
+                btnLiberar.setVisibility(View.GONE);
+                atualizarStatus("Retomando dispensação manualmente...");
+                mComandoEnviado = false;
+                Log.i(TAG, "[MANUAL] Retomando por botão | restante=" + restante + "mL");
                 enviarComandoML(restante);
-                Log.i(TAG, "[RETRY] Retomando dispensacao | restante=" + restante + "ml");
             }
         });
 
