@@ -8,6 +8,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
+import androidx.core.content.ContextCompat;
 import android.content.pm.ActivityInfo;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -482,10 +483,20 @@ public class PagamentoConcluido extends AppCompatActivity {
         super.onResume();
         // CORREÇÃO 3: usa registerReceiver global em vez de LocalBroadcastManager,
         // pois BluetoothServiceIndustrial usa sendBroadcast() (não LocalBroadcastManager).
+        //
+        // CORREÇÃO 7 (Android 13+ / API 33+): registerReceiver exige a flag
+        // RECEIVER_NOT_EXPORTED quando o receiver não é exclusivo de broadcasts do sistema.
+        // Sem essa flag, o Android 13+ lança SecurityException e mata a Activity.
+        // O receiver é NOT_EXPORTED pois só recebe broadcasts internos do próprio app.
         IntentFilter filter = new IntentFilter();
         filter.addAction(BluetoothServiceIndustrial.BLE_STATUS_ACTION);
         filter.addAction(BluetoothServiceIndustrial.BLE_DATA_ACTION);
-        registerReceiver(mServiceUpdateReceiver, filter);
+        ContextCompat.registerReceiver(
+                this,
+                mServiceUpdateReceiver,
+                filter,
+                ContextCompat.RECEIVER_NOT_EXPORTED
+        );
     }
 
     @Override
