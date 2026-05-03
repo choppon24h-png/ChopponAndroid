@@ -107,7 +107,8 @@ public class PagamentoConcluido extends AppCompatActivity {
     private SessionManager   mSessionManager;
 
     // ── Watchdog ──────────────────────────────────────────────────────────────
-    private boolean mWatchdogActive = false;
+    private boolean  mWatchdogActive    = false;
+    private Runnable mAutoRetryRunnable = null;
 
     private final Runnable mWatchdogRunnable = () -> {
         Log.e(TAG, "[APP] WATCHDOG disparado! liberado=" + liberado + " qtd_ml=" + qtd_ml);
@@ -319,31 +320,6 @@ public class PagamentoConcluido extends AppCompatActivity {
             mUltimoComandoEnviado = "";
             atualizarStatus("Falha ao enviar comando. BLE desconectado?");
         }
-        
-        mComandoEnviado = true;
-        atualizarStatus("Configurando timeout do sensor...");
-        
-        // 1. Envia comando de Timeout (10 segundos)
-        boolean toOk = mBluetoothService.sendCommand("$TO:10");
-        if (toOk) {
-            Log.i(TAG, "[BLE] Timeout configurado para 10s de inatividade");
-        } else {
-            Log.e(TAG, "[BLE] Falha ao enviar $TO:10");
-        }
-        
-        // 2. Aguarda 300ms e envia o comando de liberação ($ML)
-        mMainHandler.postDelayed(() -> {
-            String command = "$ML:" + volumeMl;
-            Log.i(TAG, "[BLE] Enviando: " + command);
-            boolean mlOk = mBluetoothService.sendCommand(command);
-            if (mlOk) {
-                atualizarStatus("Enviando comando de liberacao...");
-            } else {
-                Log.e(TAG, "[BLE] Falha ao enviar $ML");
-                mComandoEnviado = false;
-                atualizarStatus("Erro ao enviar comando. Tentando novamente...");
-            }
-        }, 300);
     }
 
     /**
@@ -402,7 +378,7 @@ public class PagamentoConcluido extends AppCompatActivity {
         } else {
             // Fallback: fluxo legado com start_sale.php
             Log.w(TAG, "[PAYMENT] SessionManager nao disponivel — usando fluxo legado");
-            chamarStartSale(checkout_id, qtd_ml, android_id, () -> enviarComandoML(qtd_ml));
+            chamarStartSale(checkout_id, qtd_ml, android_id, () -> enviarTimeoutESP32(10, () -> enviarComandoML(qtd_ml)));
         }
     }
 
