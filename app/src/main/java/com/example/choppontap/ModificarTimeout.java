@@ -42,38 +42,43 @@ public class ModificarTimeout extends AppCompatActivity {
         @Override
         public void onReceive(Context context, Intent intent) {
             final String action = intent.getAction();
-            if (BluetoothServiceIndustrial.ACTION_CONNECTION_STATUS.equals(action)) {
-                String status = intent.getStringExtra(BluetoothServiceIndustrial.EXTRA_STATUS);
-                if(status.equals("Not found")  || status.equals("disconnected")){
+            if (BluetoothServiceIndustrial.BLE_STATUS_ACTION.equals(action)) {
+                String status = intent.getStringExtra("status");
+                if(status.equals("Not found")  || status.startsWith("disconnected")){
                     btnSalvarTimeout.setEnabled(false);
                     btnSalvarTimeout.setTextColor(Color.GRAY);
                     View contextView = (View) findViewById(R.id.mainCalibrar);
-                    Snackbar snackbar = Snackbar.make(contextView, "Não foi possível comunicar com a TAP", Snackbar.LENGTH_INDEFINITE)
-                            .setAction("Repetir", new View.OnClickListener() {
-                                @Override
-                                public void onClick(View view) {
-                                    try {
-                                        mBluetoothService.scanLeDevice(true);
-                                    } catch (Exception ex) {
-                                        throw new RuntimeException(ex);
+                    if (contextView != null) {
+                        Snackbar snackbar = Snackbar.make(contextView, "Não foi possível comunicar com a TAP", Snackbar.LENGTH_INDEFINITE)
+                                .setAction("Repetir", new View.OnClickListener() {
+                                    @Override
+                                    public void onClick(View view) {
+                                        try {
+                                            String mac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
+                                                    .getString("esp32_mac", "");
+                                            if (mac != null && !mac.isEmpty()) mBluetoothService.connectWithMac(mac);
+                                        } catch (Exception ex) {
+                                            throw new RuntimeException(ex);
+                                        }
                                     }
-                                }
-                            });
-                    snackbar.show();
+                                });
+                        snackbar.show();
+                    }
                 }
-                else if(status.equals("connected")){
+                else if(status.equals("connected") || status.equals("ready")){
                     btnSalvarTimeout.setEnabled(true);
                     btnSalvarTimeout.setTextColor(Color.WHITE);
-                    mBluetoothService.write("$TO:0");
+                    mBluetoothService.sendCommand("$TO:0");
                 }
 
                 // mStatusTextView.setText(status); // Ex: "Conectado"
-            } else if (BluetoothServiceIndustrial.ACTION_DATA_AVAILABLE.equals(action)) {
-                String receivedData = intent.getStringExtra(BluetoothServiceIndustrial.EXTRA_DATA);
-                txtTimeoutAtual.setText(receivedData);
+            } else if (BluetoothServiceIndustrial.BLE_DATA_ACTION.equals(action)) {
+                String receivedData = intent.getStringExtra("data");
+                if (receivedData != null) txtTimeoutAtual.setText(receivedData);
             }
-            else if (BluetoothServiceIndustrial.ACTION_DEVICE_FOUND.equals(action)) {
-                BluetoothDevice device = intent.getParcelableExtra(BluetoothServiceIndustrial.EXTRA_DEVICE);
+            else if (BluetoothServiceIndustrial.BLE_DATA_ACTION.equals(action)) {
+                String device = intent.getStringExtra("device");
+                // Nova ação de descoberta de dispositivo (opcional)
 
 
             }
@@ -88,8 +93,9 @@ public class ModificarTimeout extends AppCompatActivity {
             BluetoothServiceIndustrial.LocalBinder binder = (BluetoothServiceIndustrial.LocalBinder) service;
             mBluetoothService = binder.getService();
             mIsServiceBound = true;
-            if(mBluetoothService.connected()){
-                mBluetoothService.write("$TO:0");
+            String status = mBluetoothService.getCurrentStatus();
+            if(status.equals("ready") || status.equals("connected")){
+                mBluetoothService.sendCommand("$TO:0");
             }
         }
 
@@ -117,9 +123,8 @@ public class ModificarTimeout extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         IntentFilter filter = new IntentFilter();
-        filter.addAction(BluetoothServiceIndustrial.ACTION_CONNECTION_STATUS);
-        filter.addAction(BluetoothServiceIndustrial.ACTION_DEVICE_FOUND);
-        filter.addAction(BluetoothServiceIndustrial.ACTION_DATA_AVAILABLE);
+        filter.addAction(BluetoothServiceIndustrial.BLE_STATUS_ACTION);
+        filter.addAction(BluetoothServiceIndustrial.BLE_DATA_ACTION);
         LocalBroadcastManager.getInstance(this).registerReceiver(mServiceUpdateReceiver, filter);
     }
 
@@ -155,7 +160,7 @@ public class ModificarTimeout extends AppCompatActivity {
             public void onClick(View v) {
                 try {
                     String novaQtd = edtNovoTimeout.getText().toString();
-                   mBluetoothService.write("$TO:"+novaQtd);
+                   mBluetoothService.sendCommand("$TO:"+novaQtd);
 
                 } catch (Exception e) {
                     throw new RuntimeException(e);

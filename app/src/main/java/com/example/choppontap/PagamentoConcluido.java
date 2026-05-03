@@ -302,6 +302,7 @@ public class PagamentoConcluido extends AppCompatActivity {
     private void enviarComandoML(int volumeMl) {
         if (mBluetoothService == null) {
             Log.e(TAG, "[BLE] BluetoothService nulo — nao foi possivel enviar $ML");
+            atualizarStatus("Aguardando conexao BLE...");
             return;
         }
         String command = "$ML:" + volumeMl;
@@ -318,6 +319,31 @@ public class PagamentoConcluido extends AppCompatActivity {
             mUltimoComandoEnviado = "";
             atualizarStatus("Falha ao enviar comando. BLE desconectado?");
         }
+        
+        mComandoEnviado = true;
+        atualizarStatus("Configurando timeout do sensor...");
+        
+        // 1. Envia comando de Timeout (10 segundos)
+        boolean toOk = mBluetoothService.sendCommand("$TO:10");
+        if (toOk) {
+            Log.i(TAG, "[BLE] Timeout configurado para 10s de inatividade");
+        } else {
+            Log.e(TAG, "[BLE] Falha ao enviar $TO:10");
+        }
+        
+        // 2. Aguarda 300ms e envia o comando de liberação ($ML)
+        mMainHandler.postDelayed(() -> {
+            String command = "$ML:" + volumeMl;
+            Log.i(TAG, "[BLE] Enviando: " + command);
+            boolean mlOk = mBluetoothService.sendCommand(command);
+            if (mlOk) {
+                atualizarStatus("Enviando comando de liberacao...");
+            } else {
+                Log.e(TAG, "[BLE] Falha ao enviar $ML");
+                mComandoEnviado = false;
+                atualizarStatus("Erro ao enviar comando. Tentando novamente...");
+            }
+        }, 300);
     }
 
     /**
@@ -457,8 +483,12 @@ public class PagamentoConcluido extends AppCompatActivity {
 
         // Botão "Continuar Servindo" — recuperação após timeout ou fluxo parcial
         btnLiberar.setOnClickListener(v -> {
-            btnLiberar.setVisibility(View.GONE);
-            atualizarStatus("Retomando liberacao...");
+            // Cancela auto-retry pendente para evitar envio duplo
+            if (mAutoRetryRunnable != null) {
+                mMainHandler.removeCallbacks(mAutoRetryRunnable);
+                mAutoRetryRunnable = null;
+            }
+
             int restante = qtd_ml - liberado;
             if (restante > 0) {
                 Log.i(TAG, "[RETRY] Retomando dispensacao | liberado=" + liberado
