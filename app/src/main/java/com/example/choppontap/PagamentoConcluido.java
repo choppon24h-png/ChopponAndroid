@@ -324,7 +324,16 @@ public class PagamentoConcluido extends AppCompatActivity {
     }
 
     /**
-     * Envia $TO:<timeout> antes do $ML para configurar o timeout do sensor no ESP32.
+     * Envia $TO:<timeout_ms> antes do $ML para configurar o timeout do sensor no ESP32.
+     *
+     * ATENÇÃO — unidade do firmware: o operacional.cpp multiplica o valor recebido
+     * por 1000 (microsegundos via esp_timer_get_time), portanto a unidade esperada
+     * pelo ESP32 é MILISSEGUNDOS.
+     *   $TO:10    = 10ms  ← ERRADO (válvula fecha em <1s)
+     *   $TO:10000 = 10s   ← CORRETO
+     *
+     * Este método recebe o timeout em SEGUNDOS e converte para ms antes de enviar.
+     *
      * CORREÇÃO 5: registra mUltimoComandoEnviado = "$TO:..." para que o OK
      * resultante NÃO dispare o watchdog.
      */
@@ -333,16 +342,20 @@ public class PagamentoConcluido extends AppCompatActivity {
             if (onOk != null) onOk.run();
             return;
         }
-        String cmd = "$TO:" + timeoutSegundos;
-        Log.i(TAG, "[BLE] Configurando timeout ESP32: " + cmd);
+        // Converte segundos → milissegundos (unidade esperada pelo firmware ESP32)
+        int timeoutMs = timeoutSegundos * 1000;
+        String cmd = "$TO:" + timeoutMs;
+        Log.i(TAG, "[BLE] Configurando timeout ESP32: " + cmd
+                + " (" + timeoutSegundos + "s = " + timeoutMs + "ms)");
         mUltimoComandoEnviado = cmd;
         boolean ok = mBluetoothService.sendCommand(cmd);
         if (ok) {
-            Log.i(TAG, "[BLE] Timeout configurado para " + timeoutSegundos + "s de inatividade");
-            // Aguarda 300ms para o ESP32 processar o $TO antes de enviar o $ML
+            Log.i(TAG, "[BLE] Timeout configurado para " + timeoutSegundos
+                    + "s (" + timeoutMs + "ms) de inatividade");
+            // Aguarda 400ms para o ESP32 processar o $TO antes de enviar o $ML
             mMainHandler.postDelayed(() -> {
                 if (onOk != null) onOk.run();
-            }, 300L);
+            }, 400L);
         } else {
             Log.w(TAG, "[BLE] Falha ao enviar $TO — prosseguindo com $ML mesmo assim");
             if (onOk != null) onOk.run();
