@@ -67,6 +67,7 @@ public class PagamentoConcluido extends AppCompatActivity {
 
     // ── Timeouts e delays ─────────────────────────────────────────────────────
     private static final long ML_SEND_DELAY_MS       = 800L;
+    private static final long TO_ML_DELAY_MS          = 600L; // delay $TO→$ML: aguarda round-trip BLE (connection interval 15-45ms x2 + margem)
     private static final long HOME_NAVIGATE_DELAY_MS = 3_000L;
     private static final long WATCHDOG_TIMEOUT_MS    = 30_000L;
 
@@ -350,12 +351,11 @@ public class PagamentoConcluido extends AppCompatActivity {
         mUltimoComandoEnviado = cmd;
         boolean ok = mBluetoothService.sendCommand(cmd);
         if (ok) {
-            Log.i(TAG, "[BLE] Timeout configurado para " + timeoutSegundos
-                    + "s (" + timeoutMs + "ms) de inatividade");
-            // Aguarda 400ms para o ESP32 processar o $TO antes de enviar o $ML
+            Log.i(TAG, "[BLE] Timeout configurado para " + timeoutSegundos + "s de inatividade");
+            // Aguarda 300ms para o ESP32 processar o $TO antes de enviar o $ML
             mMainHandler.postDelayed(() -> {
                 if (onOk != null) onOk.run();
-            }, 400L);
+            }, 300L);
         } else {
             Log.w(TAG, "[BLE] Falha ao enviar $TO — prosseguindo com $ML mesmo assim");
             if (onOk != null) onOk.run();

@@ -526,16 +526,32 @@ public class BluetoothServiceIndustrial extends Service {
     // Broadcasts
     // =========================================================================
 
+    /**
+     * Envia broadcast de status BLE para receivers internos do app.
+     *
+     * Android 13+ (API 33): sendBroadcast() implícito (sem pacote destino) NÃO
+     * entrega para receivers registrados com RECEIVER_NOT_EXPORTED. É obrigatório
+     * definir o pacote destino via setPackage() para que a entrega funcione.
+     * Ref: https://developer.android.com/about/versions/13/behavior-changes-13#runtime-receivers
+     */
     private void broadcastStatus(String status) {
         Log.d(TAG, "[STATUS] " + status);
         Intent i = new Intent(BLE_STATUS_ACTION);
         i.putExtra("status", status);
+        i.setPackage(getPackageName()); // Android 13+: necessário para RECEIVER_NOT_EXPORTED
         sendBroadcast(i);
     }
 
+    /**
+     * Envia broadcast de dados recebidos do ESP32 para receivers internos do app.
+     *
+     * Mesmo requisito do Android 13+: setPackage() obrigatório para entrega
+     * a receivers registrados com RECEIVER_NOT_EXPORTED.
+     */
     private void broadcastData(String data) {
         Intent i = new Intent(BLE_DATA_ACTION);
         i.putExtra("data", data);
+        i.setPackage(getPackageName()); // Android 13+: necessário para RECEIVER_NOT_EXPORTED
         sendBroadcast(i);
     }
 
