@@ -66,6 +66,7 @@ public class PagamentoConcluido extends AppCompatActivity {
 
     // ── Timeouts e delays ─────────────────────────────────────────────────────
     private static final long ML_SEND_DELAY_MS       = 800L;
+    private static final long TO_ML_DELAY_MS          = 600L; // delay $TO→$ML: aguarda round-trip BLE (connection interval 15-45ms x2 + margem)
     private static final long HOME_NAVIGATE_DELAY_MS = 3_000L;
     private static final long WATCHDOG_TIMEOUT_MS    = 30_000L;
 
@@ -336,10 +337,15 @@ public class PagamentoConcluido extends AppCompatActivity {
         boolean ok = mBluetoothService.sendCommand(cmd);
         if (ok) {
             Log.i(TAG, "[BLE] Timeout configurado para " + timeoutSegundos + "s de inatividade");
-            // Aguarda 300ms para o ESP32 processar o $TO antes de enviar o $ML
+            // Aguarda TO_ML_DELAY_MS (600ms) para o ESP32 processar o $TO antes de enviar o $ML.
+            // Motivo: sendCommand() retorna true quando o write BLE foi enfileirado no Android,
+            // NAO quando o ESP32 processou. O round-trip real e:
+            //   Android enfileira -> connection interval (15-45ms) -> ESP32 recebe e processa
+            //   -> ESP32 envia OK -> connection interval -> Android recebe OK
+            // Esse ciclo pode levar 100-200ms+ em link congestionado. 600ms garante margem segura.
             mMainHandler.postDelayed(() -> {
                 if (onOk != null) onOk.run();
-            }, 300L);
+            }, TO_ML_DELAY_MS);
         } else {
             Log.w(TAG, "[BLE] Falha ao enviar $TO — prosseguindo com $ML mesmo assim");
             if (onOk != null) onOk.run();
