@@ -110,6 +110,11 @@ public class BluetoothServiceIndustrial extends Service {
     private final Runnable mPingRunnable        = this::sendPing;
     private final Runnable mScanTimeoutRunnable = this::onScanTimeout;
 
+    // CORREÇÃO v4.2: flag para suspender o PING durante dispensação de chopp.
+    // O PING a cada 5s pode colidir com VP:/ML: do ESP32 durante a liberação,
+    // causando falha no write BLE ou corrupção do estado serial do ESP32.
+    private volatile boolean mDispensandoChopp = false;
+
     // Notification Foreground Service
     private static final String CHANNEL_ID = "ble_industrial_channel";
     private static final int    NOTIF_ID   = 1001;
@@ -227,12 +232,47 @@ public class BluetoothServiceIndustrial extends Service {
             Log.w(TAG, "[CMD] RxChar ou GATT nulo");
             return false;
         }
+        // CORREÇÃO v4.2: suspende o PING ao iniciar dispensação ($ML ou $LB)
+        // e retoma quando a operação termina ($ML:0 ou após ML: recebido).
+        if (command.startsWith("$ML:") && !command.equals("$ML:0")) {
+            pausarPing();
+        } else if (command.equals("$ML:0") || command.equals("$LB:")) {
+            // $LB: (contínuo) também suspende o PING
+            if (command.equals("$LB:")) pausarPing();
+        }
         byte[] bytes = (command + "\n").getBytes();
         mRxChar.setValue(bytes);
         mRxChar.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
         boolean ok = mGatt.writeCharacteristic(mRxChar);
         Log.d(TAG, "[CMD] Enviado=" + ok + " cmd=" + command.trim());
         return ok;
+    }
+
+    /**
+     * Suspende o keepalive PING durante a dispensação de chopp.
+     * Deve ser chamado antes de enviar $ML:<volume> ou $LB:.
+     */
+    public void pausarPing() {
+        if (!mDispensandoChopp) {
+            mDispensandoChopp = true;
+            mHandler.removeCallbacks(mPingRunnable);
+            Log.i(TAG, "[PING] PING suspenso durante dispensação de chopp");
+        }
+    }
+
+    /**
+     * Retoma o keepalive PING após o fim da dispensação.
+     * Deve ser chamado quando ML: for recebido ou quando a operação for cancelada.
+     */
+    public void retomarPing() {
+        if (mDispensandoChopp) {
+            mDispensandoChopp = false;
+            if (mState == State.READY) {
+                mHandler.removeCallbacks(mPingRunnable);
+                mHandler.postDelayed(mPingRunnable, PING_INTERVAL_MS);
+                Log.i(TAG, "[PING] PING retomado após fim da dispensação");
+            }
+        }
     }
 
     /** Desconecta e para de reconectar. */
@@ -484,6 +524,11 @@ public class BluetoothServiceIndustrial extends Service {
 
     private void sendPing() {
         if (mState != State.READY) return;
+        // CORREÇÃO v4.2: não envia PING enquanto estiver dispensando chopp.
+        if (mDispensandoChopp) {
+            Log.d(TAG, "[PING] PING suprimido — dispensação em andamento");
+            return;
+        }
         sendCommand(BleCommand.buildPing());
         mHandler.postDelayed(mPingRunnable, PING_INTERVAL_MS);
     }

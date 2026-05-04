@@ -115,6 +115,8 @@ public class PagamentoConcluido extends AppCompatActivity {
     private final Runnable mWatchdogRunnable = () -> {
         Log.e(TAG, "[APP] WATCHDOG disparado! liberado=" + liberado + " qtd_ml=" + qtd_ml);
         mWatchdogActive  = false;
+        // CORREÇÃO v4.2: retoma o PING quando o watchdog dispara (timeout sem fluxo).
+        if (mBluetoothService != null) mBluetoothService.retomarPing();
         atualizarStatus("Timeout: fluxo nao detectado.");
         runOnUiThread(() -> {
             if (liberado < qtd_ml) {
@@ -242,6 +244,8 @@ public class PagamentoConcluido extends AppCompatActivity {
         // ── ML: — volume final liberado (CONCLUSÃO da liberação) ──────────────
         if (msg.startsWith("ML:")) {
             cancelarWatchdog();
+            // CORREÇÃO v4.2: retoma o PING após o fim da dispensação.
+            if (mBluetoothService != null) mBluetoothService.retomarPing();
             try {
                 double mlFinal = Double.parseDouble(msg.substring(3).trim());
                 liberado = (int) Math.round(mlFinal);
@@ -325,10 +329,12 @@ public class PagamentoConcluido extends AppCompatActivity {
     }
 
     /**
-     * Envia $TO:<segundos> antes do $ML para configurar o timeout de inatividade do ESP32.
+     * Envia $TO:<ms> antes do $ML para configurar o timeout de inatividade do ESP32.
      *
-     * Firmware (operacional.cpp): inatividade > (configuracao.timeOut * 1_000_000us)
-     * → o valor é em SEGUNDOS. Enviar $TO:10000 = 10000s ≈ 2,7h (errado).
+     * CORREÇÃO (v4.2): O protocolo NUS v4.0 define $TO em MILISSEGUNDOS.
+     * O parâmetro de entrada é em segundos (para legibilidade no código),
+     * mas a conversão para ms é feita aqui antes do envio.
+     * Ex: enviarTimeoutESP32(10, ...) → envia $TO:10000 (10 segundos em ms).
      *
      * Registra mUltimoComandoEnviado = "$TO:..." para que o OK resultante
      * NÃO dispare o watchdog (watchdog só deve iniciar após OK do $ML).
@@ -338,13 +344,15 @@ public class PagamentoConcluido extends AppCompatActivity {
             if (onOk != null) onOk.run();
             return;
         }
-        // Firmware ESP32 espera SEGUNDOS no parâmetro de $TO
-        String cmd = "$TO:" + timeoutSegundos;
-        Log.i(TAG, "[BLE] Configurando timeout ESP32: " + cmd + " (" + timeoutSegundos + "s)");
+        // CORREÇÃO v4.2: protocolo NUS v4.0 espera MILISSEGUNDOS em $TO.
+        // Convertemos o valor de segundos (legível no código) para ms antes do envio.
+        int timeoutMs = timeoutSegundos * 1000;
+        String cmd = "$TO:" + timeoutMs;
+        Log.i(TAG, "[BLE] Configurando timeout ESP32: " + cmd + " (" + timeoutSegundos + "s = " + timeoutMs + "ms)");
         mUltimoComandoEnviado = cmd;
         boolean ok = mBluetoothService.sendCommand(cmd);
         if (ok) {
-            Log.i(TAG, "[BLE] Timeout configurado para " + timeoutSegundos + "s de inatividade");
+            Log.i(TAG, "[BLE] Timeout configurado para " + timeoutMs + "ms (" + timeoutSegundos + "s) de inatividade");
             // 600ms: garante que o ESP32 processou e respondeu OK ao $TO
             // antes do $ML chegar (BLE round-trip + margem para link congestionado)
             mMainHandler.postDelayed(() -> {
