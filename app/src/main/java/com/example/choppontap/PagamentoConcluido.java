@@ -71,13 +71,16 @@ public class PagamentoConcluido extends AppCompatActivity {
     private static final long HOME_NAVIGATE_DELAY_MS = 3_000L;
     private static final long WATCHDOG_TIMEOUT_MS    = 30_000L;
 
-    // ── Handlers ──────────────────────────────────────────────────────────────
+    // ── Handlers ─────────────────────────────────────────────────────────────────────────────────────
     private final Handler mMainHandler     = new Handler(Looper.getMainLooper());
     private final Handler mWatchdogHandler = new Handler(Looper.getMainLooper());
 
-    // ── Estado da liberação ───────────────────────────────────────────────────
+    // ── Estado da liberação ─────────────────────────────────────────────────────────────────────────────────────
     private int     qtd_ml               = 0;
     private int     liberado             = 0;
+    // CORREÇÃO v4.3: armazena o volume em double para não perder a parte fracionária
+    // dos valores reportados pelo ESP32 (ex: VP:0.340, ML:0.34 → arredondava para 0).
+    private double  liberadoFloat        = 0.0;
     private boolean mLiberacaoFinalizada = false;
     private boolean mComandoEnviado      = false;
 
@@ -88,7 +91,7 @@ public class PagamentoConcluido extends AppCompatActivity {
      */
     private String  mUltimoComandoEnviado = "";
 
-    // ── Dados do pedido ───────────────────────────────────────────────────────
+    // ── Dados do pedido ──────────────────────────────────────────────────────────────────
     private String checkout_id;
     private String android_id;
     private String imagemUrl;
@@ -206,27 +209,34 @@ public class PagamentoConcluido extends AppCompatActivity {
             return;
         }
 
-        // ── VP: — volume parcial durante liberação ────────────────────────────
+        // ── VP: — volume parcial durante liberação ────────────────────
         if (msg.startsWith("VP:")) {
             resetarWatchdog();
             try {
                 double mlFloat = Double.parseDouble(msg.substring(3).trim());
-                int mlArredondado = (int) Math.round(mlFloat);
 
-                // CORREÇÃO 6: enquanto VP:0.000 (fluxo ainda não detectado),
-                // exibe mensagem de aguardo em vez de "0 ML" para melhor UX.
-                if (mlArredondado == 0 && mlFloat < 0.5) {
-                    Log.d(TAG, "[VP] VP=0 — aguardando início do fluxo");
+                // CORREÇÃO v4.3: O ESP32 reporta VP em ml com casas decimais (ex: VP:0.340).
+                // O sensor conta pulsos e converte: cada pulso ≈ 0.17ml (com PL padrão).
+                // O código anterior descartava qualquer VP < 0.5ml como "sem fluxo",
+                // o que fazia o app ignorar TODOS os valores reais do sensor (0.17, 0.34).
+                // Correção: só ignorar VP:0.000 exato (válvula ainda fechada).
+                // Qualquer valor > 0 já indica fluxo real e deve ser acumulado.
+                if (mlFloat <= 0.0) {
+                    Log.d(TAG, "[VP] VP=0.000 — aguardando início do fluxo");
                     atualizarStatus("Aguardando fluxo... Puxe a alavanca.");
                 } else {
-                    liberado = mlArredondado;
-                    final int mlExibir = liberado;
+                    // Armazena em double para não perder a parte fracionária
+                    liberadoFloat = mlFloat;
+                    liberado = (int) Math.round(liberadoFloat);
+                    final double mlExibir = liberadoFloat;
+                    final int mlExibirInt = liberado;
+                    Log.d(TAG, "[VP] Fluxo detectado: " + mlExibir + "ml (int=" + mlExibirInt + ")");
                     runOnUiThread(() -> {
-                        txtMls.setText(mlExibir + " ML");
+                        txtMls.setText(String.format("%.0f ML", mlExibir));
                         if (progressBar != null && qtd_ml > 0) {
-                            progressBar.setProgress((int) ((mlExibir / (float) qtd_ml) * 100));
+                            progressBar.setProgress((int) ((mlExibir / qtd_ml) * 100));
                         }
-                        atualizarStatus("Liberando... " + mlExibir + " / " + qtd_ml + " ML");
+                        atualizarStatus("Liberando... " + String.format("%.1f", mlExibir) + " / " + qtd_ml + " ML");
                     });
                 }
             } catch (Exception e) {
@@ -248,7 +258,12 @@ public class PagamentoConcluido extends AppCompatActivity {
             if (mBluetoothService != null) mBluetoothService.retomarPing();
             try {
                 double mlFinal = Double.parseDouble(msg.substring(3).trim());
-                liberado = (int) Math.round(mlFinal);
+                // CORREÇÃO v4.3: preserva o valor float do ESP32 para não perder
+                // volumes fracionários (ex: ML:0.34 arredondava para 0 antes).
+                // Usa o maior valor entre o ML: final e o último VP: acumulado.
+                liberadoFloat = Math.max(mlFinal, liberadoFloat);
+                liberado = (int) Math.round(liberadoFloat);
+                Log.i(TAG, "[ML] Volume final ESP32: " + mlFinal + "ml | acumulado=" + liberadoFloat + "ml | int=" + liberado);
             } catch (Exception ignored) {}
 
             mLiberacaoFinalizada = true;
