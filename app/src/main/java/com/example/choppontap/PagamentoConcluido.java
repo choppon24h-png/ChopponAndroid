@@ -161,9 +161,16 @@ public class PagamentoConcluido extends AppCompatActivity {
                     Log.i(TAG, "[BLE] STATUS_READY recebido — BLE pronto para envio");
                     atualizarStatus("Dispositivo pronto. Liberando...");
                     mMainHandler.postDelayed(() -> {
-                        if (!mLiberacaoFinalizada && liberado == 0 && !mComandoEnviado) {
+                        // CORREÇÃO v4.4: usa liberadoFloat > 0 em vez de liberado == 0
+                        // para não reiniciar do zero quando já houve dispensacao parcial
+                        // (ex: liberadoFloat=0.17 arredondava para liberado=0 e reiniciava
+                        // a venda inteira em vez de continuar do ponto onde parou).
+                        if (!mLiberacaoFinalizada && liberadoFloat == 0.0 && !mComandoEnviado) {
                             mComandoEnviado = false;
                             iniciarVendaEEnfileirar();
+                        } else if (!mLiberacaoFinalizada && liberadoFloat > 0.0 && !mComandoEnviado) {
+                            Log.i(TAG, "[BLE] STATUS_READY com dispensacao parcial (" + liberadoFloat
+                                    + "ml) — aguardando acao do usuario para continuar");
                         }
                     }, ML_SEND_DELAY_MS);
                 }
@@ -496,11 +503,20 @@ public class PagamentoConcluido extends AppCompatActivity {
                 mAutoRetryRunnable = null;
             }
 
-            int restante = qtd_ml - liberado;
+            // CORREÇÃO v4.4: usa liberadoFloat para calcular o restante real.
+            // O campo 'liberado' (int) perde a parte fracionária (ex: 0.17ml → 0),
+            // fazendo o retry enviar $ML:300 em vez de $ML:299 (ou o valor correto).
+            // Usa Math.ceil para garantir que fracionamentos não sejam ignorados.
+            int liberadoIntReal = (int) Math.floor(liberadoFloat);
+            int restante = qtd_ml - liberadoIntReal;
             if (restante > 0) {
-                Log.i(TAG, "[RETRY] Retomando dispensacao | liberado=" + liberado
+                Log.i(TAG, "[RETRY] Retomando dispensacao | liberadoFloat=" + liberadoFloat
+                        + " | liberadoInt=" + liberadoIntReal
                         + " | restante=" + restante + "ml");
-                // Reenvia $TO:10 antes do $ML para garantir timeout correto no ESP32
+                // Reseta o acumulador float para o novo ciclo de dispensacao
+                liberadoFloat = 0.0;
+                liberado      = 0;
+                // Reenvia $TO antes do $ML para garantir timeout correto no ESP32
                 enviarTimeoutESP32(10, () -> enviarComandoML(restante));
             }
         });
