@@ -325,37 +325,31 @@ public class PagamentoConcluido extends AppCompatActivity {
     }
 
     /**
-     * Envia $TO:<timeout_ms> antes do $ML para configurar o timeout do sensor no ESP32.
+     * Envia $TO:<segundos> antes do $ML para configurar o timeout de inatividade do ESP32.
      *
-     * ATENÇÃO — unidade do firmware: o operacional.cpp multiplica o valor recebido
-     * por 1000 (microsegundos via esp_timer_get_time), portanto a unidade esperada
-     * pelo ESP32 é MILISSEGUNDOS.
-     *   $TO:10    = 10ms  ← ERRADO (válvula fecha em <1s)
-     *   $TO:10000 = 10s   ← CORRETO
+     * Firmware (operacional.cpp): inatividade > (configuracao.timeOut * 1_000_000us)
+     * → o valor é em SEGUNDOS. Enviar $TO:10000 = 10000s ≈ 2,7h (errado).
      *
-     * Este método recebe o timeout em SEGUNDOS e converte para ms antes de enviar.
-     *
-     * CORREÇÃO 5: registra mUltimoComandoEnviado = "$TO:..." para que o OK
-     * resultante NÃO dispare o watchdog.
+     * Registra mUltimoComandoEnviado = "$TO:..." para que o OK resultante
+     * NÃO dispare o watchdog (watchdog só deve iniciar após OK do $ML).
      */
     private void enviarTimeoutESP32(int timeoutSegundos, Runnable onOk) {
         if (mBluetoothService == null) {
             if (onOk != null) onOk.run();
             return;
         }
-        // Converte segundos → milissegundos (unidade esperada pelo firmware ESP32)
-        int timeoutMs = timeoutSegundos * 1000;
-        String cmd = "$TO:" + timeoutMs;
-        Log.i(TAG, "[BLE] Configurando timeout ESP32: " + cmd
-                + " (" + timeoutSegundos + "s = " + timeoutMs + "ms)");
+        // Firmware ESP32 espera SEGUNDOS no parâmetro de $TO
+        String cmd = "$TO:" + timeoutSegundos;
+        Log.i(TAG, "[BLE] Configurando timeout ESP32: " + cmd + " (" + timeoutSegundos + "s)");
         mUltimoComandoEnviado = cmd;
         boolean ok = mBluetoothService.sendCommand(cmd);
         if (ok) {
             Log.i(TAG, "[BLE] Timeout configurado para " + timeoutSegundos + "s de inatividade");
-            // Aguarda 300ms para o ESP32 processar o $TO antes de enviar o $ML
+            // 600ms: garante que o ESP32 processou e respondeu OK ao $TO
+            // antes do $ML chegar (BLE round-trip + margem para link congestionado)
             mMainHandler.postDelayed(() -> {
                 if (onOk != null) onOk.run();
-            }, 300L);
+            }, 600L);
         } else {
             Log.w(TAG, "[BLE] Falha ao enviar $TO — prosseguindo com $ML mesmo assim");
             if (onOk != null) onOk.run();

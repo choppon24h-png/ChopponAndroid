@@ -87,7 +87,7 @@ public class BluetoothServiceIndustrial extends Service {
     // Estado interno
     // -------------------------------------------------------------------------
     private enum State { IDLE, SCANNING, CONNECTING, CONNECTED, READY }
-    private State mState = State.IDLE;
+    private volatile State mState = State.IDLE;
 
     private BluetoothAdapter            mAdapter;
     private BluetoothLeScanner          mScanner;
@@ -331,6 +331,11 @@ public class BluetoothServiceIndustrial extends Service {
             boolean fallbackOk  = mReconnectCount >= 2;
 
             if (nameMatch || macMatch || fallbackOk) {
+                // Guard: evita múltiplas conexões GATT quando o scanner
+                // entrega o mesmo dispositivo várias vezes antes de parar.
+                if (mState != State.SCANNING) return;
+                mState = State.CONNECTING;
+
                 if (!nameMatch && !macMatch) {
                     Log.w(TAG, "[FALLBACK] Aceitando " + deviceName + " por fallback apos " + mReconnectCount + " falhas");
                 }
@@ -352,6 +357,11 @@ public class BluetoothServiceIndustrial extends Service {
 
     private void connectGatt(BluetoothDevice device) {
         Log.i(TAG, "[GATT] Conectando a " + device.getAddress());
+        // Fecha GATT residual de sessão anterior para não acumular instâncias
+        if (mGatt != null) {
+            try { mGatt.close(); } catch (Exception ignored) {}
+            mGatt = null;
+        }
         mState = State.CONNECTING;
         // Just Works: autoConnect=false, TRANSPORT_LE, sem createBond()
         mGatt = device.connectGatt(this, false, mGattCallback, BluetoothDevice.TRANSPORT_LE);
