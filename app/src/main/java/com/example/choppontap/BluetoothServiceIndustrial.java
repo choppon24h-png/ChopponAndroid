@@ -22,6 +22,7 @@ import android.bluetooth.le.ScanSettings;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Binder;
+import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -30,6 +31,7 @@ import android.util.Log;
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -240,10 +242,20 @@ public class BluetoothServiceIndustrial extends Service {
             // $LB: (contínuo) também suspende o PING
             if (command.equals("$LB:")) pausarPing();
         }
-        byte[] bytes = (command + "\n").getBytes();
-        mRxChar.setValue(bytes);
-        mRxChar.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
-        boolean ok = mGatt.writeCharacteristic(mRxChar);
+        byte[] bytes = (command + "\n").getBytes(StandardCharsets.UTF_8);
+        boolean ok;
+        // CORREÇÃO v4.5: writeCharacteristic(char, byte[], writeType) é a API moderna
+        // introduzida no Android 13 (API 33). A API antiga setValue()+writeCharacteristic(char)
+        // foi descontinuada e pode causar race conditions em Android 13+.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            int result = mGatt.writeCharacteristic(
+                    mRxChar, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            ok = (result == BluetoothGatt.GATT_SUCCESS);
+        } else {
+            mRxChar.setValue(bytes);
+            mRxChar.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            ok = mGatt.writeCharacteristic(mRxChar);
+        }
         Log.d(TAG, "[CMD] Enviado=" + ok + " cmd=" + command.trim());
         return ok;
     }
@@ -466,9 +478,16 @@ public class BluetoothServiceIndustrial extends Service {
             gatt.setCharacteristicNotification(mTxChar, true);
             BluetoothGattDescriptor descriptor = mTxChar.getDescriptor(UUID_CCCD);
             if (descriptor != null) {
-                descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                gatt.writeDescriptor(descriptor);
-                Log.d(TAG, "[GATT] Habilitando notificacoes TX");
+                // CORREÇÃO v4.5: writeDescriptor(desc, byte[]) é a API moderna (API 33+).
+                // A API antiga setValue()+writeDescriptor(desc) foi descontinuada.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeDescriptor(descriptor,
+                            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                } else {
+                    descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                    gatt.writeDescriptor(descriptor);
+                }
+                Log.d(TAG, "[GATT] Habilitando notificacoes TX (API=" + Build.VERSION.SDK_INT + ")");
             } else {
                 Log.w(TAG, "[GATT] Descriptor 0x2902 nao encontrado - prosseguindo sem ele");
                 onReady();
@@ -487,11 +506,31 @@ public class BluetoothServiceIndustrial extends Service {
             }
         }
 
+        // ── Android 12 e anteriores (API 31-32) ─────────────────────────────────
+        // O sistema chama esta assinatura em dispositivos com Android <= 12.
+        // Em Android 13+ (API 33) esta assinatura foi descontinuada e o sistema
+        // chama EXCLUSIVAMENTE a nova assinatura abaixo com byte[] value.
         @Override
         public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
-            byte[] data = characteristic.getValue();
+            // Redireciona para o handler unificado usando getValue() (API legada)
+            processarNotificacaoBLE(characteristic.getValue());
+        }
+
+        // ── Android 13+ (API 33+) ────────────────────────────────────────────────
+        // CORREÇÃO v4.5: Nova assinatura obrigatória para Android 13, 14 e 15.
+        // Sem este override, VP:/ML:/QP: nunca chegam ao app em celulares novos.
+        // O byte[] value é passado diretamente pelo sistema, sem depender de
+        // characteristic.getValue() que pode conter dados desatualizados.
+        @Override
+        public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, byte[] value) {
+            // Redireciona para o handler unificado com o valor direto (API 33+)
+            processarNotificacaoBLE(value);
+        }
+
+        /** Handler unificado para notificacoes BLE — chamado por ambas as assinaturas. */
+        private void processarNotificacaoBLE(byte[] data) {
             if (data == null) return;
-            String msg = new String(data).trim();
+            String msg = new String(data, StandardCharsets.UTF_8).trim();
             Log.d(TAG, "[RX] Recebido: " + msg);
 
             // Processar PONG internamente para keepalive
