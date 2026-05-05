@@ -88,6 +88,8 @@ public class PagamentoConcluido extends AppCompatActivity {
     // CORREÇÃO v4.3: armazena o volume em double para não perder a parte fracionária
     // dos valores reportados pelo ESP32 (ex: VP:0.340, ML:0.34 → arredondava para 0).
     private double  liberadoFloat        = 0.0;
+    // v5.1: acumulador persistente entre ciclos parciais (soma de todos os ciclos da venda)
+    private double  liberadoTotalFloat   = 0.0;
     private boolean mLiberacaoFinalizada = false;
     private boolean mComandoEnviado      = false;
 
@@ -323,27 +325,41 @@ public class PagamentoConcluido extends AppCompatActivity {
             return;
         }
 
-        // ── FN: — fim definitivo do ciclo (v5.0 — novo) ──────────────────────
+        // ── FN: — fim definitivo do ciclo (v5.1 — com acumulador entre ciclos) ─────────
         if ("FN:".equals(msg) || "FN".equals(msg)) {
             Log.i(TAG, "[FN] Ciclo encerrado definitivamente pelo ESP32");
-            // v5.0: FN: é o sinal definitivo — retomar PING aqui.
+            // v5.1: FN: é o sinal definitivo — retomar PING aqui.
             if (mBluetoothService != null) mBluetoothService.retomarPing();
             mLiberacaoFinalizada = true;
             mComandoEnviado      = false;
-
-            if (liberado < qtd_ml) {
-                int restante = qtd_ml - liberado;
-                Log.w(TAG, "[FN] Volume parcial: " + liberado + "/" + qtd_ml + "ml | restante=" + restante + "ml");
-                chamarFinishSale(liberado);
+            // v5.1: soma o ciclo atual ao total acumulado entre todos os ciclos da venda.
+            // BUG CORRIGIDO: sem isso, o app comparava apenas o volume do ciclo atual
+            // com qtd_ml e nunca detectava que a venda foi concluída em múltiplos ciclos.
+            // Exemplo: ciclo1=139ml + ciclo2=162ml = 301ml >= 300ml → venda completa.
+            liberadoTotalFloat += liberadoFloat;
+            int totalLiberado = (int) Math.round(liberadoTotalFloat);
+            Log.i(TAG, "[FN] Total acumulado: " + liberadoTotalFloat + "ml | ciclo atual: "
+                    + liberadoFloat + "ml | qtd_ml=" + qtd_ml);
+            if (totalLiberado < qtd_ml) {
+                int restante = qtd_ml - totalLiberado;
+                Log.w(TAG, "[FN] Volume parcial: " + totalLiberado + "/" + qtd_ml + "ml | restante=" + restante + "ml");
+                chamarFinishSale(totalLiberado);
+                final int totalUI = totalLiberado;
                 runOnUiThread(() -> {
-                    atualizarStatus("Fluxo interrompido. " + liberado + "/" + qtd_ml + " ML");
+                    txtMls.setText(totalUI + " ML");
+                    if (progressBar != null && qtd_ml > 0) {
+                        progressBar.setProgress((int) ((totalUI / (float) qtd_ml) * 100));
+                    }
+                    atualizarStatus("Fluxo interrompido. " + totalUI + "/" + qtd_ml + " ML");
                     btnLiberar.setText("Continuar servindo (" + restante + "ml)");
                     btnLiberar.setVisibility(View.VISIBLE);
                     mLiberacaoFinalizada = false; // permite reenvio
                 });
             } else {
-                chamarFinishSale(liberado);
+                chamarFinishSale(totalLiberado);
+                final int totalUI = totalLiberado;
                 runOnUiThread(() -> {
+                    txtMls.setText(totalUI + " ML");
                     if (progressBar != null) progressBar.setProgress(100);
                     atualizarStatus("Dosagem completa!");
                     mMainHandler.postDelayed(() -> {
@@ -355,7 +371,7 @@ public class PagamentoConcluido extends AppCompatActivity {
             return;
         }
 
-        // ── PL: — resposta de pulsos/litro ────────────────────────────────────
+        // ── PL: — resposta de pulsos/litro ─────────────────────────────────────────
         if (msg.startsWith("PL:")) {
             Log.d(TAG, "[BLE] Pulsos/litro atual: " + msg);
             return;
@@ -561,7 +577,8 @@ public class PagamentoConcluido extends AppCompatActivity {
                 Log.i(TAG, "[RETRY] Retomando dispensacao | liberadoFloat=" + liberadoFloat
                         + " | liberadoInt=" + liberadoIntReal
                         + " | restante=" + restante + "ml");
-                // Reseta o acumulador float para o novo ciclo de dispensacao
+                // v5.1: NÃO acumula aqui — o FN: do ciclo atual já acumula em liberadoTotalFloat.
+                // Apenas reseta o acumulador do ciclo corrente para o novo ciclo.
                 liberadoFloat = 0.0;
                 liberado      = 0;
                 // Reenvia $TO antes do $ML para garantir timeout correto no ESP32
