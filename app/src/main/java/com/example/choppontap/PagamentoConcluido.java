@@ -48,18 +48,25 @@ import okhttp3.ResponseBody;
 /**
  * PagamentoConcluido — Tela de liberação do chopp após pagamento confirmado.
  *
- * Protocolo NUS v4.0:
- *   Envio:    $TO:<timeout>  →  OK  (configuração — NÃO inicia watchdog)
+ * Protocolo NUS v5.0 (firmware 2026-05-05):
+ *   Envio:    $TO:<s>        →  OK  (timeout em SEGUNDOS — NÃO inicia watchdog)
  *             $ML:<volume>   →  OK  (liberação — inicia watchdog)
- *   Respostas: OK, VP:<parcial>, QP:<pulsos>, ML:<final>
+ *             $RS:           →  RS:<restante> ou RS:0 (retomada de ciclo incompleto)
+ *   Respostas: OK, IN:, VP:<parcial>, QP:<pulsos>, ML:<final>, FN:
  *
- * CORREÇÕES aplicadas (v4.1):
- *   1. BroadcastReceiver usa BLE_STATUS_ACTION / BLE_DATA_ACTION (não mais ACTION_*)
- *   2. Extração de extras usa chaves "status" / "data" (não mais EXTRA_STATUS / EXTRA_DATA)
- *   3. registerReceiver global (não mais LocalBroadcastManager — serviço usa sendBroadcast)
- *   4. enviarComandoML usa sendCommand() (não mais isReady()/write()/enqueueServeCommand())
- *   5. Watchdog só inicia após OK do $ML, não após OK do $TO
- *   6. VP:0.000 exibe "Aguardando fluxo..." em vez de "0 ML" para melhor UX
+ * Fluxo de liberação:
+ *   1. Android envia $ML:<volume>
+ *   2. ESP32 responde OK (comando enfileirado)
+ *   3. ESP32 envia IN: (válvula abriu)
+ *   4. ESP32 envia VP:<ml> a cada ~2s (volume acumulado)
+ *   5. ESP32 envia QP:<pulsos> (pulsos totais)
+ *   6. ESP32 envia ML:<ml> (volume final)
+ *   7. ESP32 envia FN: (ciclo encerrado — sinal definitivo)
+ *
+ * Retomada de ciclo incompleto:
+ *   - Opção A: Android calcula restante e envia $ML:<restante>
+ *   - Opção B: Android envia $RS: e ESP32 calcula o restante
+ *   - Ao reconectar após desconexão inesperada: enviar $RS: antes de qualquer comando
  */
 public class PagamentoConcluido extends AppCompatActivity {
 
@@ -186,7 +193,7 @@ public class PagamentoConcluido extends AppCompatActivity {
     };
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Processamento de mensagens do ESP32 (protocolo NUS v4.0)
+    // Processamento de mensagens do ESP32 (protocolo NUS v5.0)
     // ─────────────────────────────────────────────────────────────────────────
 
     private void processarMensagem(String msg) {
@@ -194,16 +201,18 @@ public class PagamentoConcluido extends AppCompatActivity {
 
         // ── OK — comando aceito pelo ESP32 ────────────────────────────────────
         if ("OK".equalsIgnoreCase(msg)) {
-            // CORREÇÃO 5: só inicia watchdog se o OK for resposta ao $ML.
-            // O $TO:N também retorna OK mas não deve iniciar o watchdog,
-            // pois o $ML ainda não foi enviado nesse momento.
-            if (mUltimoComandoEnviado.startsWith("$ML:")) {
-                Log.i(TAG, "[BLE] OK do $ML recebido — iniciando watchdog");
-                atualizarStatus("Comando aceito. Liberando chopp...");
+            // v5.0: OK do $ML inicia watchdog (aguarda IN: confirmar válvula aberta).
+            // OK do $TO, $RS, $DB não iniciam watchdog.
+            if (mUltimoComandoEnviado.startsWith(BleCommand.CMD_ML)) {
+                Log.i(TAG, "[BLE] OK do $ML recebido — aguardando IN: para confirmar abertura");
+                atualizarStatus("Comando aceito. Aguardando abertura da válvula...");
                 iniciarWatchdog();
+            } else if (mUltimoComandoEnviado.equals(BleCommand.CMD_RS)) {
+                Log.i(TAG, "[BLE] OK do $RS recebido — aguardando RS: com volume restante");
+                atualizarStatus("Retomando ciclo anterior...");
             } else {
                 Log.i(TAG, "[BLE] OK do comando '" + mUltimoComandoEnviado
-                        + "' recebido — watchdog NÃO iniciado (não é $ML)");
+                        + "' recebido — watchdog NÃO iniciado");
             }
             return;
         }
@@ -211,33 +220,64 @@ public class PagamentoConcluido extends AppCompatActivity {
         // ── ERRO — comando com erro ───────────────────────────────────────────
         if ("ERRO".equalsIgnoreCase(msg)) {
             Log.e(TAG, "[BLE] ESP32 reportou ERRO no comando '" + mUltimoComandoEnviado + "'");
-            atualizarStatus("Erro no comando. Tentando novamente...");
-            mComandoEnviado = false;
+            if (mUltimoComandoEnviado.equals(BleCommand.CMD_RS)) {
+                // $RS: retornou ERRO = nenhum ciclo anterior registrado no ESP32
+                Log.w(TAG, "[RS] Nenhum ciclo anterior no ESP32 — iniciando venda nova");
+                atualizarStatus("Nenhum ciclo anterior. Iniciando nova venda...");
+                mComandoEnviado = false;
+                enviarTimeoutESP32(10, () -> enviarComandoML(qtd_ml));
+            } else {
+                atualizarStatus("Erro no comando. Tentando novamente...");
+                mComandoEnviado = false;
+            }
             return;
         }
 
-        // ── VP: — volume parcial durante liberação ────────────────────
+        // ── IN: — válvula abriu, ciclo iniciado (v5.0 — novo) ────────────────
+        if ("IN:".equals(msg) || "IN".equals(msg)) {
+            Log.i(TAG, "[IN] Válvula abriu — ciclo iniciado");
+            resetarWatchdog(); // watchdog reinicia a partir da abertura real
+            atualizarStatus("Válvula aberta. Puxe a alavanca!");
+            return;
+        }
+
+        // ── RS: — resposta ao $RS: (volume restante do ciclo anterior) ────────
+        if (msg.startsWith("RS:")) {
+            try {
+                double restanteEsp = Double.parseDouble(msg.substring(3).trim());
+                Log.i(TAG, "[RS] Ciclo anterior: restante=" + restanteEsp + "ml");
+                if (restanteEsp > 0) {
+                    int restanteInt = (int) Math.ceil(restanteEsp);
+                    atualizarStatus("Retomando: " + restanteInt + "ml restantes...");
+                    enviarComandoML(restanteInt);
+                } else {
+                    // RS:0 = ciclo anterior já completo, inicia venda nova
+                    Log.i(TAG, "[RS] Ciclo anterior completo (RS:0) — iniciando venda nova");
+                    atualizarStatus("Iniciando nova venda...");
+                    mComandoEnviado = false;
+                    enviarTimeoutESP32(10, () -> enviarComandoML(qtd_ml));
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "[RS] Erro ao parsear RS: " + msg);
+            }
+            return;
+        }
+
+        // ── VP: — volume parcial acumulado durante liberação ──────────────────
         if (msg.startsWith("VP:")) {
             resetarWatchdog();
             try {
                 double mlFloat = Double.parseDouble(msg.substring(3).trim());
-
-                // CORREÇÃO v4.3: O ESP32 reporta VP em ml com casas decimais (ex: VP:0.340).
-                // O sensor conta pulsos e converte: cada pulso ≈ 0.17ml (com PL padrão).
-                // O código anterior descartava qualquer VP < 0.5ml como "sem fluxo",
-                // o que fazia o app ignorar TODOS os valores reais do sensor (0.17, 0.34).
-                // Correção: só ignorar VP:0.000 exato (válvula ainda fechada).
-                // Qualquer valor > 0 já indica fluxo real e deve ser acumulado.
+                // v5.0: VP reporta volume ACUMULADO desde o início do ciclo.
+                // Só ignorar VP:0.000 exato (válvula ainda fechada).
                 if (mlFloat <= 0.0) {
-                    Log.d(TAG, "[VP] VP=0.000 — aguardando início do fluxo");
+                    Log.d(TAG, "[VP] VP=0.000 — aguardando fluxo");
                     atualizarStatus("Aguardando fluxo... Puxe a alavanca.");
                 } else {
-                    // Armazena em double para não perder a parte fracionária
                     liberadoFloat = mlFloat;
                     liberado = (int) Math.round(liberadoFloat);
                     final double mlExibir = liberadoFloat;
-                    final int mlExibirInt = liberado;
-                    Log.d(TAG, "[VP] Fluxo detectado: " + mlExibir + "ml (int=" + mlExibirInt + ")");
+                    Log.d(TAG, "[VP] Volume acumulado: " + mlExibir + "ml");
                     runOnUiThread(() -> {
                         txtMls.setText(String.format("%.0f ML", mlExibir));
                         if (progressBar != null && qtd_ml > 0) {
@@ -254,52 +294,56 @@ public class PagamentoConcluido extends AppCompatActivity {
 
         // ── QP: — quantidade de pulsos ao final ───────────────────────────────
         if (msg.startsWith("QP:")) {
-            Log.i(TAG, "[BLE] Pulsos reportados: " + msg);
+            Log.i(TAG, "[BLE] Pulsos totais do ciclo: " + msg);
             return;
         }
 
-        // ── ML: — volume final liberado (CONCLUSÃO da liberação) ──────────────
+        // ── ML: — volume final liberado ───────────────────────────────────────
         if (msg.startsWith("ML:")) {
             cancelarWatchdog();
-            // CORREÇÃO v4.2: retoma o PING após o fim da dispensação.
-            if (mBluetoothService != null) mBluetoothService.retomarPing();
+            // v5.0: NÃO retomar PING aqui — aguardar FN: (sinal definitivo de fim de ciclo).
             try {
                 double mlFinal = Double.parseDouble(msg.substring(3).trim());
-                // CORREÇÃO v4.3: preserva o valor float do ESP32 para não perder
-                // volumes fracionários (ex: ML:0.34 arredondava para 0 antes).
-                // Usa o maior valor entre o ML: final e o último VP: acumulado.
                 liberadoFloat = Math.max(mlFinal, liberadoFloat);
                 liberado = (int) Math.round(liberadoFloat);
-                Log.i(TAG, "[ML] Volume final ESP32: " + mlFinal + "ml | acumulado=" + liberadoFloat + "ml | int=" + liberado);
+                Log.i(TAG, "[ML] Volume final: " + mlFinal + "ml | acumulado=" + liberadoFloat + "ml");
             } catch (Exception ignored) {}
 
+            mUltimoComandoEnviado = "";
+            Log.i(TAG, "[ML] " + liberado + "mL de " + qtd_ml + "mL — aguardando FN:");
+
+            final int libInt = liberado;
+            runOnUiThread(() -> {
+                txtMls.setText(libInt + " ML");
+                if (progressBar != null && qtd_ml > 0) {
+                    progressBar.setProgress((int) ((libInt / (float) qtd_ml) * 100));
+                }
+                atualizarStatus("Encerrando ciclo... " + libInt + "/" + qtd_ml + " ML");
+            });
+            return;
+        }
+
+        // ── FN: — fim definitivo do ciclo (v5.0 — novo) ──────────────────────
+        if ("FN:".equals(msg) || "FN".equals(msg)) {
+            Log.i(TAG, "[FN] Ciclo encerrado definitivamente pelo ESP32");
+            // v5.0: FN: é o sinal definitivo — retomar PING aqui.
+            if (mBluetoothService != null) mBluetoothService.retomarPing();
             mLiberacaoFinalizada = true;
             mComandoEnviado      = false;
-            mUltimoComandoEnviado = "";
 
-            Log.i(TAG, "[BLE] Liberacao encerrada: " + liberado + "mL de " + qtd_ml + "mL");
-
-            // Verifica se liberou menos do solicitado — exibe botão "Continuar Servindo"
             if (liberado < qtd_ml) {
                 int restante = qtd_ml - liberado;
-                Log.w(TAG, "[BLE] Volume parcial: liberado=" + liberado + " < solicitado=" + qtd_ml
-                        + " | restante=" + restante + "ml");
+                Log.w(TAG, "[FN] Volume parcial: " + liberado + "/" + qtd_ml + "ml | restante=" + restante + "ml");
                 chamarFinishSale(liberado);
                 runOnUiThread(() -> {
-                    txtMls.setText(liberado + " ML");
-                    if (progressBar != null && qtd_ml > 0) {
-                        progressBar.setProgress((int) ((liberado / (float) qtd_ml) * 100));
-                    }
                     atualizarStatus("Fluxo interrompido. " + liberado + "/" + qtd_ml + " ML");
                     btnLiberar.setText("Continuar servindo (" + restante + "ml)");
                     btnLiberar.setVisibility(View.VISIBLE);
                     mLiberacaoFinalizada = false; // permite reenvio
                 });
             } else {
-                // Liberação completa — navega para Home
                 chamarFinishSale(liberado);
                 runOnUiThread(() -> {
-                    txtMls.setText(liberado + " ML");
                     if (progressBar != null) progressBar.setProgress(100);
                     atualizarStatus("Dosagem completa!");
                     mMainHandler.postDelayed(() -> {
@@ -311,9 +355,15 @@ public class PagamentoConcluido extends AppCompatActivity {
             return;
         }
 
-        // ── PL: — resposta de pulsos/litro (não esperado aqui) ────────────────
+        // ── PL: — resposta de pulsos/litro ────────────────────────────────────
         if (msg.startsWith("PL:")) {
-            Log.d(TAG, "[BLE] Pulsos/litro: " + msg);
+            Log.d(TAG, "[BLE] Pulsos/litro atual: " + msg);
+            return;
+        }
+
+        // ── TO: — resposta ao $TO:0 (GET do timeout atual) ───────────────────
+        if (msg.startsWith("TO:")) {
+            Log.d(TAG, "[BLE] Timeout atual (ms): " + msg);
             return;
         }
 
@@ -351,12 +401,11 @@ public class PagamentoConcluido extends AppCompatActivity {
     }
 
     /**
-     * Envia $TO:<ms> antes do $ML para configurar o timeout de inatividade do ESP32.
+     * Envia $TO:<segundos> antes do $ML para configurar o timeout de inatividade do ESP32.
      *
-     * CORREÇÃO (v4.2): O protocolo NUS v4.0 define $TO em MILISSEGUNDOS.
-     * O parâmetro de entrada é em segundos (para legibilidade no código),
-     * mas a conversão para ms é feita aqui antes do envio.
-     * Ex: enviarTimeoutESP32(10, ...) → envia $TO:10000 (10 segundos em ms).
+     * v5.0: O protocolo NUS v5.0 define $TO em SEGUNDOS (firmware 2026-05-05).
+     * O firmware converte internamente para microsegundos: timeOut * 1_000_000LL.
+     * Ex: enviarTimeoutESP32(10, ...) → envia $TO:10 (10 segundos).
      *
      * Registra mUltimoComandoEnviado = "$TO:..." para que o OK resultante
      * NÃO dispare o watchdog (watchdog só deve iniciar após OK do $ML).
@@ -366,15 +415,14 @@ public class PagamentoConcluido extends AppCompatActivity {
             if (onOk != null) onOk.run();
             return;
         }
-        // CORREÇÃO v4.2: protocolo NUS v4.0 espera MILISSEGUNDOS em $TO.
-        // Convertemos o valor de segundos (legível no código) para ms antes do envio.
-        int timeoutMs = timeoutSegundos * 1000;
-        String cmd = "$TO:" + timeoutMs;
-        Log.i(TAG, "[BLE] Configurando timeout ESP32: " + cmd + " (" + timeoutSegundos + "s = " + timeoutMs + "ms)");
+        // v5.0: protocolo NUS v5.0 espera SEGUNDOS em $TO.
+        String cmd = BleCommand.buildSetTimeout(timeoutSegundos);
+        if (cmd == null) cmd = "$TO:10";
+        Log.i(TAG, "[BLE] Configurando timeout ESP32: " + cmd + " (" + timeoutSegundos + "s)");
         mUltimoComandoEnviado = cmd;
         boolean ok = mBluetoothService.sendCommand(cmd);
         if (ok) {
-            Log.i(TAG, "[BLE] Timeout configurado para " + timeoutMs + "ms (" + timeoutSegundos + "s) de inatividade");
+            Log.i(TAG, "[BLE] Timeout configurado para " + timeoutSegundos + "s de inatividade");
             // 600ms: garante que o ESP32 processou e respondeu OK ao $TO
             // antes do $ML chegar (BLE round-trip + margem para link congestionado)
             mMainHandler.postDelayed(() -> {

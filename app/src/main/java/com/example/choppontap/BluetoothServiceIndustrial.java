@@ -234,13 +234,15 @@ public class BluetoothServiceIndustrial extends Service {
             Log.w(TAG, "[CMD] RxChar ou GATT nulo");
             return false;
         }
-        // CORREÇÃO v4.2: suspende o PING ao iniciar dispensação ($ML ou $LB)
-        // e retoma quando a operação termina ($ML:0 ou após ML: recebido).
-        if (command.startsWith("$ML:") && !command.equals("$ML:0")) {
+        // v5.0: suspende o PING ao iniciar dispensação ($ML, $LB, $RS)
+        // e retoma somente ao receber FN: (fim definitivo do ciclo).
+        if (command.startsWith(BleCommand.CMD_ML) && !command.equals(BleCommand.CMD_ML + "0")) {
             pausarPing();
-        } else if (command.equals("$ML:0") || command.equals("$LB:")) {
-            // $LB: (contínuo) também suspende o PING
-            if (command.equals("$LB:")) pausarPing();
+        } else if (command.equals(BleCommand.CMD_LB)) {
+            pausarPing();
+        } else if (command.equals(BleCommand.CMD_RS)) {
+            // $RS: retoma ciclo incompleto — suspende PING pois ciclo vai reiniciar
+            pausarPing();
         }
         byte[] bytes = (command + "\n").getBytes(StandardCharsets.UTF_8);
         boolean ok;
@@ -273,8 +275,9 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     /**
-     * Retoma o keepalive PING após o fim da dispensação.
-     * Deve ser chamado quando ML: for recebido ou quando a operação for cancelada.
+     * Retoma o keepalive PING após o fim do ciclo de dispensação.
+     * Deve ser chamado ao receber FN: (fim definitivo do ciclo) ou ao cancelar.
+     * Não chamar ao receber ML: — aguardar FN: conforme protocolo v5.0.
      */
     public void retomarPing() {
         if (mDispensandoChopp) {

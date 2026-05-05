@@ -3,23 +3,25 @@ package com.example.choppontap;
 import android.util.Log;
 
 /**
- * BleConfigUtils — adaptado para firmware ASOARESBH/ESP32
+ * BleConfigUtils — Protocolo NUS v5.0 (firmware 2026-05-05)
  *
- * UUIDs: Nordic UART Service (NUS) padrão — 6E400001/2/3
+ * UUIDs: Nordic UART Service (NUS) — 6E400001/2/3
  * Nome BLE: CHOPP_ + 4 primeiros hex do eFuse MAC (= 2 primeiros octetos do wifiMac)
- * Segurança: Just Works — sem PIN, sem bond
+ * Segurança: Just Works — sem PIN, sem bond, sem createBond()
  *
  * Regra do nome (espelha geraNomeBle() do firmware):
  *   ESP.getEfuseMac() armazena o MAC WiFi com bytes invertidos.
  *   O firmware pega os 4 primeiros caracteres hex do resultado, em maiúsculas.
  *   Equivalente em Android: pegar os 2 primeiros octetos do wifiMac da API.
- *   Exemplo: wifiMac = "48:F6:EE:23:2A:6C" -> eFuse bytes 0,1 = 48,F6 -> nome = "CHOPP_48F6"
+ *   Exemplo: wifiMac = "DC:B4:D9:9A:67:1A" -> nome = "CHOPP_DCB4"
  *
- *   ATENÇÃO: o NRF Connect mostrou "CHOPP_F648" neste dispositivo específico.
- *   Isso ocorre porque o eFuse MAC pode estar invertido dependendo do chip.
- *   A função deriveBleNameFromWifiMac() tenta as duas variantes e usa a validação
- *   por prefix durante o scan — o Android aceita qualquer "CHOPP_XXXX" encontrado
- *   cujo MAC BLE bata com o esperado da API.
+ *   ATENÇÃO: o eFuse MAC pode estar invertido dependendo do chip.
+ *   A função matchesBleNameForMac() tenta as duas variantes (direta e invertida).
+ *
+ *   Prioridade de identificação no scan (conforme doc integracao 2026-05-05):
+ *   1. Se a API fornecer o campo bleName, usar isExactBleNameMatch() para comparação exata.
+ *   2. Caso contrário, derivar o nome do wifiMac via matchesBleNameForMac().
+ *   3. Rejeitar qualquer CHOPP_XXXX que não corresponda ao MAC esperado.
  */
 public class BleConfigUtils {
 
@@ -80,5 +82,35 @@ public class BleConfigUtils {
         String upper = foundName.toUpperCase();
         return upper.equals(deriveBleNameFromWifiMac(wifiMac).toUpperCase())
             || upper.equals(deriveBleNameFromWifiMacInverted(wifiMac).toUpperCase());
+    }
+
+    /**
+     * Compara o nome encontrado no scan com o bleName fornecido diretamente pela API.
+     * Usar quando a API ja fornece o campo bleName (ex: "CHOPP_DCB4").
+     * Prioridade 1 conforme doc integracao 2026-05-05.
+     */
+    public static boolean isExactBleNameMatch(String foundName, String bleName) {
+        if (foundName == null || bleName == null || bleName.isEmpty()) return false;
+        return foundName.toUpperCase().equals(bleName.toUpperCase());
+    }
+
+    /**
+     * Metodo unificado de validacao: usa bleName direto se disponivel,
+     * caso contrario deriva do wifiMac (com fallback para variante invertida).
+     *
+     * @param foundName nome encontrado no scan BLE
+     * @param bleName   campo bleName da API (pode ser null)
+     * @param wifiMac   campo wifiMac da API (pode ser null)
+     */
+    public static boolean isValidChoppDevice(String foundName, String bleName, String wifiMac) {
+        if (foundName == null) return false;
+        if (bleName != null && !bleName.isEmpty()) {
+            return isExactBleNameMatch(foundName, bleName);
+        }
+        if (wifiMac != null && !wifiMac.isEmpty()) {
+            return matchesBleNameForMac(foundName, wifiMac);
+        }
+        // Fallback: aceita qualquer CHOPP_ (nao recomendado em producao)
+        return isChoppDevice(foundName);
     }
 }
