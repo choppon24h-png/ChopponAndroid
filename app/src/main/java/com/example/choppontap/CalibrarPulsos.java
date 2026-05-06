@@ -148,7 +148,7 @@ public class CalibrarPulsos extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         EdgeToEdge.enable(this);
         setContentView(R.layout.calibrar_pulsos);
-        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT);
 
         // Tela cheia (oculta barras do sistema)
         WindowInsetsControllerCompat insetsController =
