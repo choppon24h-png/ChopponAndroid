@@ -22,6 +22,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.activity.EdgeToEdge;
+import androidx.activity.OnBackPressedCallback;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.constraintlayout.widget.ConstraintLayout;
 import androidx.core.view.WindowInsetsCompat;
@@ -337,4 +338,19 @@ public class CalibrarPulsos extends AppCompatActivity {
             btnTimeout.setEnabled(enabled);
         });
     }
+    // v5.2: Impede que o botão Voltar caia na AcessoMaster via back stack.
+    private void setupBackBlock() {
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                android.util.Log.i("CALIBRAR_PULSOS", "[KIOSK] Botão Voltar bloqueado → Home");
+                android.content.Intent intent = new android.content.Intent(CalibrarPulsos.this, Home.class);
+                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        | android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                startActivity(intent);
+                finish();
+            }
+        });
+    }
+
 }

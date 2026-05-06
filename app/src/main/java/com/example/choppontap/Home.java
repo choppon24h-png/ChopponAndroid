@@ -354,7 +354,11 @@ public class Home extends AppCompatActivity {
             secretClickCount++;
             if (secretClickCount >= 5) {
                 secretClickCount = 0;
-                startActivity(new Intent(Home.this, AcessoMaster.class));
+                // v5.2: NO_HISTORY garante que AcessoMaster não entre no back stack.
+                // Sem isso, pressionar Voltar dentro da AcessoMaster voltava ao Home,
+                // que interceptava o Back e reabria a AcessoMaster — loop infinito.
+                startActivity(new Intent(Home.this, AcessoMaster.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_NO_HISTORY));
             }
             handler.removeCallbacksAndMessages("secret_timer");
             handler.postAtTime(() -> secretClickCount = 0,
@@ -397,11 +401,13 @@ public class Home extends AppCompatActivity {
         }
 
         // 2. Intercepta o botão Back — redireciona para AcessoMaster (senha de admin)
+        // v5.2: NO_HISTORY impede que AcessoMaster entre no back stack, evitando loop.
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
                 Log.i(TAG, "[KIOSK] Botão Back interceptado → abrindo AcessoMaster");
-                startActivity(new Intent(Home.this, AcessoMaster.class));
+                startActivity(new Intent(Home.this, AcessoMaster.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_NO_HISTORY));
             }
         });
     }

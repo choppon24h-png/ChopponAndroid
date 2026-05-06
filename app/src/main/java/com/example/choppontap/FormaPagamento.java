@@ -25,6 +25,7 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.activity.OnBackPressedCallback;
 import androidx.activity.EdgeToEdge;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.cardview.widget.CardView;
@@ -154,6 +155,8 @@ public class FormaPagamento extends AppCompatActivity {
 
         setupFullscreen();
         setupCpfMask();
+        // v5.2: Bloqueia o botão Voltar — redireciona para Home sem abrir AcessoMaster.
+        setupBackBlock();
 
         btnPix.setOnClickListener(v -> handlePaymentClick("pix"));
         btnCard.setOnClickListener(v -> handlePaymentClick("credit"));
@@ -573,6 +576,19 @@ public class FormaPagamento extends AppCompatActivity {
             }
         };
         handlerCountDown.postDelayed(runnableCountDown, 1000);
+    }
+
+    // v5.2: Impede que o botão Voltar caia na AcessoMaster via back stack.
+    private void setupBackBlock() {
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                Log.i("FORMA_PAGAMENTO", "[KIOSK] Botão Voltar bloqueado → Home");
+                startActivity(new Intent(FormaPagamento.this, Home.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP));
+                finish();
+            }
+        });
     }
 
     private void setupFullscreen() {

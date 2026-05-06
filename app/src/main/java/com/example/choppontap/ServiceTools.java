@@ -29,6 +29,7 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.activity.OnBackPressedCallback;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.FileProvider;
 
@@ -141,6 +142,8 @@ public class ServiceTools extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_service_tools);
+        // v5.2: Bloqueia o botão Voltar — redireciona para Home sem abrir AcessoMaster.
+        setupBackBlock();
 
         fromOffline = getIntent().getBooleanExtra("from_offline", false);
 
@@ -927,4 +930,19 @@ public class ServiceTools extends AppCompatActivity {
             mDownloadReceiver = null;
         }
     }
+    // v5.2: Impede que o botão Voltar caia na AcessoMaster via back stack.
+    private void setupBackBlock() {
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                android.util.Log.i("SERVICE_TOOLS", "[KIOSK] Botão Voltar bloqueado → Home");
+                android.content.Intent intent = new android.content.Intent(ServiceTools.this, Home.class);
+                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        | android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                startActivity(intent);
+                finish();
+            }
+        });
+    }
+
 }

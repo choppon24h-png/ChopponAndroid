@@ -19,6 +19,7 @@ import android.widget.EditText;
 import android.widget.TextView;
 
 import androidx.activity.EdgeToEdge;
+import androidx.activity.OnBackPressedCallback;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
@@ -169,4 +170,19 @@ public class ModificarTimeout extends AppCompatActivity {
         });
 
     }
+    // v5.2: Impede que o botão Voltar caia na AcessoMaster via back stack.
+    private void setupBackBlock() {
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                android.util.Log.i("MODIFICAR_TIMEOUT", "[KIOSK] Botão Voltar bloqueado → Home");
+                android.content.Intent intent = new android.content.Intent(ModificarTimeout.this, Home.class);
+                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        | android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                startActivity(intent);
+                finish();
+            }
+        });
+    }
+
 }

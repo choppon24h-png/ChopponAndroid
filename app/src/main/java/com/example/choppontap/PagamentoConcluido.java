@@ -541,6 +541,8 @@ public class PagamentoConcluido extends AppCompatActivity {
         EdgeToEdge.enable(this);
         setContentView(R.layout.activity_pagamento_concluido);
         setupFullscreen();
+        // v5.2: Bloqueia o botão Voltar — redireciona para Home sem abrir AcessoMaster.
+        setupBackBlock();
         android_id = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
         Bundle extras = getIntent().getExtras();
         if (extras == null) { finish(); return; }
@@ -758,4 +760,19 @@ public class PagamentoConcluido extends AppCompatActivity {
         wic.hide(WindowInsetsCompat.Type.systemBars());
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT);
     }
+    // v5.2: Impede que o botão Voltar caia na AcessoMaster via back stack.
+    private void setupBackBlock() {
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                android.util.Log.i("PAGAMENTO_CONCLUIDO", "[KIOSK] Botão Voltar bloqueado → Home");
+                android.content.Intent intent = new android.content.Intent(PagamentoConcluido.this, Home.class);
+                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        | android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                startActivity(intent);
+                finish();
+            }
+        });
+    }
+
 }

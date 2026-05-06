@@ -16,6 +16,7 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.activity.OnBackPressedCallback;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 
@@ -107,6 +108,21 @@ public class AcessoMaster extends AppCompatActivity {
 
         btnAcessoQrCode.setOnClickListener(v -> iniciarFluxoQrCode());
         btnAcessoSenha.setOnClickListener(v -> mostrarInputSenha());
+
+        // v5.2: Bloqueia o botão Voltar na AcessoMaster.
+        // A tela de acesso master só pode ser acessada via 5 cliques no logo Chopp On.
+        // Pressionar Voltar redireciona para Home sem empilhar AcessoMaster no back stack.
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                Log.i(TAG, "[KIOSK] Botão Voltar na AcessoMaster → redirecionando para Home");
+                pararPolling();
+                Intent intent = new Intent(AcessoMaster.this, Home.class);
+                intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                startActivity(intent);
+                finish();
+            }
+        });
 
         edtSenhaAcesso.addTextChangedListener(new android.text.TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
