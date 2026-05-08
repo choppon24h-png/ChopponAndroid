@@ -25,7 +25,7 @@ import androidx.activity.OnBackPressedCallback;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
-import androidx.localbroadcastmanager.content.LocalBroadcastManager;
+import androidx.core.content.ContextCompat;
 import com.google.android.material.snackbar.Snackbar;
 
 /**
@@ -546,16 +546,22 @@ public class CalibrarPulsos extends AppCompatActivity {
         IntentFilter filter = new IntentFilter();
         filter.addAction(BluetoothServiceIndustrial.BLE_STATUS_ACTION);
         filter.addAction(BluetoothServiceIndustrial.BLE_DATA_ACTION);
-        LocalBroadcastManager.getInstance(this).registerReceiver(mServiceUpdateReceiver, filter);
-
+        // Usa ContextCompat.registerReceiver (broadcast global) pois
+        // BluetoothServiceIndustrial usa sendBroadcast(), nao LocalBroadcastManager.
+        // Flag RECEIVER_NOT_EXPORTED obrigatoria no Android 13+ (API 33+).
+        ContextCompat.registerReceiver(
+                this,
+                mServiceUpdateReceiver,
+                filter,
+                ContextCompat.RECEIVER_NOT_EXPORTED
+        );
         Intent serviceIntent = new Intent(this, BluetoothServiceIndustrial.class);
         bindService(serviceIntent, mServiceConnection, Context.BIND_AUTO_CREATE);
     }
-
     @Override
     protected void onPause() {
         super.onPause();
-        LocalBroadcastManager.getInstance(this).unregisterReceiver(mServiceUpdateReceiver);
+        unregisterReceiver(mServiceUpdateReceiver);
         if (mIsServiceBound) {
             unbindService(mServiceConnection);
             mIsServiceBound = false;
