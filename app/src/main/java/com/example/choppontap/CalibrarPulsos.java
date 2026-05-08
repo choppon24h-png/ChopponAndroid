@@ -8,6 +8,7 @@ import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.content.pm.ActivityInfo;
 import android.graphics.Color;
+import android.util.Log;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
@@ -76,6 +77,8 @@ public class CalibrarPulsos extends AppCompatActivity {
     private LinearLayout painelConfirmacao;
     private View      mainView;
 
+    private static final String TAG_CAL = "CALIBRAR_PULSOS";
+
     // ── BroadcastReceiver — mensagens do servico BLE ──────────────────────
     private final BroadcastReceiver mServiceUpdateReceiver = new BroadcastReceiver() {
         @Override
@@ -87,6 +90,7 @@ public class CalibrarPulsos extends AppCompatActivity {
             if (BluetoothServiceIndustrial.BLE_STATUS_ACTION.equals(action)) {
                 String status = intent.getStringExtra("status");
                 if (status == null) return;
+                Log.d(TAG_CAL, "[BLE] Status: " + status);
                 if (status.equals("Not found") || status.startsWith("disconnected")) {
                     setAllButtonsEnabled(false);
                     mostrarSnackbarReconectar();
@@ -110,10 +114,15 @@ public class CalibrarPulsos extends AppCompatActivity {
             }
 
             // ── Dados recebidos do ESP32 ───────────────────────────────────
+            // Aceita tanto BLE_DATA_ACTION quanto DATA_RECEIVED_ACTION para
+            // garantir compatibilidade com todas as versoes do servico BLE
             if (BluetoothServiceIndustrial.BLE_DATA_ACTION.equals(action)) {
                 String msg = intent.getStringExtra("data");
+                if (msg == null) msg = intent.getStringExtra("message");
                 if (msg == null) return;
-                processarMensagem(msg.trim());
+                Log.d(TAG_CAL, "[RX] Recebido: " + msg.trim());
+                final String msgFinal = msg.trim();
+                runOnUiThread(() -> processarMensagem(msgFinal));
             }
         }
     };
@@ -222,21 +231,30 @@ public class CalibrarPulsos extends AppCompatActivity {
             resetarVolumeDisplay();
             setStatusOperacao("Liberando 100 mL...", true);
             mBluetoothService.sendCommand("$ML:100\n");
-        });
-
-        // ── Botao: Liberacao continua ($LB: / para com $ML:0) ────────────
+        });        // ── Botao: Liberacao continua ($LB: / para com timeout forcado) ────────
+        // NOTA: O firmware ESP32 nao aceita $ML:0 durante $LB: (retorna ERRO).
+        // Para encerrar $LB:, o Android reduz o timeout para 1s ($TO:1),
+        // aguarda o ESP32 fechar por inatividade, e restaura o timeout original.
         btnLiberacaoContinua.setOnClickListener(v -> {
             if (!verificarServico()) return;
             if (mLiberandoContinuo) {
-                // Segundo clique: para a liberacao
-                mBluetoothService.sendCommand("$ML:0\n");
+                // Segundo clique: forca encerramento via timeout minimo
+                Log.d(TAG_CAL, "[PARAR] Forcando encerramento de $LB: via $TO:1");
+                mBluetoothService.sendCommand("$TO:1\n");
                 mLiberandoContinuo = false;
-                btnLiberacaoContinua.setText("Liberacao Continua");
+                btnLiberacaoContinua.setText("Parando...");
+                btnLiberacaoContinua.setEnabled(false);
                 btnLiberacaoContinua.setBackgroundTintList(
-                        getColorStateList(com.google.android.material.R.color.design_default_color_primary));
-                setStatusOperacao("", false);
-            } else {
-                // Primeiro clique: inicia liberacao continua
+                        android.content.res.ColorStateList.valueOf(Color.GRAY));
+                setStatusOperacao("Encerrando liberacao — aguarde...", true);
+                // Restaura o timeout original apos 3s (tempo suficiente para o ESP32 fechar)
+                handler.postDelayed(() -> {
+                    if (mIsServiceBound && mBluetoothService != null) {
+                        mBluetoothService.sendCommand("$TO:10000\n");
+                        Log.d(TAG_CAL, "[PARAR] Timeout restaurado para 10000ms");
+                    }
+                }, 3000);
+            } else {               // Primeiro clique: inicia liberacao continua
                 mLiberandoContinuo = true;
                 resetarVolumeDisplay();
                 btnLiberacaoContinua.setText("PARAR Liberacao");
@@ -353,10 +371,14 @@ public class CalibrarPulsos extends AppCompatActivity {
                 double ml = Double.parseDouble(msg.substring(3));
                 runOnUiThread(() -> {
                     txtVolumeLiberado.setText(String.format("%.3f ML", ml));
-                    mLiberando100ml = false;
-                    if (!mLiberandoContinuo) {
-                        setStatusOperacao("Ciclo encerrado: " + String.format("%.3f mL", ml), true);
-                    }
+                    mLiberando100ml    = false;
+                    mLiberandoContinuo = false;
+                    // Restaura botao de liberacao continua
+                    btnLiberacaoContinua.setText("Liberacao Continua");
+                    btnLiberacaoContinua.setEnabled(true);
+                    btnLiberacaoContinua.setBackgroundTintList(
+                            android.content.res.ColorStateList.valueOf(Color.parseColor("#FF6F00")));
+                    setStatusOperacao("Ciclo encerrado: " + String.format("%.3f mL", ml), true);
                 });
             } catch (NumberFormatException ignored) {}
             return;
@@ -367,9 +389,11 @@ public class CalibrarPulsos extends AppCompatActivity {
             runOnUiThread(() -> {
                 mLiberando100ml    = false;
                 mLiberandoContinuo = false;
+                // Restaura o botao de liberacao continua ao estado normal
                 btnLiberacaoContinua.setText("Liberacao Continua");
+                btnLiberacaoContinua.setEnabled(true);
                 btnLiberacaoContinua.setBackgroundTintList(
-                        getColorStateList(android.R.color.holo_orange_dark));
+                        android.content.res.ColorStateList.valueOf(Color.parseColor("#FF6F00")));
                 if (estadoCal == EstadoCal.CAL_CONCLUIDA) {
                     // Calibracao concluida com sucesso
                     estadoCal = EstadoCal.IDLE;
