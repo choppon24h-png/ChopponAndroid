@@ -181,15 +181,39 @@ public class AcessoMaster extends AppCompatActivity {
             @Override
             public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
                 String rb = response.body() != null ? response.body().string() : "";
-                Log.d(TAG, "[QR] Resposta generate: " + rb);
+                Log.d(TAG, "[QR] HTTP " + response.code() + " | Resposta generate: '" + rb + "'");
+                // Corpo vazio = arquivo PHP nao instalado ou com erro silencioso no servidor
+                if (rb.trim().isEmpty()) {
+                    Log.e(TAG, "[QR] Servidor retornou corpo vazio (HTTP " + response.code() + "). "
+                            + "Verifique se request_master_qr.php esta instalado no servidor.");
+                    runOnUiThread(() -> {
+                        progressQr.setVisibility(View.GONE);
+                        txtStatusQr.setText("Servidor nao respondeu. Envie o arquivo "
+                                + "request_master_qr.php para o servidor via FTP.");
+                        btnAcessoQrCode.setEnabled(true);
+                        btnAcessoSenha.setEnabled(true);
+                    });
+                    return;
+                }
                 try {
                     JSONObject json = new JSONObject(rb);
                     if (json.optBoolean("success", false)) {
                         mTokenId = json.optInt("token_id", -1);
                         String qrData = json.optString("qr_data", "");
+                        if (qrData.isEmpty() || mTokenId <= 0) {
+                            Log.e(TAG, "[QR] Resposta invalida: token_id=" + mTokenId + " qr_data='" + qrData + "'");
+                            runOnUiThread(() -> {
+                                progressQr.setVisibility(View.GONE);
+                                txtStatusQr.setText("Resposta invalida do servidor. Tente novamente.");
+                                btnAcessoQrCode.setEnabled(true);
+                                btnAcessoSenha.setEnabled(true);
+                            });
+                            return;
+                        }
                         runOnUiThread(() -> exibirQrCode(qrData));
                     } else {
                         String msg = json.optString("message", "Erro ao gerar QR Code.");
+                        Log.w(TAG, "[QR] Servidor recusou generate: " + msg);
                         runOnUiThread(() -> {
                             progressQr.setVisibility(View.GONE);
                             txtStatusQr.setText(msg);
@@ -198,7 +222,7 @@ public class AcessoMaster extends AppCompatActivity {
                         });
                     }
                 } catch (Exception e) {
-                    Log.e(TAG, "[QR] Erro ao parsear generate: " + e.getMessage());
+                    Log.e(TAG, "[QR] Erro ao parsear generate: " + e.getMessage() + " | body='" + rb + "'");
                     runOnUiThread(() -> {
                         progressQr.setVisibility(View.GONE);
                         txtStatusQr.setText("Erro ao processar resposta do servidor.");

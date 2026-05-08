@@ -239,21 +239,45 @@ public class CalibrarPulsos extends AppCompatActivity {
             if (!verificarServico()) return;
             if (mLiberandoContinuo) {
                 // Segundo clique: forca encerramento via timeout minimo
-                Log.d(TAG_CAL, "[PARAR] Forcando encerramento de $LB: via $TO:1");
-                mBluetoothService.sendCommand("$TO:1\n");
+                // Estrategia: envia $TO:1 a cada 1s por 5s para garantir que o ESP32
+                // receba mesmo que esteja processando pulsos. Apos 5s, restaura o
+                // botao e o timeout independente do FN: chegar.
+                Log.d(TAG_CAL, "[PARAR] Iniciando sequencia de encerramento de $LB:");
                 mLiberandoContinuo = false;
                 btnLiberacaoContinua.setText("Parando...");
                 btnLiberacaoContinua.setEnabled(false);
                 btnLiberacaoContinua.setBackgroundTintList(
                         android.content.res.ColorStateList.valueOf(Color.GRAY));
                 setStatusOperacao("Encerrando liberacao — aguarde...", true);
-                // Restaura o timeout original apos 3s (tempo suficiente para o ESP32 fechar)
+                // Envia $TO:1 imediatamente e repete a cada 1s por 4 vezes
+                mBluetoothService.sendCommand("$TO:1\n");
+                Log.d(TAG_CAL, "[PARAR] $TO:1 enviado (1/4)");
+                for (int i = 1; i <= 3; i++) {
+                    final int tentativa = i + 1;
+                    handler.postDelayed(() -> {
+                        if (mIsServiceBound && mBluetoothService != null) {
+                            mBluetoothService.sendCommand("$TO:1\n");
+                            Log.d(TAG_CAL, "[PARAR] $TO:1 enviado (" + tentativa + "/4)");
+                        }
+                    }, i * 1000L);
+                }
+                // Apos 5s: restaura timeout e reabilita o botao independente do FN:
                 handler.postDelayed(() -> {
                     if (mIsServiceBound && mBluetoothService != null) {
                         mBluetoothService.sendCommand("$TO:10000\n");
                         Log.d(TAG_CAL, "[PARAR] Timeout restaurado para 10000ms");
                     }
-                }, 3000);
+                    runOnUiThread(() -> {
+                        if (!mLiberandoContinuo) { // so restaura se nao foi reiniciado
+                            btnLiberacaoContinua.setText("Liberacao Continua");
+                            btnLiberacaoContinua.setEnabled(true);
+                            btnLiberacaoContinua.setBackgroundTintList(
+                                    android.content.res.ColorStateList.valueOf(Color.parseColor("#FF6F00")));
+                            setStatusOperacao("", false);
+                            Log.d(TAG_CAL, "[PARAR] Botao restaurado apos 5s");
+                        }
+                    });
+                }, 5000L);
             } else {               // Primeiro clique: inicia liberacao continua
                 mLiberandoContinuo = true;
                 resetarVolumeDisplay();
