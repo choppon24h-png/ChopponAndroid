@@ -74,6 +74,37 @@ public class Home extends AppCompatActivity {
     private int secretClickCount = 0;
     private final Handler handler = new Handler();
 
+    // ── Polling de status da TAP ──────────────────────────────────────────────
+    /**
+     * Receiver que escuta o TapStatusPollingService.
+     * Quando o ERP desativa a TAP (status=0), desconecta o BLE e navega para OfflineTap.
+     */
+    private final BroadcastReceiver mTapStatusReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!TapStatusPollingService.ACTION_TAP_STATUS_CHANGED.equals(intent.getAction())) return;
+
+            int status = intent.getIntExtra(TapStatusPollingService.EXTRA_STATUS, 1);
+            Log.i(TAG, "[POLL] Status da TAP recebido via broadcast: " + status);
+
+            if (status == 0) {
+                // TAP desativada pelo ERP → desconecta BLE e vai para OfflineTap
+                Log.w(TAG, "[POLL] TAP DESATIVADA pelo ERP → redirecionando para OfflineTap");
+                Toast.makeText(Home.this, "TAP desativada pelo sistema", Toast.LENGTH_LONG).show();
+                redirecionarOffline();
+            } else {
+                // TAP continua ativa — atualiza dados se mudaram
+                String bebidaNova = intent.getStringExtra(TapStatusPollingService.EXTRA_BEBIDA);
+                float  precoNovo  = intent.getFloatExtra(TapStatusPollingService.EXTRA_PRECO, 0f);
+                String imageNova  = intent.getStringExtra(TapStatusPollingService.EXTRA_IMAGE);
+                if (bebidaNova != null && !bebidaNova.isEmpty()) {
+                    Log.d(TAG, "[POLL] Dados atualizados via poll: bebida=" + bebidaNova);
+                    updateFields(bebidaNova, precoNovo, imageNova);
+                }
+            }
+        }
+    };
+
     // ── Pulsação aleatória ────────────────────────────────────────────────────
     /** Handler dedicado ao agendamento da pulsação aleatória */
     private final Handler pulseHandler = new Handler();
@@ -261,6 +292,10 @@ public class Home extends AppCompatActivity {
 
         // Vincula o BluetoothService — onServiceConnected() dispara o scan
         bindBluetoothService();
+
+        // Inicia o polling de status da TAP (TAP online = status 1)
+        TapStatusPollingService.start(this, 1);
+        Log.i(TAG, "[POLL] TapStatusPollingService iniciado");
     }
 
     @Override
@@ -271,6 +306,10 @@ public class Home extends AppCompatActivity {
         // Registra o receiver para receber broadcasts de status BLE
         IntentFilter filter = new IntentFilter(BluetoothServiceIndustrial.BLE_STATUS_ACTION);
         LocalBroadcastManager.getInstance(this).registerReceiver(mServiceUpdateReceiver, filter);
+
+        // Registra o receiver para receber broadcasts de status da TAP (polling)
+        IntentFilter tapFilter = new IntentFilter(TapStatusPollingService.ACTION_TAP_STATUS_CHANGED);
+        LocalBroadcastManager.getInstance(this).registerReceiver(mTapStatusReceiver, tapFilter);
 
         // Inicia o watchdog de fallback BLE
         startBleWatchdog();
@@ -296,6 +335,7 @@ public class Home extends AppCompatActivity {
     protected void onPause() {
         super.onPause();
         LocalBroadcastManager.getInstance(this).unregisterReceiver(mServiceUpdateReceiver);
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(mTapStatusReceiver);
         stopBleWatchdog();
     }
 
@@ -310,6 +350,8 @@ public class Home extends AppCompatActivity {
             unbindService(mServiceConnection);
             mIsServiceBound = false;
         }
+        // Polling continua rodando em background (parado apenas pelo OfflineTap quando TAP ativa)
+        // Não parar aqui pois o serviço precisa continuar durante a navegação para OfflineTap
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -31,6 +31,9 @@
     <!-- Permissão para exibir notificações (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Permissão para TapStatusPollingService (dataSync) no Android 14+ -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
     <!-- Permissões para sistema de atualização de APK (v3.2.0) -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
@@ -122,6 +125,15 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- TapStatusPollingService: polling de status da TAP em background.
+             foregroundServiceType="dataSync" cobre requisições HTTP periódicas.
+             Obrigatório no Android 14+ (targetSdk 34+). -->
+        <service
+            android:name=".TapStatusPollingService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <!-- FileProvider para instalação de APK via sistema de atualização (v3.2.0) -->
         <provider
