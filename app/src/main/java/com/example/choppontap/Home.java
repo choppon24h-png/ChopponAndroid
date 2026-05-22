@@ -126,6 +126,13 @@ public class Home extends AppCompatActivity {
     private boolean mIsServiceBound = false;
 
     /**
+     * Flag de proteção: quando true, o Home está em processo de redirecionamento
+     * para OfflineTap. Evita que o watchdog BLE, o mServiceUpdateReceiver ou
+     * qualquer outro handler interfira após a decisão de redirecionar.
+     */
+    private volatile boolean mIsRedirecting = false;
+
+    /**
      * Watchdog de fallback BLE.
      *
      * PROBLEMA: O ESP32 pode estar fisicamente conectado (LED azul) mas o
@@ -603,13 +610,31 @@ public class Home extends AppCompatActivity {
     public void updateFields(String bebida, Float preco, String imageUrl) {
         this.bebida    = bebida;
         this.valorBase = preco;
-        this.imagemUrl = imageUrl;
 
-        Log.d(TAG, "updateFields: bebida=" + bebida + " preco=" + preco + " imageUrl=" + imageUrl);
+        // Normaliza a URL da imagem: o poll pode retornar caminho relativo
+        // (ex: "uploads/bebidas/xxx.jpg") enquanto o verify_tap retorna URL completa.
+        // Garante sempre URL absoluta para o ApiHelper.
+        String imageUrlNormalizada = imageUrl;
+        if (imageUrl != null && !imageUrl.isEmpty()
+                && !imageUrl.startsWith("http://")
+                && !imageUrl.startsWith("https://")) {
+            String base = ApiConfig.getBaseUrl(); // ex: "https://ochoppoficial.com.br/api/"
+            // Remove o sufixo "/api/" para obter a raiz do domínio
+            if (base.endsWith("/api/")) {
+                base = base.substring(0, base.length() - 5); // remove "/api/"
+            } else if (base.endsWith("/")) {
+                base = base.substring(0, base.length() - 1);
+            }
+            imageUrlNormalizada = base + "/" + imageUrl;
+            Log.d(TAG, "updateFields: URL relativa normalizada → " + imageUrlNormalizada);
+        }
+        this.imagemUrl = imageUrlNormalizada;
+
+        Log.d(TAG, "updateFields: bebida=" + bebida + " preco=" + preco + " imageUrl=" + imageUrlNormalizada);
 
         if (txtBebida != null) txtBebida.setText(bebida);
         updateValue(preco);
-        carregarImagem(imageUrl);
+        carregarImagem(imageUrlNormalizada);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -902,11 +927,36 @@ public class Home extends AppCompatActivity {
     }
 
     private void redirecionarOffline() {
+        // Proteção contra chamadas duplicadas (watchdog + receiver podem chamar ao mesmo tempo)
+        if (mIsRedirecting) {
+            Log.d(TAG, "redirecionarOffline: já em andamento, ignorando chamada duplicada");
+            return;
+        }
+        mIsRedirecting = true;
+
         runOnUiThread(() -> {
             Log.i(TAG, "TAP desativada → desconectando BT e navegando para OfflineTap");
+
+            // 1. Para animações e watchdog imediatamente
+            stopRandomPulse();
+            stopBleWatchdog();
+
+            // 2. Desregistra receivers ANTES de desconectar o BLE
+            //    Isso evita que o mServiceUpdateReceiver receba o broadcast
+            //    de 'disconnected' e tente corrigir a UI enquanto estamos saindo
+            try {
+                LocalBroadcastManager.getInstance(Home.this).unregisterReceiver(mServiceUpdateReceiver);
+            } catch (Exception ignored) {}
+            try {
+                LocalBroadcastManager.getInstance(Home.this).unregisterReceiver(mTapStatusReceiver);
+            } catch (Exception ignored) {}
+
+            // 3. Desconecta o BLE
             if (mIsServiceBound && mBluetoothService != null) {
                 mBluetoothService.disconnect(true);
             }
+
+            // 4. Navega para OfflineTap com limpeza completa da back stack
             Intent intent = new Intent(Home.this, OfflineTap.class);
             intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP
                     | Intent.FLAG_ACTIVITY_NEW_TASK
