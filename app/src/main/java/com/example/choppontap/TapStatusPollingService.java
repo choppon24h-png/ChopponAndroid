@@ -117,19 +117,28 @@ public class TapStatusPollingService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null) {
-            int currentStatus = intent.getIntExtra(EXTRA_CURRENT_STATUS, -1);
-            if (currentStatus != -1) {
-                lastKnownStatus = currentStatus;
-                Log.d(TAG, "Status inicial recebido via Intent: " + currentStatus);
-            }
-        }
+        boolean alreadyRunning = sRunning.getAndSet(true);
 
-        if (!sRunning.getAndSet(true)) {
-            Log.i(TAG, "Iniciando loop de polling");
+        if (!alreadyRunning) {
+            // ── Primeira inicialização: aceita o status inicial informado pela Activity
+            if (intent != null) {
+                int currentStatus = intent.getIntExtra(EXTRA_CURRENT_STATUS, -1);
+                if (currentStatus != -1) {
+                    lastKnownStatus = currentStatus;
+                    Log.d(TAG, "Status inicial recebido via Intent: " + currentStatus);
+                }
+            }
+            Log.i(TAG, "Iniciando loop de polling | lastKnownStatus=" + lastKnownStatus);
             schedulePoll(0); // Primeiro poll imediato
         } else {
-            Log.d(TAG, "Polling já estava rodando — ignorando start duplicado");
+            // ── Serviço já rodando: NÃO sobrescreve lastKnownStatus
+            // CORREÇÃO BUG: Home.onCreate() chama start(this, 1) e OfflineTap chama
+            // start(this, 0). Se o serviço já está rodando e acabou de detectar
+            // status=0 (TAP desativada), um start(this, 1) subsequente resetava
+            // lastKnownStatus para 1, fazendo o próximo poll ignorar a mudança
+            // (newStatus=0 == lastKnownStatus=0 → sem broadcast).
+            // Agora o lastKnownStatus só é definido na PRIMEIRA inicialização.
+            Log.d(TAG, "Polling já estava rodando — ignorando start duplicado (lastKnownStatus preservado=" + lastKnownStatus + ")");
         }
 
         return START_STICKY; // Reinicia automaticamente se o sistema matar o serviço
@@ -215,6 +224,7 @@ public class TapStatusPollingService extends Service {
                                 + " (" + json.optString("status_label") + ")");
 
                         lastKnownStatus = newStatus;
+                        sLastKnownStatusStatic = newStatus; // Atualiza cópia estática para acesso externo
 
                         // Atualiza notificação foreground
                         String notifText = newStatus == 1
@@ -298,6 +308,20 @@ public class TapStatusPollingService extends Service {
     public static boolean isRunning() {
         return sRunning.get();
     }
+
+    /**
+     * Retorna o último status conhecido da TAP.
+     * Usado por Home.onResume() para detectar se a TAP foi desativada
+     * enquanto o receiver estava desregistrado (ex: durante tela de pagamento).
+     *
+     * @return 0=offline, 1=online, -1=desconhecido (serviço não fez nenhum poll ainda)
+     */
+    public static int getLastKnownStatus() {
+        return sLastKnownStatusStatic;
+    }
+
+    /** Cópia estática do lastKnownStatus para acesso externo sem bind */
+    private static volatile int sLastKnownStatusStatic = -1;
 
     /**
      * Inicia o serviço de polling.

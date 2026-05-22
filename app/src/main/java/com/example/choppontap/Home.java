@@ -314,6 +314,21 @@ public class Home extends AppCompatActivity {
         // Inicia o watchdog de fallback BLE
         startBleWatchdog();
 
+        // CORREÇÃO: Ao retornar de FormaPagamento/PagamentoConcluido, o receiver
+        // mTapStatusReceiver estava desregistrado (onPause foi chamado ao sair).
+        // Se a TAP foi desativada ENQUANTO o usuário estava na tela de pagamento,
+        // o broadcast já passou e não será reenviado. Por isso, ao retornar ao Home,
+        // verificamos o último status conhecido pelo serviço de polling diretamente.
+        if (TapStatusPollingService.isRunning()) {
+            int lastStatus = TapStatusPollingService.getLastKnownStatus();
+            Log.d(TAG, "onResume: último status do polling=" + lastStatus);
+            if (lastStatus == 0) {
+                Log.w(TAG, "onResume: TAP estava desativada durante navegação → redirecionando para OfflineTap");
+                redirecionarOffline();
+                return;
+            }
+        }
+
         // Se já vinculado, sincroniza o estado da UI com o estado real do serviço
         if (mIsServiceBound && mBluetoothService != null) {
             if (isBleReady()) {
