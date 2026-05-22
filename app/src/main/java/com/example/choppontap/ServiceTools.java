@@ -64,20 +64,24 @@ import okhttp3.ResponseBody;
  *      → Home.onCreate() chama sendRequestCheckSecurity() + bindBluetoothService()
  *        que recarrega bebida, imagem, preço e conecta ao ESP32
  *
- * Sistema de ATUALIZAÇÃO DE APK (v3.2.0):
- *   - checkAppUpdate(Context)  → consulta version.json no servidor
+ * Sistema de ATUALIZAÇÃO DE APK (v3.3.0 — migrado do AcessoMaster):
+ *   - checkAppUpdate(Context)  → GET /api/app_version.php (com fallback para version.json)
  *   - downloadNewVersion(...)  → baixa o APK via DownloadManager
  *   - installApk(File)         → instala via FileProvider (Android 7+)
  *   Não interfere em nenhuma lógica existente.
- *   Acionado apenas pelo botão btnAtualizarApp ou chamada manual.
+ *   Acionado apenas pelo botão btnAtualizarApp.
+ *
+ * NOTA: A lógica de atualização foi centralizada aqui (ServiceTools).
+ *       O AcessoMaster contém apenas QR Code e Senha.
  */
 public class ServiceTools extends AppCompatActivity {
 
     private static final String TAG = "SERVICE_TOOLS";
 
-    // ── URL do endpoint de versão (alterar para o servidor real) ─────────────
+    // ── URL do endpoint de versão — usa o endpoint PHP do ERP (com fallback para version.json)
+    // Fonte de verdade: admin/app_update.php no ERP publica a versão no banco e sincroniza o JSON
     private static final String VERSION_URL =
-            "https://ochoppoficial.com.br/app/version.json";
+            ApiConfig.getBaseUrl() + "app_version.php";
 
     // ── Nome do arquivo APK salvo no Downloads ────────────────────────────────
     private static final String APK_FILE_NAME = "choppontap-update.apk";
@@ -227,7 +231,17 @@ public class ServiceTools extends AppCompatActivity {
      * @param context Context da Activity chamadora
      */
     public static void checkAppUpdate(Context context) {
-        Log.d(TAG, "checkAppUpdate() iniciado");
+        Log.d(TAG, "[UPDATE] checkAppUpdate() iniciado — URL: " + VERSION_URL);
+
+        // Desabilita o botão e mostra progresso se chamado de dentro da própria Activity
+        if (context instanceof ServiceTools) {
+            ServiceTools st = (ServiceTools) context;
+            if (st.btnAtualizarApp != null) {
+                st.btnAtualizarApp.setEnabled(false);
+                st.btnAtualizarApp.setText("Verificando...");
+            }
+            if (st.progressUpdate != null) st.progressUpdate.setVisibility(View.VISIBLE);
+        }
 
         OkHttpClient client = new OkHttpClient();
         Request request = new Request.Builder()
@@ -238,12 +252,15 @@ public class ServiceTools extends AppCompatActivity {
         client.newCall(request).enqueue(new okhttp3.Callback() {
             @Override
             public void onFailure(okhttp3.Call call, IOException e) {
-                Log.e(TAG, "checkAppUpdate - falha de rede: " + e.getMessage());
+                Log.e(TAG, "[UPDATE] Falha de rede: " + e.getMessage());
                 if (context instanceof AppCompatActivity) {
-                    ((AppCompatActivity) context).runOnUiThread(() ->
-                            Toast.makeText(context,
-                                    "Não foi possível verificar atualizações.\nVerifique a conexão.",
-                                    Toast.LENGTH_LONG).show());
+                    AppCompatActivity activity = (AppCompatActivity) context;
+                    activity.runOnUiThread(() -> {
+                        if (context instanceof ServiceTools) ((ServiceTools) context).resetUpdateButton();
+                        Toast.makeText(context,
+                                "Não foi possível verificar atualizações.\nVerifique a conexão Wi-Fi.",
+                                Toast.LENGTH_LONG).show();
+                    });
                 }
             }
 
@@ -251,29 +268,45 @@ public class ServiceTools extends AppCompatActivity {
             public void onResponse(okhttp3.Call call, okhttp3.Response response) throws IOException {
                 try (okhttp3.ResponseBody rb = response.body()) {
                     if (!response.isSuccessful() || rb == null) {
-                        Log.e(TAG, "checkAppUpdate - resposta inválida HTTP " + response.code());
+                        Log.e(TAG, "[UPDATE] Resposta inválida HTTP " + response.code());
+                        if (context instanceof AppCompatActivity) {
+                            AppCompatActivity activity = (AppCompatActivity) context;
+                            activity.runOnUiThread(() -> {
+                                if (context instanceof ServiceTools) ((ServiceTools) context).resetUpdateButton();
+                                Toast.makeText(context,
+                                        "Servidor retornou erro " + response.code() + ". Tente novamente.",
+                                        Toast.LENGTH_LONG).show();
+                            });
+                        }
                         return;
                     }
 
                     String json = rb.string();
-                    Log.d(TAG, "checkAppUpdate - version.json: " + json);
+                    Log.d(TAG, "[UPDATE] Resposta: " + json);
 
-                    // Parsear o JSON de versão
                     VersionInfo info = parseVersionJson(json);
                     if (info == null) {
-                        Log.e(TAG, "checkAppUpdate - falha ao parsear version.json");
+                        Log.e(TAG, "[UPDATE] Falha ao parsear JSON de versão");
+                        if (context instanceof AppCompatActivity) {
+                            ((AppCompatActivity) context).runOnUiThread(() -> {
+                                if (context instanceof ServiceTools) ((ServiceTools) context).resetUpdateButton();
+                                Toast.makeText(context, "Erro ao processar resposta do servidor.", Toast.LENGTH_LONG).show();
+                            });
+                        }
                         return;
                     }
 
-                    // Obter versionCode atual do app instalado
                     int currentVersionCode = getCurrentVersionCode(context);
-                    Log.d(TAG, "checkAppUpdate - versão atual: " + currentVersionCode
-                            + " | versão servidor: " + info.versionCode);
+                    Log.d(TAG, "[UPDATE] Versão instalada: " + currentVersionCode
+                            + " | Versão servidor: " + info.versionCode
+                            + " | Nome: " + info.versionName);
 
                     if (context instanceof AppCompatActivity) {
                         AppCompatActivity activity = (AppCompatActivity) context;
-                        activity.runOnUiThread(() ->
-                                handleUpdateResult(activity, info, currentVersionCode));
+                        activity.runOnUiThread(() -> {
+                            if (context instanceof ServiceTools) ((ServiceTools) context).resetUpdateButton();
+                            handleUpdateResult(activity, info, currentVersionCode);
+                        });
                     }
                 }
             }
@@ -289,8 +322,8 @@ public class ServiceTools extends AppCompatActivity {
         if (info.versionCode > currentVersionCode) {
             // Nova versão disponível
             String titulo   = "Nova atualização disponível";
-            String mensagem = "Versão " + info.versionName + " disponível.\n\n"
-                    + "Versão atual: " + getCurrentVersionName(activity) + "\n\n"
+            String mensagem = "Versão " + info.versionName + " disponível.\n"
+                    + "Versão instalada: " + getCurrentVersionName(activity) + "\n\n"
                     + (info.changelog != null && !info.changelog.isEmpty()
                     ? "O que há de novo:\n" + info.changelog : "");
 
