@@ -154,6 +154,24 @@
     </LinearLayout>
 
     <!-- ══════════════════════════════════════════════════════════════
+         INDICADOR DE POLLING (aguardando reativação pelo sistema)
+         Visível apenas quando a TAP está offline e o polling está ativo
+         ══════════════════════════════════════════════════════════════ -->
+    <TextView
+        android:id="@+id/txtStatusPoll"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Aguardando reativação pelo sistema..."
+        android:textColor="#55FFFFFF"
+        android:textSize="11sp"
+        android:gravity="center"
+        android:layout_marginBottom="12dp"
+        app:layout_constraintBottom_toTopOf="@+id/layoutNextTap"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        android:visibility="gone" />
+
+    <!-- ══════════════════════════════════════════════════════════════
          CONTADOR SECRETO (invisível, para feedback visual dos cliques)
          ══════════════════════════════════════════════════════════════ -->
     <TextView
