@@ -56,6 +56,14 @@ public class CalibrarPulsos extends AppCompatActivity {
     private boolean mLiberandoContinuo = false;   // $LB: ativo
     private boolean mLiberando100ml    = false;   // $ML:100 ativo
 
+    // ── Ultimo VP recebido (para nao exibir valor antigo ao iniciar nova acao) ──
+    // O ESP32 so envia VP: quando ha fluxo ativo. Se o usuario inicia uma nova
+    // acao sem que o ESP32 tenha resetado o contador (ex: reinicia $LB: logo apos
+    // parar), o display continuaria mostrando o ultimo VP: recebido. Por isso,
+    // resetamos o display localmente ao iniciar qualquer acao E enviamos $RS:
+    // para zerar o acumulador VP no ESP32.
+    private double mUltimoVp = 0.0;
+
     // ── Servico BLE ───────────────────────────────────────────────────────
     private BluetoothServiceIndustrial mBluetoothService;
     private boolean mIsServiceBound = false;
@@ -230,7 +238,16 @@ public class CalibrarPulsos extends AppCompatActivity {
             mLiberando100ml = true;
             resetarVolumeDisplay();
             setStatusOperacao("Liberando 100 mL...", true);
-            mBluetoothService.sendCommand("$ML:100\n");
+            // CORRECAO: envia $RS: para zerar o acumulador VP no ESP32 antes de
+            // iniciar o novo ciclo. Sem isso, o display mostra o VP do ciclo anterior
+            // ate o ESP32 comecar a enviar novos VP:.
+            Log.d(TAG_CAL, "[RESET] Enviando $RS: antes de $ML:100");
+            mBluetoothService.sendCommand("$RS:\n");
+            handler.postDelayed(() -> {
+                if (mIsServiceBound && mBluetoothService != null) {
+                    mBluetoothService.sendCommand("$ML:100\n");
+                }
+            }, 150);
         });        // ── Botao: Liberacao continua ($LB: / para com timeout forcado) ────────
         // NOTA: O firmware ESP32 nao aceita $ML:0 durante $LB: (retorna ERRO).
         // Para encerrar $LB:, o Android reduz o timeout para 1s ($TO:1),
@@ -281,6 +298,9 @@ public class CalibrarPulsos extends AppCompatActivity {
             } else {               // Primeiro clique: inicia liberacao continua
                 mLiberandoContinuo = true;
                 resetarVolumeDisplay();
+                // CORRECAO: zera o acumulador VP no ESP32 antes de iniciar $LB:
+                Log.d(TAG_CAL, "[RESET] Enviando $RS: antes de $LB:");
+                mBluetoothService.sendCommand("$RS:\n");
                 btnLiberacaoContinua.setText("PARAR Liberacao");
                 btnLiberacaoContinua.setBackgroundTintList(
                         android.content.res.ColorStateList.valueOf(Color.parseColor("#FF5252")));
@@ -299,7 +319,14 @@ public class CalibrarPulsos extends AppCompatActivity {
             estadoCal = EstadoCal.CAL_DISPENSANDO;
             resetarVolumeDisplay();
             atualizarUiEstado();
-            mBluetoothService.sendCommand("$CA:300\n");
+            // CORRECAO: zera o acumulador VP no ESP32 antes de iniciar calibracao
+            Log.d(TAG_CAL, "[RESET] Enviando $RS: antes de $CA:300");
+            mBluetoothService.sendCommand("$RS:\n");
+            handler.postDelayed(() -> {
+                if (mIsServiceBound && mBluetoothService != null) {
+                    mBluetoothService.sendCommand("$CA:300\n");
+                }
+            }, 150);
         });
 
         // ── Botao: Confirmar Medicao ($CF:<ml_real>) ──────────────────────
@@ -344,9 +371,21 @@ public class CalibrarPulsos extends AppCompatActivity {
     private void processarMensagem(String msg) {
 
         // ── VP: — volume parcial em tempo real ────────────────────────────
+        // CORRECAO: ignora VP: se o valor for menor ou igual ao ultimo VP recebido
+        // E nenhuma operacao esta ativa. Isso evita que um VP: residual do ciclo
+        // anterior sobrescreva o display apos o reset.
         if (msg.startsWith("VP:")) {
             try {
                 double ml = Double.parseDouble(msg.substring(3));
+                // Se o display foi resetado (mUltimoVp=0) e chegou um VP: com valor
+                // alto sem nenhuma operacao ativa, e um VP: residual — ignora.
+                boolean operacaoAtiva = mLiberando100ml || mLiberandoContinuo
+                        || estadoCal != EstadoCal.IDLE;
+                if (!operacaoAtiva && ml > 0 && mUltimoVp == 0.0) {
+                    Log.d(TAG_CAL, "[VP] Ignorando VP: residual (" + ml + ") — nenhuma operacao ativa");
+                    return;
+                }
+                mUltimoVp = ml;
                 runOnUiThread(() ->
                     txtVolumeLiberado.setText(String.format("%.3f ML", ml))
                 );
@@ -513,6 +552,7 @@ public class CalibrarPulsos extends AppCompatActivity {
     // Helpers de UI
     // ─────────────────────────────────────────────────────────────────────
     private void resetarVolumeDisplay() {
+        mUltimoVp = 0.0;
         runOnUiThread(() -> txtVolumeLiberado.setText("0.000 ML"));
     }
 
