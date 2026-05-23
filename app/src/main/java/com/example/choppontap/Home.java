@@ -74,6 +74,16 @@ public class Home extends AppCompatActivity {
     private int secretClickCount = 0;
     private final Handler handler = new Handler();
 
+    // ── Controle de fluxo de pagamento ────────────────────────────────────────
+    /**
+     * Flag que indica que o usuário está em uma tela filha legítima (pagamento,
+     * conclusão de pagamento). Enquanto true, o Kiosk recovery em
+     * onWindowFocusChanged NÃO força o retorno ao Home, evitando o loop de
+     * conectar/desconectar BLE causado pelo app ser trazido ao primeiro plano
+     * enquanto FormaPagamento ou PagamentoConcluido estão ativas.
+     */
+    private boolean mIsInPaymentFlow = false;
+
     // ── Polling de status da TAP ──────────────────────────────────────────────
     /**
      * Receiver que escuta o TapStatusPollingService.
@@ -310,6 +320,11 @@ public class Home extends AppCompatActivity {
         super.onResume();
         secretClickCount = 0;
 
+        // Ao retornar de qualquer tela filha (pagamento, conclusão), reseta a flag
+        // de fluxo de pagamento para que o Kiosk recovery volte a funcionar normalmente.
+        mIsInPaymentFlow = false;
+        Log.d(TAG, "onResume: mIsInPaymentFlow resetado para false");
+
         // Registra o receiver para receber broadcasts de status BLE
         IntentFilter filter = new IntentFilter(BluetoothServiceIndustrial.BLE_STATUS_ACTION);
         LocalBroadcastManager.getInstance(this).registerReceiver(mServiceUpdateReceiver, filter);
@@ -489,12 +504,19 @@ public class Home extends AppCompatActivity {
         } else {
             // App perdeu foco — força retorno ao primeiro plano após 400ms
             // (cobre casos onde Task Pinning não está ativo)
+            // CORREÇÃO: NÃO forçar retorno se o usuário está em fluxo de pagamento legítimo.
+            // Sem essa guarda, o Home era trazido ao primeiro plano sobre FormaPagamento/
+            // PagamentoConcluido, causando loop rápido de onResume → BLE rebind → watchdog.
             handler.postDelayed(() -> {
                 try {
+                    if (mIsInPaymentFlow) {
+                        Log.d(TAG, "[KIOSK] App perdeu foco mas está em fluxo de pagamento — recovery suprimido");
+                        return;
+                    }
                     ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
                     boolean lockActive = am != null &&
                             am.getLockTaskModeState() != ActivityManager.LOCK_TASK_MODE_NONE;
-                    if (!lockActive && !isFinishing() && !isDestroyed()) {
+                    if (!lockActive && !isFinishing() && !isDestroyed() && !mIsRedirecting) {
                         Log.i(TAG, "[KIOSK] App perdeu foco sem Task Pinning → forçando retorno");
                         Intent intent = new Intent(Home.this, Home.class);
                         intent.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
@@ -903,6 +925,10 @@ public class Home extends AppCompatActivity {
                 it.putExtra("imagem_url", imagemUrl);
             }
             Log.i(TAG, "Abrindo pagamento: " + volumeMl + "ml R$" + valor + " imagemUrl=" + imagemUrl);
+            // Sinaliza que o app está em fluxo de pagamento legítimo.
+            // Isso suprime o Kiosk recovery em onWindowFocusChanged, evitando que
+            // o Home seja trazido ao primeiro plano sobre FormaPagamento/PagamentoConcluido.
+            mIsInPaymentFlow = true;
             startActivity(it);
         } else {
             Toast.makeText(this, "Aguardando conexão Bluetooth...", Toast.LENGTH_SHORT).show();
