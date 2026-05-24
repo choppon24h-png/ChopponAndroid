@@ -1,6 +1,7 @@
 package com.example.choppontap;
 
 import android.content.BroadcastReceiver;
+import androidx.core.content.ContextCompat;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -736,7 +737,9 @@ public class CalibrarPulsos extends AppCompatActivity {
         IntentFilter filter = new IntentFilter();
         filter.addAction(BluetoothServiceIndustrial.BLE_STATUS_ACTION);
         filter.addAction(BluetoothServiceIndustrial.BLE_DATA_ACTION);
-        registerReceiver(mServiceUpdateReceiver, filter);
+        // Android 13+ (API 33) exige RECEIVER_NOT_EXPORTED para receivers nao-sistema
+        ContextCompat.registerReceiver(this, mServiceUpdateReceiver, filter,
+                ContextCompat.RECEIVER_NOT_EXPORTED);
 
         Intent serviceIntent = new Intent(this, BluetoothServiceIndustrial.class);
         bindService(serviceIntent, mServiceConnection, Context.BIND_AUTO_CREATE);

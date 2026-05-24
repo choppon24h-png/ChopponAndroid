@@ -439,8 +439,15 @@ public class ServiceTools extends AppCompatActivity {
             }
         };
 
-        registerReceiver(mDownloadReceiver,
-                new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
+        // DownloadManager é broadcast do sistema → RECEIVER_EXPORTED obrigatório no Android 13+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(mDownloadReceiver,
+                    new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+                    RECEIVER_EXPORTED);
+        } else {
+            registerReceiver(mDownloadReceiver,
+                    new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
+        }
     }
 
     /**
