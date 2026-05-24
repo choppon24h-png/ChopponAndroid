@@ -12,20 +12,21 @@ import android.util.Log;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
-import android.provider.Settings;
 import android.text.TextUtils;
 import android.view.View;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 import androidx.activity.EdgeToEdge;
 import androidx.activity.OnBackPressedCallback;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
-import androidx.core.content.ContextCompat;
 import com.google.android.material.snackbar.Snackbar;
 
 /**
@@ -35,16 +36,16 @@ import com.google.android.material.snackbar.Snackbar;
  *
  * Funcoes disponíveis:
  *   1. Liberar 100 mL ($ML:100) — teste rapido
- *   2. Liberacao continua ($LB:) — fecha por $ML:0
- *   3. Calibracao automatica ($CA:300 -> $CF:<ml_real>) — 2 passos
+ *   2. Liberacao continua ($LB:) — fecha por timeout forcado ($TO:1)
+ *   3. Calibracao automatica — NOVO FLUXO 3 ETAPAS:
+ *        ETAPA 1: Usuario informa volume desejado → confirma
+ *        ETAPA 2: Sistema envia $RS: + $CA:<volume> → ESP32 dispensa
+ *        ETAPA 3: Usuario mede na proveta → informa volume real → $CF:<ml_real>
  *   4. Salvar pulsos/litro manual ($PL:<n>)
- *   5. Modificar Timeout -> navega para ModificarTimeout
- *
- * Volume Aferido: exibe VP: em tempo real para qualquer funcao ativa.
- * Painel de Calibracao: aparece somente apos CA: recebido do ESP32.
+ *   5. Modificar Timeout → navega para ModificarTimeout
  *
  * Maquina de estados de calibracao:
- *   IDLE -> CAL_DISPENSANDO -> CAL_AGUARDANDO -> CAL_CONCLUIDA -> IDLE
+ *   IDLE → CAL_DISPENSANDO → CAL_AGUARDANDO → CAL_CONCLUIDA → IDLE
  */
 public class CalibrarPulsos extends AppCompatActivity {
 
@@ -52,16 +53,14 @@ public class CalibrarPulsos extends AppCompatActivity {
     private enum EstadoCal { IDLE, CAL_DISPENSANDO, CAL_AGUARDANDO, CAL_CONCLUIDA }
     private EstadoCal estadoCal = EstadoCal.IDLE;
 
+    // ── Volume alvo definido pelo usuario na Etapa 1 ──────────────────────
+    private double mVolumeAlvo = 300.0;  // default seguro
+
     // ── Flags de operacao ativa ───────────────────────────────────────────
     private boolean mLiberandoContinuo = false;   // $LB: ativo
     private boolean mLiberando100ml    = false;   // $ML:100 ativo
 
-    // ── Ultimo VP recebido (para nao exibir valor antigo ao iniciar nova acao) ──
-    // O ESP32 so envia VP: quando ha fluxo ativo. Se o usuario inicia uma nova
-    // acao sem que o ESP32 tenha resetado o contador (ex: reinicia $LB: logo apos
-    // parar), o display continuaria mostrando o ultimo VP: recebido. Por isso,
-    // resetamos o display localmente ao iniciar qualquer acao E enviamos $RS:
-    // para zerar o acumulador VP no ESP32.
+    // ── Ultimo VP recebido ────────────────────────────────────────────────
     private double mUltimoVp = 0.0;
 
     // ── Servico BLE ───────────────────────────────────────────────────────
@@ -70,20 +69,27 @@ public class CalibrarPulsos extends AppCompatActivity {
     private final Handler handler = new Handler();
 
     // ── Views ─────────────────────────────────────────────────────────────
-    private TextView  txtTimeoutAtual;
-    private TextView  txtVolumeLiberado;
-    private TextView  txtStatusOperacao;
-    private EditText  edtNovoTimeout;
-    private EditText  edtVolumeMedido;
-    private Button    btnChangePulsos;
-    private Button    btnSalvarTimeout;
-    private Button    btnLiberacaoContinua;
-    private Button    btnIniciarCal;
-    private Button    btnConfirmarCal;
-    private Button    btnTimeout;
-    private Button    btnVoltar;
-    private LinearLayout painelConfirmacao;
-    private View      mainView;
+    private TextView     txtTimeoutAtual;
+    private TextView     txtVolumeLiberado;
+    private TextView     txtStatusOperacao;
+    private TextView     txtVolumeAlvo;
+    private EditText     edtNovoTimeout;
+    private EditText     edtVolumeDesejado;
+    private EditText     edtVolumeMedido;
+    private Button       btnChangePulsos;
+    private Button       btnSalvarTimeout;
+    private Button       btnLiberacaoContinua;
+    private Button       btnIniciarCal;
+    private Button       btnConfirmarCal;
+    private Button       btnCancelarCal;
+    private Button       btnTimeout;
+    private Button       btnVoltar;
+    private LinearLayout painelVolumeDesejado;
+    private LinearLayout painelDispensando;
+    private LinearLayout painelMedicao;
+    private LinearLayout painelConfirmacao;   // legado — mantido oculto
+    private ProgressBar  progressCal;
+    private View         mainView;
 
     private static final String TAG_CAL = "CALIBRAR_PULSOS";
 
@@ -105,13 +111,14 @@ public class CalibrarPulsos extends AppCompatActivity {
                     // Aborta calibracao se estava em andamento
                     if (estadoCal != EstadoCal.IDLE) {
                         estadoCal = EstadoCal.IDLE;
-                        atualizarUiEstado();
-                        Toast.makeText(CalibrarPulsos.this,
-                                "Conexao perdida — calibracao abortada", Toast.LENGTH_LONG).show();
+                        runOnUiThread(() -> {
+                            atualizarUiEstado();
+                            Toast.makeText(CalibrarPulsos.this,
+                                    "Conexao perdida — calibracao abortada", Toast.LENGTH_LONG).show();
+                        });
                     }
                 } else if (status.equals("connected") || status.startsWith("ready")) {
                     setAllButtonsEnabled(true);
-                    // Consulta PL e TO ao conectar
                     handler.postDelayed(() -> {
                         if (mIsServiceBound && mBluetoothService != null) {
                             mBluetoothService.sendCommand("$PL:0\n");
@@ -122,8 +129,6 @@ public class CalibrarPulsos extends AppCompatActivity {
             }
 
             // ── Dados recebidos do ESP32 ───────────────────────────────────
-            // Aceita tanto BLE_DATA_ACTION quanto DATA_RECEIVED_ACTION para
-            // garantir compatibilidade com todas as versoes do servico BLE
             if (BluetoothServiceIndustrial.BLE_DATA_ACTION.equals(action)) {
                 String msg = intent.getStringExtra("data");
                 if (msg == null) msg = intent.getStringExtra("message");
@@ -143,7 +148,6 @@ public class CalibrarPulsos extends AppCompatActivity {
                     (BluetoothServiceIndustrial.LocalBinder) service;
             mBluetoothService = binder.getService();
             mIsServiceBound = true;
-            // Consulta estado atual
             handler.postDelayed(() -> {
                 mBluetoothService.sendCommand("$PL:0\n");
                 handler.postDelayed(() -> mBluetoothService.sendCommand("$TO:0\n"), 400);
@@ -167,14 +171,14 @@ public class CalibrarPulsos extends AppCompatActivity {
         setContentView(R.layout.calibrar_pulsos);
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT);
 
-        // Tela cheia (oculta barras do sistema)
+        // Tela cheia
         WindowInsetsControllerCompat insetsController =
                 new WindowInsetsControllerCompat(getWindow(), getWindow().getDecorView());
         insetsController.hide(WindowInsetsCompat.Type.systemBars());
         insetsController.setSystemBarsBehavior(
                 WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
 
-        // Bloquear botao Voltar do sistema (kiosk mode)
+        // Bloquear botao Voltar (kiosk mode)
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
@@ -183,20 +187,27 @@ public class CalibrarPulsos extends AppCompatActivity {
         });
 
         // Bind das views
-        mainView           = findViewById(R.id.mainCalibrar);
-        txtTimeoutAtual    = findViewById(R.id.txtTimeoutAtual);
-        txtVolumeLiberado  = findViewById(R.id.txtVolumeLiberado);
-        txtStatusOperacao  = findViewById(R.id.txtStatusOperacao);
-        edtNovoTimeout     = findViewById(R.id.edtNovoTimeout);
-        edtVolumeMedido    = findViewById(R.id.edtVolumeMedido);
-        btnChangePulsos    = findViewById(R.id.btnChangePulsos);
-        btnSalvarTimeout   = findViewById(R.id.btnSalvarTimeout);
-        btnLiberacaoContinua = findViewById(R.id.btnLiberacaoContinua);
-        btnIniciarCal      = findViewById(R.id.btnIniciarCal);
-        btnConfirmarCal    = findViewById(R.id.btnConfirmarCal);
-        btnTimeout         = findViewById(R.id.btnTimeout);
-        btnVoltar          = findViewById(R.id.btnVoltar);
-        painelConfirmacao  = findViewById(R.id.painelConfirmacao);
+        mainView              = findViewById(R.id.mainCalibrar);
+        txtTimeoutAtual       = findViewById(R.id.txtTimeoutAtual);
+        txtVolumeLiberado     = findViewById(R.id.txtVolumeLiberado);
+        txtStatusOperacao     = findViewById(R.id.txtStatusOperacao);
+        txtVolumeAlvo         = findViewById(R.id.txtVolumeAlvo);
+        edtNovoTimeout        = findViewById(R.id.edtNovoTimeout);
+        edtVolumeDesejado     = findViewById(R.id.edtVolumeDesejado);
+        edtVolumeMedido       = findViewById(R.id.edtVolumeMedido);
+        btnChangePulsos       = findViewById(R.id.btnChangePulsos);
+        btnSalvarTimeout      = findViewById(R.id.btnSalvarTimeout);
+        btnLiberacaoContinua  = findViewById(R.id.btnLiberacaoContinua);
+        btnIniciarCal         = findViewById(R.id.btnIniciarCal);
+        btnConfirmarCal       = findViewById(R.id.btnConfirmarCal);
+        btnCancelarCal        = findViewById(R.id.btnCancelarCal);
+        btnTimeout            = findViewById(R.id.btnTimeout);
+        btnVoltar             = findViewById(R.id.btnVoltar);
+        painelVolumeDesejado  = findViewById(R.id.painelVolumeDesejado);
+        painelDispensando     = findViewById(R.id.painelDispensando);
+        painelMedicao         = findViewById(R.id.painelMedicao);
+        painelConfirmacao     = findViewById(R.id.painelConfirmacao);
+        progressCal           = findViewById(R.id.progressCal);
 
         configurarBotoes();
     }
@@ -231,16 +242,12 @@ public class CalibrarPulsos extends AppCompatActivity {
         btnSalvarTimeout.setOnClickListener(v -> {
             if (!verificarServico()) return;
             if (mLiberandoContinuo) {
-                // Para liberacao continua antes de iniciar novo ciclo
                 mBluetoothService.sendCommand("$ML:0\n");
                 mLiberandoContinuo = false;
             }
             mLiberando100ml = true;
             resetarVolumeDisplay();
             setStatusOperacao("Liberando 100 mL...", true);
-            // CORRECAO: envia $RS: para zerar o acumulador VP no ESP32 antes de
-            // iniciar o novo ciclo. Sem isso, o display mostra o VP do ciclo anterior
-            // ate o ESP32 comecar a enviar novos VP:.
             Log.d(TAG_CAL, "[RESET] Enviando $RS: antes de $ML:100");
             mBluetoothService.sendCommand("$RS:\n");
             handler.postDelayed(() -> {
@@ -248,17 +255,13 @@ public class CalibrarPulsos extends AppCompatActivity {
                     mBluetoothService.sendCommand("$ML:100\n");
                 }
             }, 150);
-        });        // ── Botao: Liberacao continua ($LB: / para com timeout forcado) ────────
-        // NOTA: O firmware ESP32 nao aceita $ML:0 durante $LB: (retorna ERRO).
-        // Para encerrar $LB:, o Android reduz o timeout para 1s ($TO:1),
-        // aguarda o ESP32 fechar por inatividade, e restaura o timeout original.
+        });
+
+        // ── Botao: Liberacao continua ($LB: / para com timeout forcado) ──
         btnLiberacaoContinua.setOnClickListener(v -> {
             if (!verificarServico()) return;
             if (mLiberandoContinuo) {
                 // Segundo clique: forca encerramento via timeout minimo
-                // Estrategia: envia $TO:1 a cada 1s por 5s para garantir que o ESP32
-                // receba mesmo que esteja processando pulsos. Apos 5s, restaura o
-                // botao e o timeout independente do FN: chegar.
                 Log.d(TAG_CAL, "[PARAR] Iniciando sequencia de encerramento de $LB:");
                 mLiberandoContinuo = false;
                 btnLiberacaoContinua.setText("Parando...");
@@ -266,7 +269,6 @@ public class CalibrarPulsos extends AppCompatActivity {
                 btnLiberacaoContinua.setBackgroundTintList(
                         android.content.res.ColorStateList.valueOf(Color.GRAY));
                 setStatusOperacao("Encerrando liberacao — aguarde...", true);
-                // Envia $TO:1 imediatamente e repete a cada 1s por 4 vezes
                 mBluetoothService.sendCommand("$TO:1\n");
                 Log.d(TAG_CAL, "[PARAR] $TO:1 enviado (1/4)");
                 for (int i = 1; i <= 3; i++) {
@@ -278,14 +280,13 @@ public class CalibrarPulsos extends AppCompatActivity {
                         }
                     }, i * 1000L);
                 }
-                // Apos 5s: restaura timeout e reabilita o botao independente do FN:
                 handler.postDelayed(() -> {
                     if (mIsServiceBound && mBluetoothService != null) {
                         mBluetoothService.sendCommand("$TO:10000\n");
                         Log.d(TAG_CAL, "[PARAR] Timeout restaurado para 10000ms");
                     }
                     runOnUiThread(() -> {
-                        if (!mLiberandoContinuo) { // so restaura se nao foi reiniciado
+                        if (!mLiberandoContinuo) {
                             btnLiberacaoContinua.setText("Liberacao Continua");
                             btnLiberacaoContinua.setEnabled(true);
                             btnLiberacaoContinua.setBackgroundTintList(
@@ -295,41 +296,74 @@ public class CalibrarPulsos extends AppCompatActivity {
                         }
                     });
                 }, 5000L);
-            } else {               // Primeiro clique: inicia liberacao continua
+            } else {
+                // Primeiro clique: inicia liberacao continua
                 mLiberandoContinuo = true;
                 resetarVolumeDisplay();
-                // CORRECAO: zera o acumulador VP no ESP32 antes de iniciar $LB:
                 Log.d(TAG_CAL, "[RESET] Enviando $RS: antes de $LB:");
                 mBluetoothService.sendCommand("$RS:\n");
                 btnLiberacaoContinua.setText("PARAR Liberacao");
                 btnLiberacaoContinua.setBackgroundTintList(
                         android.content.res.ColorStateList.valueOf(Color.parseColor("#FF5252")));
                 setStatusOperacao("Liberacao continua ativa — clique novamente para parar", true);
-                mBluetoothService.sendCommand("$LB:\n");
+                handler.postDelayed(() -> {
+                    if (mIsServiceBound && mBluetoothService != null) {
+                        mBluetoothService.sendCommand("$LB:\n");
+                    }
+                }, 150);
             }
         });
 
-        // ── Botao: Iniciar Calibracao Automatica ($CA:300) ────────────────
+        // ── NOVO FLUXO: Botao "Confirmar e Iniciar Calibracao" (Etapa 1) ─
+        // Lê o volume desejado, valida e inicia a dispensacao
         btnIniciarCal.setOnClickListener(v -> {
             if (!verificarServico()) return;
             if (estadoCal != EstadoCal.IDLE) {
                 Toast.makeText(this, "Calibracao ja em andamento", Toast.LENGTH_SHORT).show();
                 return;
             }
-            estadoCal = EstadoCal.CAL_DISPENSANDO;
-            resetarVolumeDisplay();
-            atualizarUiEstado();
-            // CORRECAO: zera o acumulador VP no ESP32 antes de iniciar calibracao
-            Log.d(TAG_CAL, "[RESET] Enviando $RS: antes de $CA:300");
-            mBluetoothService.sendCommand("$RS:\n");
-            handler.postDelayed(() -> {
-                if (mIsServiceBound && mBluetoothService != null) {
-                    mBluetoothService.sendCommand("$CA:300\n");
-                }
-            }, 150);
+
+            // Valida o campo de volume desejado
+            String val = edtVolumeDesejado.getText().toString().trim();
+            if (TextUtils.isEmpty(val)) {
+                edtVolumeDesejado.setError("Informe o volume desejado para calibracao");
+                edtVolumeDesejado.requestFocus();
+                return;
+            }
+            double volumeDesejado;
+            try {
+                volumeDesejado = Double.parseDouble(val);
+            } catch (NumberFormatException e) {
+                edtVolumeDesejado.setError("Valor invalido");
+                return;
+            }
+            if (volumeDesejado <= 0) {
+                edtVolumeDesejado.setError("Volume deve ser maior que zero");
+                return;
+            }
+            if (volumeDesejado > 2000) {
+                edtVolumeDesejado.setError("Volume maximo: 2000 mL");
+                return;
+            }
+
+            // Salva o volume alvo para exibicao e para o $CA:
+            mVolumeAlvo = volumeDesejado;
+
+            // Oculta teclado
+            InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) imm.hideSoftInputFromWindow(v.getWindowToken(), 0);
+
+            // Confirma com o usuario antes de iniciar
+            new AlertDialog.Builder(this)
+                    .setTitle("Confirmar Calibracao")
+                    .setMessage("Sera dispensado " + String.format("%.0f mL", mVolumeAlvo) +
+                            " para calibracao.\n\nPosicione a proveta e confirme.")
+                    .setPositiveButton("Iniciar", (dialog, which) -> iniciarDispensacaoCalibrar())
+                    .setNegativeButton("Cancelar", null)
+                    .show();
         });
 
-        // ── Botao: Confirmar Medicao ($CF:<ml_real>) ──────────────────────
+        // ── Botao: Confirmar Medicao ($CF:<ml_real>) — Etapa 3 ───────────
         btnConfirmarCal.setOnClickListener(v -> {
             if (estadoCal != EstadoCal.CAL_AGUARDANDO) {
                 Toast.makeText(this, "Aguarde a dispensacao terminar", Toast.LENGTH_SHORT).show();
@@ -337,22 +371,62 @@ public class CalibrarPulsos extends AppCompatActivity {
             }
             String val = edtVolumeMedido.getText().toString().trim();
             if (TextUtils.isEmpty(val)) {
-                Toast.makeText(this, "Informe o volume medido na proveta", Toast.LENGTH_SHORT).show();
+                edtVolumeMedido.setError("Informe o volume medido na proveta");
+                edtVolumeMedido.requestFocus();
                 return;
             }
-            int mlReal;
-            try { mlReal = Integer.parseInt(val); } catch (NumberFormatException e) {
-                Toast.makeText(this, "Valor invalido", Toast.LENGTH_SHORT).show();
+            double mlReal;
+            try {
+                mlReal = Double.parseDouble(val);
+            } catch (NumberFormatException e) {
+                edtVolumeMedido.setError("Valor invalido");
                 return;
             }
             if (mlReal <= 0) {
-                Toast.makeText(this, "Volume deve ser maior que zero", Toast.LENGTH_SHORT).show();
+                edtVolumeMedido.setError("Volume deve ser maior que zero");
                 return;
             }
             if (!verificarServico()) return;
-            estadoCal = EstadoCal.CAL_CONCLUIDA;
-            atualizarUiEstado();
-            mBluetoothService.sendCommand("$CF:" + mlReal + "\n");
+
+            // Oculta teclado
+            InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) imm.hideSoftInputFromWindow(v.getWindowToken(), 0);
+
+            // Confirma com o usuario
+            new AlertDialog.Builder(this)
+                    .setTitle("Confirmar Medicao")
+                    .setMessage("Volume real medido: " + String.format("%.1f mL", mlReal) +
+                            "\nVolume alvo: " + String.format("%.0f mL", mVolumeAlvo) +
+                            "\n\nO sistema calculara e gravara o novo fator de calibracao.")
+                    .setPositiveButton("Confirmar", (dialog, which) -> {
+                        estadoCal = EstadoCal.CAL_CONCLUIDA;
+                        atualizarUiEstado();
+                        // Envia o volume real como inteiro (protocolo ESP32 aceita int)
+                        int mlRealInt = (int) Math.round(mlReal);
+                        Log.d(TAG_CAL, "[CAL] Enviando $CF:" + mlRealInt +
+                                " (volume alvo=" + mVolumeAlvo + ", medido=" + mlReal + ")");
+                        mBluetoothService.sendCommand("$CF:" + mlRealInt + "\n");
+                    })
+                    .setNegativeButton("Corrigir", null)
+                    .show();
+        });
+
+        // ── Botao: Cancelar Calibracao (Etapa 3) ─────────────────────────
+        btnCancelarCal.setOnClickListener(v -> {
+            new AlertDialog.Builder(this)
+                    .setTitle("Cancelar Calibracao")
+                    .setMessage("Deseja cancelar a calibracao? O fator atual sera mantido.")
+                    .setPositiveButton("Sim, cancelar", (dialog, which) -> {
+                        Log.d(TAG_CAL, "[CAL] Calibracao cancelada pelo usuario na Etapa 3");
+                        estadoCal = EstadoCal.IDLE;
+                        edtVolumeMedido.setText("");
+                        edtVolumeDesejado.setText("");
+                        atualizarUiEstado();
+                        Toast.makeText(CalibrarPulsos.this,
+                                "Calibracao cancelada. Fator anterior mantido.", Toast.LENGTH_LONG).show();
+                    })
+                    .setNegativeButton("Continuar", null)
+                    .show();
         });
 
         // ── Botao: Modificar Timeout ──────────────────────────────────────
@@ -362,7 +436,46 @@ public class CalibrarPulsos extends AppCompatActivity {
         });
 
         // ── Botao: Voltar ─────────────────────────────────────────────────
-        btnVoltar.setOnClickListener(v -> navegarHome());
+        btnVoltar.setOnClickListener(v -> {
+            if (estadoCal != EstadoCal.IDLE) {
+                new AlertDialog.Builder(this)
+                        .setTitle("Sair da Calibracao")
+                        .setMessage("Ha uma calibracao em andamento. Deseja sair mesmo assim?")
+                        .setPositiveButton("Sair", (dialog, which) -> navegarHome())
+                        .setNegativeButton("Continuar", null)
+                        .show();
+            } else {
+                navegarHome();
+            }
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Inicia a dispensacao de calibracao (chamado apos confirmacao do dialogo)
+    // ─────────────────────────────────────────────────────────────────────
+    private void iniciarDispensacaoCalibrar() {
+        if (!verificarServico()) return;
+        estadoCal = EstadoCal.CAL_DISPENSANDO;
+        resetarVolumeDisplay();
+        atualizarUiEstado();
+
+        // Atualiza o texto do painel de dispensacao com o volume alvo
+        if (txtVolumeAlvo != null) {
+            txtVolumeAlvo.setText("Dispensando " + String.format("%.0f mL", mVolumeAlvo) +
+                    " — aguarde o termino");
+        }
+
+        // Zera o acumulador VP no ESP32 antes de iniciar
+        Log.d(TAG_CAL, "[RESET] Enviando $RS: antes de $CA:" + (int) mVolumeAlvo);
+        mBluetoothService.sendCommand("$RS:\n");
+        handler.postDelayed(() -> {
+            if (mIsServiceBound && mBluetoothService != null) {
+                // Envia o volume como inteiro (protocolo ESP32)
+                int volumeInt = (int) Math.round(mVolumeAlvo);
+                Log.d(TAG_CAL, "[CAL] Enviando $CA:" + volumeInt);
+                mBluetoothService.sendCommand("$CA:" + volumeInt + "\n");
+            }
+        }, 150);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -371,16 +484,11 @@ public class CalibrarPulsos extends AppCompatActivity {
     private void processarMensagem(String msg) {
 
         // ── VP: — volume parcial em tempo real ────────────────────────────
-        // CORRECAO: ignora VP: se o valor for menor ou igual ao ultimo VP recebido
-        // E nenhuma operacao esta ativa. Isso evita que um VP: residual do ciclo
-        // anterior sobrescreva o display apos o reset.
         if (msg.startsWith("VP:")) {
             try {
                 double ml = Double.parseDouble(msg.substring(3));
-                // Se o display foi resetado (mUltimoVp=0) e chegou um VP: com valor
-                // alto sem nenhuma operacao ativa, e um VP: residual — ignora.
                 boolean operacaoAtiva = mLiberando100ml || mLiberandoContinuo
-                        || estadoCal != EstadoCal.IDLE;
+                        || estadoCal == EstadoCal.CAL_DISPENSANDO;
                 if (!operacaoAtiva && ml > 0 && mUltimoVp == 0.0) {
                     Log.d(TAG_CAL, "[VP] Ignorando VP: residual (" + ml + ") — nenhuma operacao ativa");
                     return;
@@ -397,7 +505,8 @@ public class CalibrarPulsos extends AppCompatActivity {
         if (msg.equals("IN:")) {
             runOnUiThread(() -> {
                 if (estadoCal == EstadoCal.CAL_DISPENSANDO) {
-                    setStatusOperacao("Calibrando — valvula aberta, aguardando fluxo...", true);
+                    setStatusOperacao("Calibrando — valvula aberta, dispensando " +
+                            String.format("%.0f mL", mVolumeAlvo) + "...", true);
                 } else if (mLiberando100ml) {
                     setStatusOperacao("Valvula aberta — liberando 100 mL...", true);
                 } else if (mLiberandoContinuo) {
@@ -409,7 +518,6 @@ public class CalibrarPulsos extends AppCompatActivity {
 
         // ── QP: — total de pulsos contados (durante calibracao) ───────────
         if (msg.startsWith("QP:")) {
-            // Apenas exibe no status; o calculo e feito pelo ESP32
             try {
                 int qp = Integer.parseInt(msg.substring(3));
                 runOnUiThread(() ->
@@ -420,10 +528,16 @@ public class CalibrarPulsos extends AppCompatActivity {
         }
 
         // ── CA: — fim da dispensacao de calibracao, aguardando $CF: ──────
+        // ESP32 enviou CA: indicando que a dispensacao terminou.
+        // Avanca para Etapa 3: usuario deve medir e informar o volume real.
         if (msg.equals("CA:")) {
             runOnUiThread(() -> {
                 estadoCal = EstadoCal.CAL_AGUARDANDO;
+                edtVolumeMedido.setText("");
                 atualizarUiEstado();
+                // Foca no campo de medicao automaticamente
+                edtVolumeMedido.requestFocus();
+                Log.d(TAG_CAL, "[CAL] Dispensacao concluida — aguardando medicao do usuario");
             });
             return;
         }
@@ -436,7 +550,6 @@ public class CalibrarPulsos extends AppCompatActivity {
                     txtVolumeLiberado.setText(String.format("%.3f ML", ml));
                     mLiberando100ml    = false;
                     mLiberandoContinuo = false;
-                    // Restaura botao de liberacao continua
                     btnLiberacaoContinua.setText("Liberacao Continua");
                     btnLiberacaoContinua.setEnabled(true);
                     btnLiberacaoContinua.setBackgroundTintList(
@@ -447,22 +560,35 @@ public class CalibrarPulsos extends AppCompatActivity {
             return;
         }
 
-        // ── FN: — ciclo completamente encerrado (normal ou calibracao) ────
+        // ── FN: — ciclo completamente encerrado ───────────────────────────
         if (msg.equals("FN:")) {
             runOnUiThread(() -> {
                 mLiberando100ml    = false;
                 mLiberandoContinuo = false;
-                // Restaura o botao de liberacao continua ao estado normal
                 btnLiberacaoContinua.setText("Liberacao Continua");
                 btnLiberacaoContinua.setEnabled(true);
                 btnLiberacaoContinua.setBackgroundTintList(
                         android.content.res.ColorStateList.valueOf(Color.parseColor("#FF6F00")));
+
                 if (estadoCal == EstadoCal.CAL_CONCLUIDA) {
-                    // Calibracao concluida com sucesso
+                    // Calibracao concluida com sucesso — volta para IDLE
                     estadoCal = EstadoCal.IDLE;
+                    edtVolumeDesejado.setText("");
+                    edtVolumeMedido.setText("");
                     atualizarUiEstado();
-                    Toast.makeText(CalibrarPulsos.this,
-                            "Calibracao concluida com sucesso!", Toast.LENGTH_LONG).show();
+                    // Consulta o novo PL gravado
+                    handler.postDelayed(() -> {
+                        if (mIsServiceBound && mBluetoothService != null) {
+                            mBluetoothService.sendCommand("$PL:0\n");
+                        }
+                    }, 500);
+                    new AlertDialog.Builder(CalibrarPulsos.this)
+                            .setTitle("Calibracao Concluida!")
+                            .setMessage("O novo fator de calibracao foi gravado na EEPROM do ESP32.\n\n" +
+                                    "O valor de Pulsos/Litro foi atualizado acima.")
+                            .setPositiveButton("OK", null)
+                            .show();
+                    Log.d(TAG_CAL, "[CAL] Calibracao concluida com sucesso");
                 } else {
                     setStatusOperacao("", false);
                 }
@@ -479,8 +605,7 @@ public class CalibrarPulsos extends AppCompatActivity {
 
         // ── TO: — valor atual de timeout ──────────────────────────────────
         if (msg.startsWith("TO:")) {
-            // Apenas informativo; timeout e gerenciado em ModificarTimeout
-            return;
+            return; // Gerenciado em ModificarTimeout
         }
 
         // ── OK — confirmacao de comando recebido ──────────────────────────
@@ -497,6 +622,7 @@ public class CalibrarPulsos extends AppCompatActivity {
                 }
                 Toast.makeText(CalibrarPulsos.this,
                         "ESP32 rejeitou o comando. Reinicie a calibracao.", Toast.LENGTH_LONG).show();
+                Log.e(TAG_CAL, "[ERRO] ESP32 rejeitou o ultimo comando");
             });
         }
     }
@@ -506,44 +632,48 @@ public class CalibrarPulsos extends AppCompatActivity {
     // ─────────────────────────────────────────────────────────────────────
     private void atualizarUiEstado() {
         switch (estadoCal) {
+
             case IDLE:
+                // Etapa 1 visivel, Etapa 2 e 3 ocultas
+                painelVolumeDesejado.setVisibility(View.VISIBLE);
+                painelDispensando.setVisibility(View.GONE);
+                painelMedicao.setVisibility(View.GONE);
+                // Restaura botao de iniciar
                 btnIniciarCal.setEnabled(true);
-                btnIniciarCal.setText("Iniciar Calibracao (300 mL)");
+                btnIniciarCal.setText("Confirmar e Iniciar Calibracao");
                 btnIniciarCal.setBackgroundTintList(
                         android.content.res.ColorStateList.valueOf(Color.parseColor("#1565C0")));
-                painelConfirmacao.setVisibility(View.GONE);
-                edtVolumeMedido.setText("");
                 setStatusOperacao("", false);
                 setAllButtonsEnabled(true);
                 break;
 
             case CAL_DISPENSANDO:
-                btnIniciarCal.setEnabled(false);
-                btnIniciarCal.setText("Calibrando...");
-                btnIniciarCal.setBackgroundTintList(
-                        android.content.res.ColorStateList.valueOf(Color.GRAY));
-                painelConfirmacao.setVisibility(View.GONE);
-                setStatusOperacao("Dispensando 300 mL para calibracao...", true);
-                // Desabilita outros botoes durante calibracao
+                // Etapa 1 oculta, Etapa 2 visivel, Etapa 3 oculta
+                painelVolumeDesejado.setVisibility(View.GONE);
+                painelDispensando.setVisibility(View.VISIBLE);
+                painelMedicao.setVisibility(View.GONE);
+                // Desabilita todos os outros botoes durante dispensacao
                 btnSalvarTimeout.setEnabled(false);
                 btnLiberacaoContinua.setEnabled(false);
                 btnChangePulsos.setEnabled(false);
+                setStatusOperacao("Dispensando " + String.format("%.0f mL", mVolumeAlvo) +
+                        " para calibracao...", true);
                 break;
 
             case CAL_AGUARDANDO:
-                btnIniciarCal.setEnabled(false);
-                btnIniciarCal.setText("Aguardando medicao...");
-                painelConfirmacao.setVisibility(View.VISIBLE);
-                setStatusOperacao("Meca o volume na proveta e confirme abaixo", true);
+                // Etapa 1 oculta, Etapa 2 oculta, Etapa 3 visivel
+                painelVolumeDesejado.setVisibility(View.GONE);
+                painelDispensando.setVisibility(View.GONE);
+                painelMedicao.setVisibility(View.VISIBLE);
+                setStatusOperacao("Dispensacao concluida! Meca o volume na proveta.", true);
                 break;
 
             case CAL_CONCLUIDA:
-                btnIniciarCal.setEnabled(false);
-                btnIniciarCal.setText("Gravando calibracao...");
-                btnIniciarCal.setBackgroundTintList(
-                        android.content.res.ColorStateList.valueOf(Color.parseColor("#2E7D32")));
-                painelConfirmacao.setVisibility(View.GONE);
-                setStatusOperacao("Gravando novo PL na EEPROM...", true);
+                // Todos os paineis ocultos — aguardando FN: do ESP32
+                painelVolumeDesejado.setVisibility(View.GONE);
+                painelDispensando.setVisibility(View.GONE);
+                painelMedicao.setVisibility(View.GONE);
+                setStatusOperacao("Gravando novo fator de calibracao na EEPROM...", true);
                 break;
         }
     }
@@ -589,20 +719,16 @@ public class CalibrarPulsos extends AppCompatActivity {
     }
 
     private void mostrarSnackbarReconectar() {
-        if (mainView == null) return;
-        Snackbar.make(mainView, "Sem conexao com a TAP", Snackbar.LENGTH_INDEFINITE)
-                .setAction("Reconectar", v -> {
-                    String mac = getSharedPreferences("tap_config", Context.MODE_PRIVATE)
-                            .getString("esp32_mac", "");
-                    if (mIsServiceBound && mBluetoothService != null
-                            && mac != null && !mac.isEmpty()) {
-                        mBluetoothService.connectWithMac(mac);
-                    }
-                }).show();
+        runOnUiThread(() -> {
+            if (mainView != null) {
+                Snackbar.make(mainView, "BLE desconectado — reconectando...",
+                        Snackbar.LENGTH_LONG).show();
+            }
+        });
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Lifecycle
+    // Ciclo de vida
     // ─────────────────────────────────────────────────────────────────────
     @Override
     protected void onResume() {
@@ -610,22 +736,16 @@ public class CalibrarPulsos extends AppCompatActivity {
         IntentFilter filter = new IntentFilter();
         filter.addAction(BluetoothServiceIndustrial.BLE_STATUS_ACTION);
         filter.addAction(BluetoothServiceIndustrial.BLE_DATA_ACTION);
-        // Usa ContextCompat.registerReceiver (broadcast global) pois
-        // BluetoothServiceIndustrial usa sendBroadcast(), nao LocalBroadcastManager.
-        // Flag RECEIVER_NOT_EXPORTED obrigatoria no Android 13+ (API 33+).
-        ContextCompat.registerReceiver(
-                this,
-                mServiceUpdateReceiver,
-                filter,
-                ContextCompat.RECEIVER_NOT_EXPORTED
-        );
+        registerReceiver(mServiceUpdateReceiver, filter);
+
         Intent serviceIntent = new Intent(this, BluetoothServiceIndustrial.class);
         bindService(serviceIntent, mServiceConnection, Context.BIND_AUTO_CREATE);
     }
+
     @Override
     protected void onPause() {
         super.onPause();
-        unregisterReceiver(mServiceUpdateReceiver);
+        try { unregisterReceiver(mServiceUpdateReceiver); } catch (Exception ignored) {}
         if (mIsServiceBound) {
             unbindService(mServiceConnection);
             mIsServiceBound = false;
