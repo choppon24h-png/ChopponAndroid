@@ -26,6 +26,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.ParcelUuid;
 import android.util.Log;
 
 import androidx.annotation.Nullable;
@@ -37,20 +38,27 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * BluetoothServiceIndustrial - compativel com firmware ASOARESBH/ESP32
+ * BluetoothServiceIndustrial v4.0 - Conexão direta por MAC
+ *
+ * ESTRATÉGIA DE CONEXÃO (3 camadas, em ordem de prioridade):
+ *
+ *   Camada 1 — CONEXÃO DIRETA (sem scan):
+ *     BluetoothAdapter.getRemoteDevice(mac) + connectGatt()
+ *     Tempo esperado: ~1-2s
+ *     Usada: sempre que o MAC é conhecido (primeira tentativa e reconexões)
+ *
+ *   Camada 2 — SCAN DIRECIONADO (fallback após 2 falhas diretas):
+ *     Scan com ScanFilter por MAC exato + nome CHOPP_XXXX
+ *     Tempo esperado: ~3-8s
+ *     Usada: quando a conexão direta falha (ex: ESP32 reiniciou, cache GATT inválido)
+ *
+ *   Camada 3 — SCAN PERMISSIVO (fallback após 4 falhas):
+ *     Scan sem filtro, aceita qualquer dispositivo com prefixo "CHOPP_"
+ *     Tempo esperado: ~5-15s
+ *     Usada: quando o MAC do ESP32 mudou (ex: troca de hardware)
  *
  * Protocolo: Nordic UART Service (NUS) - Just Works (sem PIN, sem bond)
- * Scan: por prefixo de nome "CHOPP_" (nao por MAC direto)
  * UUIDs: 6E400001/2/3-B5A3-F393-E0A9-E50E24DCCA9E
- *
- * Fluxo de conexao (conforme ANDROID_BLE_INTEGRACAO.md atualizado 24/04/2026):
- *   1. Scan BLE filtrando nome com prefixo "CHOPP_"
- *   2. connectGatt(context, false, callback, TRANSPORT_LE)
- *   3. onConnectionStateChange(CONNECTED) -> requestMtu(247)
- *   4. onMtuChanged -> discoverServices()
- *   5. onServicesDiscovered -> habilitar notificacoes TX (descriptor 0x2902)
- *   6. onDescriptorWrite -> estado READY
- *   7. READY -> PING a cada 5s; ao receber PONG sessao esta valida
  *
  * Broadcasts emitidos:
  *   BLE_STATUS_ACTION  com extra "status": scanning / connected / ready / disconnected:<motivo>
@@ -60,7 +68,7 @@ import java.util.UUID;
 public class BluetoothServiceIndustrial extends Service {
 
     // -------------------------------------------------------------------------
-    // Constantes publicas
+    // Constantes públicas
     // -------------------------------------------------------------------------
     public static final String TAG = "BLE_INDUSTRIAL";
 
@@ -78,7 +86,7 @@ public class BluetoothServiceIndustrial extends Service {
     private static volatile boolean sRunning = false;
 
     // -------------------------------------------------------------------------
-    // UUIDs (de BleConfigUtils)
+    // UUIDs (Nordic UART Service)
     // -------------------------------------------------------------------------
     private static final UUID UUID_SERVICE = UUID.fromString(BleConfigUtils.SERVICE_UUID);
     private static final UUID UUID_RX      = UUID.fromString(BleConfigUtils.CHARACTERISTIC_UUID_RX);
@@ -88,7 +96,7 @@ public class BluetoothServiceIndustrial extends Service {
     // -------------------------------------------------------------------------
     // Estado interno
     // -------------------------------------------------------------------------
-    private enum State { IDLE, SCANNING, CONNECTING, CONNECTED, READY }
+    private enum State { IDLE, CONNECTING_DIRECT, SCANNING, CONNECTING_GATT, CONNECTED, READY }
     private volatile State mState = State.IDLE;
 
     private BluetoothAdapter            mAdapter;
@@ -102,19 +110,24 @@ public class BluetoothServiceIndustrial extends Service {
 
     private final Handler mHandler = new Handler(Looper.getMainLooper());
 
-    // Reconexao com backoff exponencial
+    // Reconexão com backoff exponencial
     private int    mReconnectCount = 0;
-    private static final int    MAX_RECONNECT  = 10;
-    private static final long[] BACKOFF_MS     = {2000,4000,8000,15000,30000,30000,30000,30000,30000,30000};
+    private static final int    MAX_RECONNECT = 10;
+    // Backoff: direto(1s), direto(2s), scan(4s), scan(8s), permissivo(15s)...
+    private static final long[] BACKOFF_MS    = {1000, 2000, 4000, 8000, 15000, 15000, 15000, 15000, 15000, 15000};
+
+    // Timeout para conexão direta (sem scan) — se o GATT não conectar em 5s, vai para scan
+    private static final long DIRECT_CONNECT_TIMEOUT_MS = 5000L;
+    private final Runnable mDirectConnectTimeoutRunnable = this::onDirectConnectTimeout;
+
+    // Timeout para scan
+    private final Runnable mScanTimeoutRunnable = this::onScanTimeout;
 
     // PING keepalive (a cada 5s em estado READY)
     private static final long PING_INTERVAL_MS = 5000L;
     private final Runnable mPingRunnable        = this::sendPing;
-    private final Runnable mScanTimeoutRunnable = this::onScanTimeout;
 
-    // CORREÇÃO v4.2: flag para suspender o PING durante dispensação de chopp.
-    // O PING a cada 5s pode colidir com VP:/ML: do ESP32 durante a liberação,
-    // causando falha no write BLE ou corrupção do estado serial do ESP32.
+    // Flag para suspender PING durante dispensação de chopp
     private volatile boolean mDispensandoChopp = false;
 
     // Notification Foreground Service
@@ -147,8 +160,9 @@ public class BluetoothServiceIndustrial extends Service {
         try {
             sRunning = true;
             Log.i(TAG, "=================================");
-            Log.i(TAG, "[SERVICE] BluetoothServiceIndustrial v3.0 SINGLETON iniciado");
+            Log.i(TAG, "[SERVICE] BluetoothServiceIndustrial v4.0 DIRETO iniciado");
             Log.i(TAG, "[SERVICE] Protocolo: Nordic UART Service (NUS)");
+            Log.i(TAG, "[SERVICE] Estrategia: MAC direto → scan direcionado → scan permissivo");
             Log.i(TAG, "=================================");
 
             createNotificationChannel();
@@ -197,34 +211,32 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     // =========================================================================
-    // API publica
+    // API pública
     // =========================================================================
 
     /**
-     * Inicia conexao BLE buscando o dispositivo pelo nome CHOPP_XXXX.
+     * Inicia conexão BLE usando MAC direto como estratégia primária.
+     * Scan é usado apenas como fallback após falhas na conexão direta.
      *
-     * @param mac     MAC BLE do dispositivo (ex: "48:F6:EE:23:2A:6C") — usado para validacao pos-scan.
-     * @param wifiMac MAC WiFi do dispositivo — usado para derivar o nome BLE esperado.
-     *                Se null, usa mac como referencia de derivacao.
+     * @param mac     MAC BLE do dispositivo (ex: "48:F6:EE:23:2A:6C")
+     * @param wifiMac MAC WiFi — usado para derivar o nome BLE esperado no scan de fallback.
+     *                Se null, usa mac como referência.
      */
     public void connectWithMac(String mac, String wifiMac) {
         mTargetMac     = mac;
         mTargetWifiMac = wifiMac != null ? wifiMac : mac;
         Log.i(TAG, "[CONNECT] connectWithMac(" + mac + ")");
-        Log.i(TAG, "[CONNECT] Nome BLE direto esperado: "
-                + BleConfigUtils.deriveBleNameFromWifiMac(mTargetWifiMac));
-        Log.i(TAG, "[CONNECT] Nome BLE invertido esperado: "
-                + BleConfigUtils.deriveBleNameFromWifiMacInverted(mTargetWifiMac));
+        Log.i(TAG, "[CONNECT] Estrategia primaria: CONEXAO DIRETA por MAC (sem scan)");
         mReconnectCount = 0;
-        startScanCycle();
+        startDirectConnect();
     }
 
-    /** Sobrecarga de compatibilidade — quando so ha um MAC (BLE = WiFi). */
+    /** Sobrecarga de compatibilidade — quando só há um MAC (BLE = WiFi). */
     public void connectWithMac(String mac) {
         connectWithMac(mac, mac);
     }
 
-    /** Envia um comando para o ESP32 via caracteristica RX. */
+    /** Envia um comando para o ESP32 via característica RX. */
     public boolean sendCommand(String command) {
         if (mState != State.READY && mState != State.CONNECTED) {
             Log.w(TAG, "[CMD] Ignorado (estado=" + mState + "): " + command);
@@ -234,21 +246,16 @@ public class BluetoothServiceIndustrial extends Service {
             Log.w(TAG, "[CMD] RxChar ou GATT nulo");
             return false;
         }
-        // v5.0: suspende o PING ao iniciar dispensação ($ML, $LB, $RS)
-        // e retoma somente ao receber FN: (fim definitivo do ciclo).
+        // Suspende PING durante dispensação ($ML, $LB, $RS)
         if (command.startsWith(BleCommand.CMD_ML) && !command.equals(BleCommand.CMD_ML + "0")) {
             pausarPing();
         } else if (command.equals(BleCommand.CMD_LB)) {
             pausarPing();
         } else if (command.equals(BleCommand.CMD_RS)) {
-            // $RS: retoma ciclo incompleto — suspende PING pois ciclo vai reiniciar
             pausarPing();
         }
         byte[] bytes = (command + "\n").getBytes(StandardCharsets.UTF_8);
         boolean ok;
-        // CORREÇÃO v4.5: writeCharacteristic(char, byte[], writeType) é a API moderna
-        // introduzida no Android 13 (API 33). A API antiga setValue()+writeCharacteristic(char)
-        // foi descontinuada e pode causar race conditions em Android 13+.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             int result = mGatt.writeCharacteristic(
                     mRxChar, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
@@ -262,10 +269,7 @@ public class BluetoothServiceIndustrial extends Service {
         return ok;
     }
 
-    /**
-     * Suspende o keepalive PING durante a dispensação de chopp.
-     * Deve ser chamado antes de enviar $ML:<volume> ou $LB:.
-     */
+    /** Suspende o keepalive PING durante a dispensação de chopp. */
     public void pausarPing() {
         if (!mDispensandoChopp) {
             mDispensandoChopp = true;
@@ -274,11 +278,7 @@ public class BluetoothServiceIndustrial extends Service {
         }
     }
 
-    /**
-     * Retoma o keepalive PING após o fim do ciclo de dispensação.
-     * Deve ser chamado ao receber FN: (fim definitivo do ciclo) ou ao cancelar.
-     * Não chamar ao receber ML: — aguardar FN: conforme protocolo v5.0.
-     */
+    /** Retoma o keepalive PING após o fim do ciclo de dispensação. */
     public void retomarPing() {
         if (mDispensandoChopp) {
             mDispensandoChopp = false;
@@ -296,6 +296,7 @@ public class BluetoothServiceIndustrial extends Service {
             mReconnectCount = MAX_RECONNECT;
             mHandler.removeCallbacks(mPingRunnable);
             mHandler.removeCallbacks(mScanTimeoutRunnable);
+            mHandler.removeCallbacks(mDirectConnectTimeoutRunnable);
         }
         stopScan();
         if (mGatt != null) {
@@ -313,9 +314,76 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     // =========================================================================
-    // Scan BLE - por prefixo de nome "CHOPP_" (nao por MAC direto)
+    // CAMADA 1: Conexão direta por MAC (sem scan) — estratégia primária
     // =========================================================================
 
+    /**
+     * Tenta conectar diretamente ao ESP32 usando o MAC conhecido.
+     * BluetoothAdapter.getRemoteDevice(mac) retorna um BluetoothDevice sem precisar
+     * fazer scan — o Android usa o cache interno de dispositivos BLE já vistos.
+     * Tempo típico de conexão: 1-2 segundos.
+     */
+    private void startDirectConnect() {
+        if (mAdapter == null || !mAdapter.isEnabled()) {
+            scheduleReconnect("adapter_off");
+            return;
+        }
+        if (mTargetMac == null || mTargetMac.isEmpty()) {
+            Log.e(TAG, "[DIRECT] MAC alvo nulo — impossivel conectar diretamente");
+            scheduleReconnect("mac_null");
+            return;
+        }
+
+        try {
+            Log.i(TAG, "[DIRECT] Tentando conexao direta ao MAC: " + mTargetMac
+                    + " (tentativa " + (mReconnectCount + 1) + ")");
+            mState = State.CONNECTING_DIRECT;
+            broadcastStatus(STATUS_SCANNING); // UI mostra "conectando..."
+
+            BluetoothDevice device = mAdapter.getRemoteDevice(mTargetMac);
+
+            // Fecha GATT residual de sessão anterior
+            if (mGatt != null) {
+                try { mGatt.close(); } catch (Exception ignored) {}
+                mGatt = null;
+            }
+
+            // Timeout de segurança: se o GATT não conectar em 5s, vai para scan
+            mHandler.postDelayed(mDirectConnectTimeoutRunnable, DIRECT_CONNECT_TIMEOUT_MS);
+
+            mGatt = device.connectGatt(this, false, mGattCallback, BluetoothDevice.TRANSPORT_LE);
+            Log.d(TAG, "[DIRECT] connectGatt() chamado — aguardando onConnectionStateChange...");
+
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "[DIRECT] MAC invalido: " + mTargetMac + " — " + e.getMessage());
+            scheduleReconnect("invalid_mac");
+        } catch (Exception e) {
+            Log.e(TAG, "[DIRECT] Excecao ao conectar diretamente: " + e.getMessage());
+            scheduleReconnect("direct_exception");
+        }
+    }
+
+    private void onDirectConnectTimeout() {
+        if (mState != State.CONNECTING_DIRECT) return;
+        Log.w(TAG, "[DIRECT] Timeout de " + DIRECT_CONNECT_TIMEOUT_MS + "ms — ESP32 nao respondeu");
+        Log.w(TAG, "[DIRECT] Fechando GATT e escalando para scan direcionado");
+        if (mGatt != null) {
+            try { mGatt.close(); } catch (Exception ignored) {}
+            mGatt = null;
+        }
+        mState = State.IDLE;
+        scheduleReconnect("direct_timeout");
+    }
+
+    // =========================================================================
+    // CAMADA 2 e 3: Scan BLE — fallback quando conexão direta falha
+    // =========================================================================
+
+    /**
+     * Inicia scan BLE como fallback.
+     * - Camada 2 (mReconnectCount < 4): scan com filtro por MAC + nome CHOPP_XXXX
+     * - Camada 3 (mReconnectCount >= 4): scan permissivo, aceita qualquer CHOPP_
+     */
     private void startScanCycle() {
         stopScan();
         if (mAdapter == null || !mAdapter.isEnabled()) return;
@@ -327,22 +395,34 @@ public class BluetoothServiceIndustrial extends Service {
             return;
         }
 
-        boolean fallback = mReconnectCount >= 2;
-        Log.i(TAG, "[SCAN] Iniciando ciclo de conexao" + (fallback ? " [MODO FALLBACK - prefixo CHOPP_]" : ""));
-        Log.i(TAG, "[SCAN] MAC alvo: " + mTargetMac);
-        Log.i(TAG, "[SCAN] Nome esperado: " + BleConfigUtils.deriveBleNameFromWifiMac(mTargetWifiMac));
+        boolean permissive = mReconnectCount >= 4;
 
-        if (fallback) {
-            Log.w(TAG, "[FALLBACK] Iniciando scan permissivo - procurando qualquer dispositivo com prefixo 'CHOPP_'");
-            Log.w(TAG, "[FALLBACK] MAC esperado (referencia): " + mTargetMac);
+        if (!permissive) {
+            Log.i(TAG, "[SCAN] Fallback camada 2: scan direcionado por MAC=" + mTargetMac);
+        } else {
+            Log.w(TAG, "[SCAN] Fallback camada 3: scan permissivo (prefixo CHOPP_) apos "
+                    + mReconnectCount + " falhas");
         }
 
         ScanSettings settings = new ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build();
 
-        // Sem filtro de nome no ScanFilter para aceitar as duas variantes (direta e invertida)
         List<ScanFilter> filters = new ArrayList<>();
+
+        // Camada 2: adiciona filtro por MAC para scan mais rápido e preciso
+        if (!permissive && mTargetMac != null && !mTargetMac.isEmpty()) {
+            try {
+                ScanFilter macFilter = new ScanFilter.Builder()
+                        .setDeviceAddress(mTargetMac)
+                        .build();
+                filters.add(macFilter);
+                Log.d(TAG, "[SCAN] Filtro por MAC adicionado: " + mTargetMac);
+            } catch (Exception e) {
+                Log.w(TAG, "[SCAN] Nao foi possivel adicionar filtro por MAC: " + e.getMessage());
+                // Continua sem filtro — scan vai funcionar, só mais lento
+            }
+        }
 
         mState = State.SCANNING;
         broadcastStatus(STATUS_SCANNING);
@@ -360,11 +440,9 @@ public class BluetoothServiceIndustrial extends Service {
 
     private void onScanTimeout() {
         if (mState != State.SCANNING) return;
-        boolean fallback = mReconnectCount >= 2;
-        if (fallback) {
-            Log.w(TAG, "[FALLBACK] Timeout - nenhum dispositivo CHOPP_ encontrado no ar.");
-        }
+        Log.w(TAG, "[SCAN] Timeout — nenhum dispositivo encontrado");
         stopScan();
+        mState = State.IDLE;
         scheduleReconnect("scan_timeout");
     }
 
@@ -376,23 +454,26 @@ public class BluetoothServiceIndustrial extends Service {
             String deviceName = (record != null) ? record.getDeviceName() : null;
             if (deviceName == null) deviceName = device.getName();
 
-            // So processa dispositivos CHOPP_
+            // Só processa dispositivos CHOPP_
             if (!BleConfigUtils.isChoppDevice(deviceName)) return;
 
             Log.d(TAG, "[SCAN] Encontrado: " + deviceName + " | MAC=" + device.getAddress());
 
-            boolean nameMatch   = BleConfigUtils.matchesBleNameForMac(deviceName, mTargetWifiMac);
             boolean macMatch    = device.getAddress().equalsIgnoreCase(mTargetMac);
-            boolean fallbackOk  = mReconnectCount >= 2;
+            boolean nameMatch   = BleConfigUtils.matchesBleNameForMac(deviceName, mTargetWifiMac);
+            boolean permissive  = mReconnectCount >= 4;
 
-            if (nameMatch || macMatch || fallbackOk) {
-                // Guard: evita múltiplas conexões GATT quando o scanner
-                // entrega o mesmo dispositivo várias vezes antes de parar.
+            if (macMatch || nameMatch || permissive) {
+                // Guard: evita múltiplas conexões GATT
                 if (mState != State.SCANNING) return;
-                mState = State.CONNECTING;
+                mState = State.CONNECTING_GATT;
 
-                if (!nameMatch && !macMatch) {
-                    Log.w(TAG, "[FALLBACK] Aceitando " + deviceName + " por fallback apos " + mReconnectCount + " falhas");
+                if (!macMatch && !nameMatch) {
+                    Log.w(TAG, "[SCAN] Aceitando " + deviceName
+                            + " por scan permissivo apos " + mReconnectCount + " falhas");
+                } else {
+                    Log.i(TAG, "[SCAN] Dispositivo alvo encontrado: " + deviceName
+                            + " | MAC=" + device.getAddress());
                 }
                 stopScan();
                 connectGatt(device);
@@ -407,18 +488,16 @@ public class BluetoothServiceIndustrial extends Service {
     };
 
     // =========================================================================
-    // Conexao GATT - Just Works (sem createBond, sem PIN)
+    // Conexão GATT — compartilhada entre conexão direta e scan
     // =========================================================================
 
     private void connectGatt(BluetoothDevice device) {
         Log.i(TAG, "[GATT] Conectando a " + device.getAddress());
-        // Fecha GATT residual de sessão anterior para não acumular instâncias
         if (mGatt != null) {
             try { mGatt.close(); } catch (Exception ignored) {}
             mGatt = null;
         }
-        mState = State.CONNECTING;
-        // Just Works: autoConnect=false, TRANSPORT_LE, sem createBond()
+        mState = State.CONNECTING_GATT;
         mGatt = device.connectGatt(this, false, mGattCallback, BluetoothDevice.TRANSPORT_LE);
     }
 
@@ -427,13 +506,19 @@ public class BluetoothServiceIndustrial extends Service {
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
             if (newState == BluetoothGatt.STATE_CONNECTED) {
-                Log.i(TAG, "[GATT] Conectado");
+                // Cancela o timeout de conexão direta — conexão bem-sucedida
+                mHandler.removeCallbacks(mDirectConnectTimeoutRunnable);
+
+                Log.i(TAG, "[GATT] Conectado (via "
+                        + (mState == State.CONNECTING_DIRECT ? "MAC direto" : "scan") + ")");
                 mState = State.CONNECTED;
                 broadcastStatus(STATUS_CONNECTED);
-                // Conforme doc: sem createBond() - ir direto para requestMtu
                 gatt.requestMtu(BleConfigUtils.MTU_REQUESTED);
 
             } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
+                // Cancela timeout de conexão direta se ainda estiver pendente
+                mHandler.removeCallbacks(mDirectConnectTimeoutRunnable);
+
                 Log.w(TAG, "[GATT] Desconectado (status=" + status + ")");
                 mState  = State.IDLE;
                 mRxChar = null;
@@ -448,7 +533,6 @@ public class BluetoothServiceIndustrial extends Service {
         @Override
         public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
             Log.i(TAG, "[GATT] MTU negociado: " + mtu);
-            // Conforme doc: apos MTU, descobrir servicos
             gatt.discoverServices();
         }
 
@@ -477,12 +561,9 @@ public class BluetoothServiceIndustrial extends Service {
                 return;
             }
 
-            // Habilitar notificacoes na TX (descriptor 0x2902)
             gatt.setCharacteristicNotification(mTxChar, true);
             BluetoothGattDescriptor descriptor = mTxChar.getDescriptor(UUID_CCCD);
             if (descriptor != null) {
-                // CORREÇÃO v4.5: writeDescriptor(desc, byte[]) é a API moderna (API 33+).
-                // A API antiga setValue()+writeDescriptor(desc) foi descontinuada.
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     gatt.writeDescriptor(descriptor,
                             BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
@@ -501,7 +582,6 @@ public class BluetoothServiceIndustrial extends Service {
         public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
             Log.i(TAG, "[GATT] onDescriptorWrite status=" + status);
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                // Conforme doc: apos onDescriptorWrite, estado READY
                 onReady();
             } else {
                 Log.e(TAG, "[GATT] Falha ao escrever descriptor: " + status);
@@ -509,34 +589,23 @@ public class BluetoothServiceIndustrial extends Service {
             }
         }
 
-        // ── Android 12 e anteriores (API 31-32) ─────────────────────────────────
-        // O sistema chama esta assinatura em dispositivos com Android <= 12.
-        // Em Android 13+ (API 33) esta assinatura foi descontinuada e o sistema
-        // chama EXCLUSIVAMENTE a nova assinatura abaixo com byte[] value.
+        // Android 12 e anteriores
         @Override
         public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
-            // Redireciona para o handler unificado usando getValue() (API legada)
             processarNotificacaoBLE(characteristic.getValue());
         }
 
-        // ── Android 13+ (API 33+) ────────────────────────────────────────────────
-        // CORREÇÃO v4.5: Nova assinatura obrigatória para Android 13, 14 e 15.
-        // Sem este override, VP:/ML:/QP: nunca chegam ao app em celulares novos.
-        // O byte[] value é passado diretamente pelo sistema, sem depender de
-        // characteristic.getValue() que pode conter dados desatualizados.
+        // Android 13+ (API 33+)
         @Override
         public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, byte[] value) {
-            // Redireciona para o handler unificado com o valor direto (API 33+)
             processarNotificacaoBLE(value);
         }
 
-        /** Handler unificado para notificacoes BLE — chamado por ambas as assinaturas. */
         private void processarNotificacaoBLE(byte[] data) {
             if (data == null) return;
             String msg = new String(data, StandardCharsets.UTF_8).trim();
             Log.d(TAG, "[RX] Recebido: " + msg);
 
-            // Processar PONG internamente para keepalive
             BleCommand.Response r = BleCommand.parse(msg);
             if (r.isPong()) {
                 Log.d(TAG, "[PING] PONG recebido - sessao valida");
@@ -566,7 +635,6 @@ public class BluetoothServiceIndustrial extends Service {
 
     private void sendPing() {
         if (mState != State.READY) return;
-        // CORREÇÃO v4.2: não envia PING enquanto estiver dispensando chopp.
         if (mDispensandoChopp) {
             Log.d(TAG, "[PING] PING suprimido — dispensação em andamento");
             return;
@@ -576,7 +644,7 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     // =========================================================================
-    // Reconexao com backoff exponencial
+    // Reconexão com backoff exponencial e escalonamento de estratégia
     // =========================================================================
 
     private void scheduleReconnect(String reason) {
@@ -589,21 +657,34 @@ public class BluetoothServiceIndustrial extends Service {
         long delay = BACKOFF_MS[Math.min(mReconnectCount, BACKOFF_MS.length - 1)];
         mReconnectCount++;
 
-        Log.w(TAG, "[RECONNECT] Falha #" + mReconnectCount
-                + " - proxima tentativa (com scan) em " + delay + "ms");
-
-        if (mReconnectCount == 2) {
-            Log.w(TAG, "[RECONNECT] " + mReconnectCount + " falhas acumuladas - proximo ciclo usara scan de fallback (CHOPP_)");
+        // Determina qual estratégia será usada na próxima tentativa
+        String estrategia;
+        if (mReconnectCount <= 2) {
+            estrategia = "MAC direto";
+        } else if (mReconnectCount <= 4) {
+            estrategia = "scan direcionado";
+        } else {
+            estrategia = "scan permissivo";
         }
+
+        Log.w(TAG, "[RECONNECT] Falha #" + mReconnectCount
+                + " (" + reason + ") — proxima tentativa [" + estrategia + "] em " + delay + "ms");
+
         if (mReconnectCount == 3) {
-            Log.w(TAG, "[RECONNECT] 3 falhas - tentando refresh do cache GATT");
+            Log.w(TAG, "[RECONNECT] Escalando para scan direcionado por MAC");
             refreshGattCache();
+        } else if (mReconnectCount == 5) {
+            Log.w(TAG, "[RECONNECT] Escalando para scan permissivo (qualquer CHOPP_)");
         }
 
         broadcastStatus(STATUS_DISCONNECTED + ":" + reason);
         mHandler.postDelayed(() -> {
-            if (mState == State.IDLE || mState == State.SCANNING) {
-                startScanCycle();
+            if (mState == State.IDLE) {
+                if (mReconnectCount <= 2) {
+                    startDirectConnect();
+                } else {
+                    startScanCycle();
+                }
             }
         }, delay);
     }
@@ -623,32 +704,18 @@ public class BluetoothServiceIndustrial extends Service {
     // Broadcasts
     // =========================================================================
 
-    /**
-     * Envia broadcast de status BLE para receivers internos do app.
-     *
-     * Android 13+ (API 33): sendBroadcast() implícito (sem pacote destino) NÃO
-     * entrega para receivers registrados com RECEIVER_NOT_EXPORTED. É obrigatório
-     * definir o pacote destino via setPackage() para que a entrega funcione.
-     * Ref: https://developer.android.com/about/versions/13/behavior-changes-13#runtime-receivers
-     */
     private void broadcastStatus(String status) {
         Log.d(TAG, "[STATUS] " + status);
         Intent i = new Intent(BLE_STATUS_ACTION);
         i.putExtra("status", status);
-        i.setPackage(getPackageName()); // Android 13+: necessário para RECEIVER_NOT_EXPORTED
+        i.setPackage(getPackageName());
         sendBroadcast(i);
     }
 
-    /**
-     * Envia broadcast de dados recebidos do ESP32 para receivers internos do app.
-     *
-     * Mesmo requisito do Android 13+: setPackage() obrigatório para entrega
-     * a receivers registrados com RECEIVER_NOT_EXPORTED.
-     */
     private void broadcastData(String data) {
         Intent i = new Intent(BLE_DATA_ACTION);
         i.putExtra("data", data);
-        i.setPackage(getPackageName()); // Android 13+: necessário para RECEIVER_NOT_EXPORTED
+        i.setPackage(getPackageName());
         sendBroadcast(i);
     }
 
