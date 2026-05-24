@@ -479,14 +479,14 @@ public class Home extends AppCompatActivity {
             Log.w(TAG, "[KIOSK] startLockTask sem Device Owner: " + e.getMessage());
         }
 
-        // 2. Intercepta o botão Back — redireciona para AcessoMaster (senha de admin)
-        // v5.2: NO_HISTORY impede que AcessoMaster entre no back stack, evitando loop.
+        // 2. Intercepta o botão Back — bloqueia silenciosamente (modo kiosk)
+        // AcessoMaster so e acessivel pelo clique no logo (5x) ou icone de perfil.
+        // Pressionar Voltar na Home nao faz nada — o operador nao pode sair.
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
-                Log.i(TAG, "[KIOSK] Botão Back interceptado → abrindo AcessoMaster");
-                startActivity(new Intent(Home.this, AcessoMaster.class)
-                        .addFlags(Intent.FLAG_ACTIVITY_NO_HISTORY));
+                Log.i(TAG, "[KIOSK] Botao Back bloqueado — use o logo para acessar AcessoMaster");
+                // Nao faz nada: kiosk mode impede saida pelo Back
             }
         });
     }

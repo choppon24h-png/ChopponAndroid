@@ -222,7 +222,7 @@ public class CalibrarPulsos extends AppCompatActivity {
         btnChangePulsos.setOnClickListener(v -> {
             String val = edtNovoTimeout.getText().toString().trim();
             if (TextUtils.isEmpty(val)) {
-                Toast.makeText(this, "Informe o valor de pulsos/litro", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "Informe o valor de ML/Litro", Toast.LENGTH_SHORT).show();
                 return;
             }
             int pl;
@@ -236,7 +236,7 @@ public class CalibrarPulsos extends AppCompatActivity {
             }
             if (!verificarServico()) return;
             mBluetoothService.sendCommand("$PL:" + pl + "\n");
-            Toast.makeText(this, "Enviando $PL:" + pl, Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Enviando ML/Litro: " + pl, Toast.LENGTH_SHORT).show();
         });
 
         // ── Botao: Liberar 100 mL ($ML:100) ──────────────────────────────
@@ -522,7 +522,7 @@ public class CalibrarPulsos extends AppCompatActivity {
             try {
                 int qp = Integer.parseInt(msg.substring(3));
                 runOnUiThread(() ->
-                    setStatusOperacao("Pulsos contados: " + qp + " — aguardando medicao na proveta", true)
+                    setStatusOperacao("Contagem: " + qp + " — aguardando medicao na proveta", true)
                 );
             } catch (NumberFormatException ignored) {}
             return;
@@ -586,7 +586,7 @@ public class CalibrarPulsos extends AppCompatActivity {
                     new AlertDialog.Builder(CalibrarPulsos.this)
                             .setTitle("Calibracao Concluida!")
                             .setMessage("O novo fator de calibracao foi gravado na EEPROM do ESP32.\n\n" +
-                                    "O valor de Pulsos/Litro foi atualizado acima.")
+                                    "O valor de ML/Litro foi atualizado acima.")
                             .setPositiveButton("OK", null)
                             .show();
                     Log.d(TAG_CAL, "[CAL] Calibracao concluida com sucesso");
@@ -713,7 +713,8 @@ public class CalibrarPulsos extends AppCompatActivity {
     }
 
     private void navegarHome() {
-        Intent i = new Intent(this, Home.class);
+        // Volta para ServiceTools (tela pai), nao para Home
+        Intent i = new Intent(this, ServiceTools.class);
         i.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         startActivity(i);
         finish();

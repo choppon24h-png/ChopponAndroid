@@ -89,7 +89,7 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="Pulsos/Litro atual:"
+                android:text="ML/Litro atual:"
                 android:textColor="#AAAAAA"
                 android:textSize="14sp" />
 
@@ -372,7 +372,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="AJUSTE MANUAL DE PULSOS/LITRO"
+            android:text="AJUSTE MANUAL DE ML/LITRO"
             android:textColor="#888888"
             android:textSize="11sp"
             android:textAllCaps="true"
@@ -391,7 +391,7 @@
                 android:layout_width="0dp"
                 android:layout_height="52dp"
                 android:layout_weight="1"
-                android:hint="Pulsos/Litro"
+                android:hint="ML/Litro"
                 android:inputType="number"
                 android:textColor="#FFFFFF"
                 android:textColorHint="#666666"
