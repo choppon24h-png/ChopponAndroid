@@ -394,6 +394,24 @@
 
     </LinearLayout>
 
+    <!-- Contador de inatividade — retorno automático para Home (v5.3) -->
+    <TextView
+        android:id="@+id/txtInactivityCountdown"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="16dp"
+        android:background="#CC000000"
+        android:gravity="center"
+        android:padding="12dp"
+        android:text="Retornando em 10s..."
+        android:textColor="#FFFFFF"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent" />
+
     <!-- Overlay de Loading Centralizado -->
     <androidx.constraintlayout.widget.ConstraintLayout
         android:id="@+id/constLoader"

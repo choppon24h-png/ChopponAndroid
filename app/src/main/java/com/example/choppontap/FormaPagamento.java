@@ -7,6 +7,7 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.os.Bundle;
+import android.os.CountDownTimer;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
@@ -68,6 +69,13 @@ import okhttp3.ResponseBody;
  *  1. updateQrCode(): exibe o QR Code PIX. Mostra mensagem de espera se não carregar.
  *  2. verifyPayment(): aceita checkout_status "PAID", "APPROVED" e "COMPLETED"
  *     além de "SUCCESSFUL", cobrindo variações da resposta da SumUp para PIX.
+ *
+ * MELHORIA v5.3 (Android) — Retorno automático por inatividade:
+ *  - Se o cliente ficar 30 segundos na tela de escolha sem iniciar pagamento,
+ *    a tela retorna automaticamente para Home, exibindo contador regressivo.
+ *  - O timer é cancelado ao iniciar qualquer pagamento (PIX/Débito/Crédito).
+ *  - O timer é reiniciado ao retornar para STATE_CHOOSING (erro, cancelamento).
+ *  - Qualquer toque na tela reinicia o contador de inatividade.
  */
 public class FormaPagamento extends AppCompatActivity {
     private String android_id;
@@ -75,6 +83,14 @@ public class FormaPagamento extends AppCompatActivity {
     private Runnable runnable;
     private Handler handlerCountDown = new Handler(Looper.getMainLooper());
     private Runnable runnableCountDown;
+
+    // ── Timeout de inatividade (v5.3) ────────────────────────────────────────
+    /** Segundos de inatividade na tela de escolha antes de retornar para Home. */
+    private static final int INACTIVITY_TIMEOUT_SECONDS = 30;
+    /** CountDownTimer que controla o retorno automático por inatividade. */
+    private CountDownTimer inactivityTimer = null;
+    /** TextView que exibe o contador regressivo de inatividade ao usuário. */
+    private TextView txtInactivityCountdown;
 
     private static final int STATE_CHOOSING = 0;
     private static final int STATE_LOADING  = 1;
@@ -126,6 +142,17 @@ public class FormaPagamento extends AppCompatActivity {
         loadInitialData();
     }
 
+    // ── Intercepta todos os toques para reiniciar o timer de inatividade ─────
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        // Reinicia o timer de inatividade a cada toque do usuário,
+        // mas apenas quando a tela está no estado de escolha de pagamento.
+        if (inactivityTimer != null) {
+            resetInactivityTimer();
+        }
+        return super.dispatchTouchEvent(ev);
+    }
+
     private void setupUI() {
         constLoader   = findViewById(R.id.constLoader);
         txtPreloader  = findViewById(R.id.txtPreloader);
@@ -153,6 +180,9 @@ public class FormaPagamento extends AppCompatActivity {
         txtQrError      = findViewById(R.id.txtQrError);
         btnCopiarPix    = findViewById(R.id.btnCopiarPix);
 
+        // ── Contador de inatividade (v5.3) ────────────────────────────────────
+        txtInactivityCountdown = findViewById(R.id.txtInactivityCountdown);
+
         setupFullscreen();
         setupCpfMask();
         // v5.2: Bloqueia o botão Voltar — redireciona para Home sem abrir AcessoMaster.
@@ -176,6 +206,80 @@ public class FormaPagamento extends AppCompatActivity {
         updateUIState(STATE_CHOOSING);
     }
 
+    // ── Métodos de controle do timer de inatividade (v5.3) ───────────────────
+
+    /**
+     * Inicia (ou reinicia) o timer de inatividade.
+     * Deve ser chamado apenas quando a tela está em STATE_CHOOSING.
+     */
+    private void startInactivityTimer() {
+        cancelInactivityTimer();
+
+        inactivityTimer = new CountDownTimer(
+                (long) INACTIVITY_TIMEOUT_SECONDS * 1000, 1000) {
+
+            @Override
+            public void onTick(long millisUntilFinished) {
+                int segundosRestantes = (int) (millisUntilFinished / 1000);
+                runOnUiThread(() -> {
+                    if (txtInactivityCountdown != null) {
+                        if (segundosRestantes <= 10) {
+                            // Últimos 10 segundos: exibe o contador em destaque
+                            txtInactivityCountdown.setVisibility(View.VISIBLE);
+                            txtInactivityCountdown.setText(
+                                    "Retornando em " + segundosRestantes + "s...");
+                        } else {
+                            txtInactivityCountdown.setVisibility(View.GONE);
+                        }
+                    }
+                });
+            }
+
+            @Override
+            public void onFinish() {
+                Log.i(TAG, "⏰ Inatividade: retornando automaticamente para Home.");
+                runOnUiThread(() -> {
+                    if (txtInactivityCountdown != null) {
+                        txtInactivityCountdown.setVisibility(View.GONE);
+                    }
+                });
+                voltarParaHome();
+            }
+        };
+        inactivityTimer.start();
+        Log.d(TAG, "⏱️ Timer de inatividade iniciado (" + INACTIVITY_TIMEOUT_SECONDS + "s).");
+    }
+
+    /**
+     * Cancela o timer de inatividade e oculta o contador visual.
+     * Deve ser chamado ao iniciar qualquer fluxo de pagamento.
+     */
+    private void cancelInactivityTimer() {
+        if (inactivityTimer != null) {
+            inactivityTimer.cancel();
+            inactivityTimer = null;
+            Log.d(TAG, "⏱️ Timer de inatividade cancelado.");
+        }
+        runOnUiThread(() -> {
+            if (txtInactivityCountdown != null) {
+                txtInactivityCountdown.setVisibility(View.GONE);
+            }
+        });
+    }
+
+    /**
+     * Reinicia o timer de inatividade (cancela e inicia novamente).
+     * Chamado a cada toque do usuário enquanto em STATE_CHOOSING.
+     */
+    private void resetInactivityTimer() {
+        // Só reinicia se estiver no estado de escolha (timer ativo)
+        if (inactivityTimer != null) {
+            startInactivityTimer();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+
     private void updateUIState(int state) {
         runOnUiThread(() -> {
             Log.d(TAG, "🔄 Mudando estado da UI para: " + state);
@@ -190,6 +294,15 @@ public class FormaPagamento extends AppCompatActivity {
                 if (txtPixCodeLabel != null) txtPixCodeLabel.setVisibility(View.GONE);
                 if (btnCopiarPix    != null) btnCopiarPix.setVisibility(View.GONE);
                 if (txtQrError      != null) txtQrError.setVisibility(View.GONE);
+            }
+
+            // ── Gerenciar timer de inatividade conforme o estado (v5.3) ──────
+            if (state == STATE_CHOOSING) {
+                // Voltou para a tela de escolha → inicia/reinicia o timer
+                startInactivityTimer();
+            } else {
+                // Entrou em qualquer fluxo de pagamento → cancela o timer
+                cancelInactivityTimer();
             }
 
             if (state == STATE_CHOOSING) changeButtonsFunction(true);
@@ -355,6 +468,7 @@ public class FormaPagamento extends AppCompatActivity {
 
     private void voltarParaHome() {
         runOnUiThread(() -> {
+            cancelInactivityTimer(); // v5.3: garantir que o timer seja cancelado ao sair
             stopRunnable();
             paymentIdempotencyKey = null;
             startActivity(new Intent(this, Home.class)
@@ -410,6 +524,7 @@ public class FormaPagamento extends AppCompatActivity {
             Log.i(TAG, "[PAYMENT] Pagamento confirmado");
             Log.i(TAG, "[PAYMENT] Volume selecionado: " + quantidade + " ml");
             Log.i(TAG, "[PAYMENT] checkout_id: " + checkout_id);
+            cancelInactivityTimer(); // v5.3: garantir que o timer seja cancelado ao concluir
             stopRunnable();
             Intent it = new Intent(this, PagamentoConcluido.class);
             it.putExtra("qtd_ml",     quantidade);
@@ -699,6 +814,7 @@ public class FormaPagamento extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        cancelInactivityTimer(); // v5.3: limpar timer ao destruir a Activity
         stopRunnable();
         paymentIdempotencyKey = null;
         dbExecutor.shutdownNow();
