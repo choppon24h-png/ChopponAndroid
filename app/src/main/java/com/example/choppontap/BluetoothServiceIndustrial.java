@@ -111,10 +111,13 @@ public class BluetoothServiceIndustrial extends Service {
     private final Handler mHandler = new Handler(Looper.getMainLooper());
 
     // Reconexão com backoff exponencial
+    // MAX_RECONNECT = Integer.MAX_VALUE: reconecta indefinidamente após queda de energia da ESP32
+    // sem precisar reiniciar o tablet.
     private int    mReconnectCount = 0;
-    private static final int    MAX_RECONNECT = 10;
-    // Backoff: direto(1s), direto(2s), scan(4s), scan(8s), permissivo(15s)...
-    private static final long[] BACKOFF_MS    = {1000, 2000, 4000, 8000, 15000, 15000, 15000, 15000, 15000, 15000};
+    private static final int    MAX_RECONNECT = Integer.MAX_VALUE;
+    // Backoff: direto(1s), direto(2s), scan(4s), scan(5s), permissivo(5s)...
+    // Limitado a 5s máximo para garantir reconexão rápida após queda de energia.
+    private static final long[] BACKOFF_MS    = {1000, 2000, 4000, 5000, 5000, 5000, 5000, 5000, 5000, 5000};
 
     // Timeout para conexão direta (sem scan) — se o GATT não conectar em 5s, vai para scan
     private static final long DIRECT_CONNECT_TIMEOUT_MS = 5000L;
@@ -648,11 +651,8 @@ public class BluetoothServiceIndustrial extends Service {
     // =========================================================================
 
     private void scheduleReconnect(String reason) {
-        if (mReconnectCount >= MAX_RECONNECT) {
-            Log.e(TAG, "[RECONNECT] Maximo de tentativas atingido - desistindo");
-            broadcastStatus(STATUS_DISCONNECTED + ":max_retries");
-            return;
-        }
+        // MAX_RECONNECT = Integer.MAX_VALUE: nunca desiste — reconecta indefinidamente
+        // após queda de energia da ESP32 sem precisar reiniciar o tablet.
 
         long delay = BACKOFF_MS[Math.min(mReconnectCount, BACKOFF_MS.length - 1)];
         mReconnectCount++;

@@ -19,11 +19,14 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.provider.Settings.Secure;
 import android.util.Log;
+import android.view.View;
 import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import androidx.constraintlayout.widget.ConstraintLayout;
 
 import androidx.activity.EdgeToEdge;
 import androidx.activity.OnBackPressedCallback;
@@ -63,6 +66,16 @@ public class Home extends AppCompatActivity {
     private ImageView logoChoppOn;
     private MaterialButton btn100, btn300, btn500, btn700;
     private BluetoothStatusIndicator bluetoothStatusIndicator;
+
+    // ── Overlay de Reconexão BLE (v5.4) ───────────────────────────────────────
+    private ConstraintLayout overlayReconectando;
+    private TextView txtReconectandoHome;
+    private TextView txtReconectandoSubHome;
+    private TextView txtReconectandoTentativaHome;
+    /** Contador de tentativas de reconexão — exibido no overlay */
+    private int mBleReconnectAttempts = 0;
+    /** true enquanto o overlay de reconexão estiver visível */
+    private boolean mIsReconnecting = false;
 
     // ── Estado da TAP ─────────────────────────────────────────────────────────
     private String android_id;
@@ -219,8 +232,18 @@ public class Home extends AppCompatActivity {
                     updateBluetoothStatus(status);
                     if (status.startsWith("disconnected")) {
                         changeButtons(false);
+                        // v5.4: exibe overlay de reconexão ao perder conexão com a ESP32
+                        showBleReconnectOverlay();
                     } else if ("ready".equals(status) || "connected".equals(status)) {
                         changeButtons(true);
+                        // v5.4: oculta overlay ao reconectar com sucesso
+                        hideBleReconnectOverlay();
+                    } else if ("scanning".equals(status) || status.startsWith("connecting")) {
+                        // Atualiza contador de tentativas no overlay se estiver visível
+                        if (mIsReconnecting) {
+                            mBleReconnectAttempts++;
+                            updateReconnectAttemptText();
+                        }
                     }
                 }
             }
@@ -351,6 +374,12 @@ public class Home extends AppCompatActivity {
             }
         }
 
+        // v5.4: Se o BLE já estiver conectado ao retornar de uma tela filha,
+        // garante que o overlay de reconexão esteja oculto
+        if (isBleReady() && mIsReconnecting) {
+            hideBleReconnectOverlay();
+        }
+
         // Se já vinculado, sincroniza o estado da UI com o estado real do serviço
         if (mIsServiceBound && mBluetoothService != null) {
             if (isBleReady()) {
@@ -406,6 +435,12 @@ public class Home extends AppCompatActivity {
 
         LinearLayout statusContainer = findViewById(R.id.bluetooth_status_container);
         bluetoothStatusIndicator = new BluetoothStatusIndicator(statusContainer);
+
+        // ── Overlay de reconexão BLE (v5.4) ──────────────────────────────────
+        overlayReconectando        = findViewById(R.id.overlayReconectando);
+        txtReconectandoHome        = findViewById(R.id.txtReconectando);
+        txtReconectandoSubHome     = findViewById(R.id.txtReconectandoSub);
+        txtReconectandoTentativaHome = findViewById(R.id.txtReconectandoTentativa);
 
         // Botões desabilitados até BLE conectar
         changeButtons(false);
@@ -872,6 +907,53 @@ public class Home extends AppCompatActivity {
             startService(serviceIntent);
         }
         bindService(serviceIntent, mServiceConnection, Context.BIND_AUTO_CREATE);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Overlay de Reconexão BLE (v5.4)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Exibe o overlay de reconexão BLE, bloqueando a tela até a ESP32 reconectar.
+     * Chamado quando o status BLE muda para "disconnected".
+     * Seguro para chamar múltiplas vezes — ignora se já estiver visível.
+     */
+    private void showBleReconnectOverlay() {
+        if (mIsReconnecting) return; // já visível
+        mIsReconnecting = true;
+        mBleReconnectAttempts = 1;
+        Log.w(TAG, "[OVERLAY] Exibindo overlay de reconexão BLE");
+        runOnUiThread(() -> {
+            if (overlayReconectando != null) {
+                overlayReconectando.setVisibility(View.VISIBLE);
+                updateReconnectAttemptText();
+            }
+        });
+    }
+
+    /**
+     * Oculta o overlay de reconexão BLE após a ESP32 reconectar com sucesso.
+     * Chamado quando o status BLE muda para "ready" ou "connected".
+     */
+    private void hideBleReconnectOverlay() {
+        if (!mIsReconnecting) return;
+        mIsReconnecting = false;
+        mBleReconnectAttempts = 0;
+        Log.i(TAG, "[OVERLAY] Ocultando overlay de reconexão BLE — ESP32 reconectada");
+        runOnUiThread(() -> {
+            if (overlayReconectando != null) {
+                overlayReconectando.setVisibility(View.GONE);
+            }
+        });
+    }
+
+    /** Atualiza o texto de tentativas no overlay de reconexão. */
+    private void updateReconnectAttemptText() {
+        runOnUiThread(() -> {
+            if (txtReconectandoTentativaHome != null) {
+                txtReconectandoTentativaHome.setText("Tentativa " + mBleReconnectAttempts);
+            }
+        });
     }
 
     private void updateBluetoothStatus(String status) {

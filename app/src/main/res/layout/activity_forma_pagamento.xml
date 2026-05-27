@@ -455,4 +455,88 @@
         </LinearLayout>
     </androidx.constraintlayout.widget.ConstraintLayout>
 
+
+    <!-- ── Overlay de Reconexão BLE (v5.4) ──────────────────────────────────
+         Exibido quando a conexão com a ESP32 é perdida durante o pagamento.
+         Cobre toda a tela, suspendendo o fluxo até a ESP32 reconectar.
+         Se não reconectar em 60s, retorna automaticamente para Home.
+    ─────────────────────────────────────────────────────────────────────── -->
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:id="@+id/overlayBleReconectando"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="#E6000000"
+        android:elevation="20dp"
+        android:visibility="gone"
+        android:clickable="true"
+        android:focusable="true"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:padding="32dp"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent">
+
+            <ProgressBar
+                android:id="@+id/progressBleReconectando"
+                style="?android:attr/progressBarStyle"
+                android:layout_width="80dp"
+                android:layout_height="80dp"
+                android:indeterminateTint="#FF8C00" />
+
+            <TextView
+                android:id="@+id/txtBleReconectando"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="24dp"
+                android:gravity="center"
+                android:text="Reconectando..."
+                android:textColor="#FFFFFF"
+                android:textSize="26sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/txtBleReconectandoSub"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:gravity="center"
+                android:text="Aguarde. Tentando reconectar com a chopeira..."
+                android:textColor="#CCCCCC"
+                android:textSize="16sp" />
+
+            <TextView
+                android:id="@+id/txtBleReconectandoTentativa"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center"
+                android:text="Tentativa 1"
+                android:textColor="#FF8C00"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/txtBleReconectandoFallback"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:gravity="center"
+                android:text=""
+                android:textColor="#FF6666"
+                android:textSize="13sp"
+                android:visibility="gone" />
+
+        </LinearLayout>
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
+
 </androidx.constraintlayout.widget.ConstraintLayout>

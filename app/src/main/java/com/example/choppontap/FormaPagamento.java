@@ -1,7 +1,9 @@
 package com.example.choppontap;
 
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ActivityInfo;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -29,6 +31,7 @@ import android.widget.Toast;
 import androidx.activity.OnBackPressedCallback;
 import androidx.activity.EdgeToEdge;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 import androidx.cardview.widget.CardView;
 import androidx.constraintlayout.widget.ConstraintLayout;
 import androidx.core.view.WindowInsetsControllerCompat;
@@ -92,6 +95,19 @@ public class FormaPagamento extends AppCompatActivity {
     /** TextView que exibe o contador regressivo de inatividade ao usuário. */
     private TextView txtInactivityCountdown;
 
+    // ── Overlay de Reconexão BLE (v5.4) ───────────────────────────────────────
+    /** Timeout em segundos para retornar ao Home se o BLE não reconectar. */
+    private static final int BLE_RECONNECT_TIMEOUT_SECONDS = 60;
+    private ConstraintLayout overlayBleReconectando;
+    private TextView txtBleReconectandoTentativa;
+    private TextView txtBleReconectandoFallback;
+    /** Contador de tentativas de reconexão BLE exibido no overlay. */
+    private int mBleReconnectAttempts = 0;
+    /** true enquanto o overlay de reconexão BLE estiver visível. */
+    private boolean mIsBleReconnecting = false;
+    /** CountDownTimer de fallback: retorna para Home se BLE não voltar em 60s. */
+    private CountDownTimer bleReconnectFallbackTimer = null;
+
     private static final int STATE_CHOOSING = 0;
     private static final int STATE_LOADING  = 1;
     private static final int STATE_PIX      = 2;
@@ -153,6 +169,146 @@ public class FormaPagamento extends AppCompatActivity {
         return super.dispatchTouchEvent(ev);
     }
 
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // v5.4: registra receiver BLE para detectar desconexão durante o pagamento
+        IntentFilter bleFilter = new IntentFilter(BluetoothServiceIndustrial.BLE_STATUS_ACTION);
+        LocalBroadcastManager.getInstance(this).registerReceiver(mBleStatusReceiver, bleFilter);
+        Log.d(TAG, "[BLE] BroadcastReceiver BLE registrado em onResume");
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // v5.4: desregistra receiver BLE ao sair da tela
+        try {
+            LocalBroadcastManager.getInstance(this).unregisterReceiver(mBleStatusReceiver);
+        } catch (Exception ignored) {}
+        cancelBleReconnectFallbackTimer();
+        Log.d(TAG, "[BLE] BroadcastReceiver BLE desregistrado em onPause");
+    }
+
+    /**
+     * BroadcastReceiver que monitora o status BLE durante o pagamento (v5.4).
+     * Ao detectar desconexão, exibe o overlay de reconexão.
+     * Ao reconectar, oculta o overlay e retoma o fluxo normalmente.
+     */
+    private final BroadcastReceiver mBleStatusReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!BluetoothServiceIndustrial.BLE_STATUS_ACTION.equals(intent.getAction())) return;
+            String status = intent.getStringExtra("status");
+            if (status == null) return;
+            Log.d(TAG, "[BLE] Status recebido em FormaPagamento: " + status);
+
+            if (status.startsWith("disconnected")) {
+                // Conexão perdida — exibe overlay de reconexão
+                showBleReconnectOverlay();
+            } else if ("ready".equals(status) || "connected".equals(status)) {
+                // Reconectou — oculta overlay e retoma fluxo
+                hideBleReconnectOverlay();
+            } else if ("scanning".equals(status) || status.startsWith("connecting")) {
+                // Tentando reconectar — atualiza contador no overlay
+                if (mIsBleReconnecting) {
+                    mBleReconnectAttempts++;
+                    runOnUiThread(() -> {
+                        if (txtBleReconectandoTentativa != null) {
+                            txtBleReconectandoTentativa.setText("Tentativa " + mBleReconnectAttempts);
+                        }
+                    });
+                }
+            }
+        }
+    };
+
+    // ── Métodos do overlay de reconexão BLE (v5.4) ───────────────────────────
+
+    /**
+     * Exibe o overlay de reconexão BLE e inicia o timer de fallback (60s → Home).
+     * Seguro para chamar múltiplas vezes — ignora se já estiver visível.
+     */
+    private void showBleReconnectOverlay() {
+        if (mIsBleReconnecting) return;
+        mIsBleReconnecting = true;
+        mBleReconnectAttempts = 1;
+        Log.w(TAG, "[BLE] Conexão perdida durante pagamento — exibindo overlay de reconexão");
+        runOnUiThread(() -> {
+            if (overlayBleReconectando != null) {
+                overlayBleReconectando.setVisibility(View.VISIBLE);
+                if (txtBleReconectandoTentativa != null) {
+                    txtBleReconectandoTentativa.setText("Tentativa 1");
+                }
+                if (txtBleReconectandoFallback != null) {
+                    txtBleReconectandoFallback.setVisibility(View.GONE);
+                    txtBleReconectandoFallback.setText("");
+                }
+            }
+        });
+        startBleReconnectFallbackTimer();
+    }
+
+    /**
+     * Oculta o overlay de reconexão BLE após reconectar com sucesso.
+     * Cancela o timer de fallback.
+     */
+    private void hideBleReconnectOverlay() {
+        if (!mIsBleReconnecting) return;
+        mIsBleReconnecting = false;
+        mBleReconnectAttempts = 0;
+        cancelBleReconnectFallbackTimer();
+        Log.i(TAG, "[BLE] ESP32 reconectada — ocultando overlay e retomando pagamento");
+        runOnUiThread(() -> {
+            if (overlayBleReconectando != null) {
+                overlayBleReconectando.setVisibility(View.GONE);
+            }
+        });
+    }
+
+    /**
+     * Inicia o timer de fallback: se o BLE não reconectar em BLE_RECONNECT_TIMEOUT_SECONDS,
+     * retorna automaticamente para Home para não deixar o totem travado.
+     */
+    private void startBleReconnectFallbackTimer() {
+        cancelBleReconnectFallbackTimer();
+        bleReconnectFallbackTimer = new CountDownTimer(
+                (long) BLE_RECONNECT_TIMEOUT_SECONDS * 1000, 1000) {
+
+            @Override
+            public void onTick(long millisUntilFinished) {
+                int secsLeft = (int) (millisUntilFinished / 1000);
+                if (secsLeft <= 20) {
+                    runOnUiThread(() -> {
+                        if (txtBleReconectandoFallback != null) {
+                            txtBleReconectandoFallback.setVisibility(View.VISIBLE);
+                            txtBleReconectandoFallback.setText(
+                                    "Retornando ao início em " + secsLeft + "s...");
+                        }
+                    });
+                }
+            }
+
+            @Override
+            public void onFinish() {
+                Log.w(TAG, "[BLE] Timeout de reconexão atingido (" + BLE_RECONNECT_TIMEOUT_SECONDS
+                        + "s) — retornando para Home");
+                mIsBleReconnecting = false;
+                voltarParaHome();
+            }
+        };
+        bleReconnectFallbackTimer.start();
+        Log.d(TAG, "[BLE] Timer de fallback BLE iniciado (" + BLE_RECONNECT_TIMEOUT_SECONDS + "s)");
+    }
+
+    /** Cancela o timer de fallback BLE se estiver ativo. */
+    private void cancelBleReconnectFallbackTimer() {
+        if (bleReconnectFallbackTimer != null) {
+            bleReconnectFallbackTimer.cancel();
+            bleReconnectFallbackTimer = null;
+            Log.d(TAG, "[BLE] Timer de fallback BLE cancelado");
+        }
+    }
+
     private void setupUI() {
         constLoader   = findViewById(R.id.constLoader);
         txtPreloader  = findViewById(R.id.txtPreloader);
@@ -182,6 +338,11 @@ public class FormaPagamento extends AppCompatActivity {
 
         // ── Contador de inatividade (v5.3) ────────────────────────────────────
         txtInactivityCountdown = findViewById(R.id.txtInactivityCountdown);
+
+        // ── Overlay de reconexão BLE (v5.4) ──────────────────────────────────
+        overlayBleReconectando        = findViewById(R.id.overlayBleReconectando);
+        txtBleReconectandoTentativa   = findViewById(R.id.txtBleReconectandoTentativa);
+        txtBleReconectandoFallback    = findViewById(R.id.txtBleReconectandoFallback);
 
         setupFullscreen();
         setupCpfMask();
@@ -815,6 +976,7 @@ public class FormaPagamento extends AppCompatActivity {
     protected void onDestroy() {
         super.onDestroy();
         cancelInactivityTimer(); // v5.3: limpar timer ao destruir a Activity
+        cancelBleReconnectFallbackTimer(); // v5.4: limpar timer de fallback BLE
         stopRunnable();
         paymentIdempotencyKey = null;
         dbExecutor.shutdownNow();
