@@ -133,6 +133,14 @@ public class BluetoothServiceIndustrial extends Service {
     // Flag para suspender PING durante dispensação de chopp
     private volatile boolean mDispensandoChopp = false;
 
+    // ── SEGURANÇA v5.5: Lock de ciclo ativo no nível do serviço BLE ──────────
+    // Impede que múltiplos $ML: sejam enviados ao ESP32 enquanto um ciclo
+    // de dispensação está em andamento. Resetado quando:
+    //   - FN: é recebido pelo PagamentoConcluido (via resetDispenseCycle())
+    //   - disconnect() é chamado
+    //   - watchdog dispara no PagamentoConcluido
+    private volatile boolean mCycleActive = false;
+
     // Notification Foreground Service
     private static final String CHANNEL_ID = "ble_industrial_channel";
     private static final int    NOTIF_ID   = 1001;
@@ -249,6 +257,18 @@ public class BluetoothServiceIndustrial extends Service {
             Log.w(TAG, "[CMD] RxChar ou GATT nulo");
             return false;
         }
+        // ── SEGURANÇA v5.5: Bloqueia $ML: duplicado se ciclo já ativo ────────────────────
+        // $TO:0 (kill-switch de emergência) SEMPRE passa, mesmo com ciclo ativo.
+        if (command.startsWith(BleCommand.CMD_ML) && !command.equals(BleCommand.CMD_ML + ":0")) {
+            if (mCycleActive) {
+                Log.e(TAG, "[SEGURANCA-BLE] sendCommand BLOQUEADO — mCycleActive=true. "
+                        + "Rejeitando " + command + " (ciclo já em andamento no ESP32)");
+                return false;
+            }
+            // Marca ciclo como ativo ao enviar $ML:
+            mCycleActive = true;
+            Log.i(TAG, "[SEGURANCA-BLE] Ciclo ativado — mCycleActive=true");
+        }
         // Suspende PING durante dispensação ($ML, $LB, $RS)
         if (command.startsWith(BleCommand.CMD_ML) && !command.equals(BleCommand.CMD_ML + "0")) {
             pausarPing();
@@ -293,6 +313,21 @@ public class BluetoothServiceIndustrial extends Service {
         }
     }
 
+    /**
+     * SEGURANÇA v5.5: Reseta o lock de ciclo ativo no nível do serviço BLE.
+     * Chamado pelo PagamentoConcluido quando:
+     *   - FN: é recebido (ciclo encerrado pelo ESP32)
+     *   - Watchdog dispara (timeout sem fluxo)
+     *   - Erro de envio (sendCommand falhou)
+     * Permite que o próximo $ML: seja aceito normalmente.
+     */
+    public void resetDispenseCycle() {
+        if (mCycleActive) {
+            mCycleActive = false;
+            Log.i(TAG, "[SEGURANCA-BLE] Ciclo resetado — mCycleActive=false");
+        }
+    }
+
     /** Desconecta e para de reconectar. */
     public void disconnect(boolean stopReconnect) {
         if (stopReconnect) {
@@ -310,6 +345,8 @@ public class BluetoothServiceIndustrial extends Service {
         mState  = State.IDLE;
         mRxChar = null;
         mTxChar = null;
+        // v5.5: Reseta o lock de ciclo ao desconectar para não bloquear a reconexão
+        mCycleActive = false;
     }
 
     public String getCurrentStatus() {

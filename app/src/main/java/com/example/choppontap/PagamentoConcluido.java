@@ -100,6 +100,34 @@ public class PagamentoConcluido extends AppCompatActivity {
      */
     private String  mUltimoComandoEnviado = "";
 
+    // ── Segurança anti-spam do botão (v5.5) ──────────────────────────────────
+    /**
+     * Lock global de dispense. Enquanto true, NENHUM novo $ML: pode ser enviado.
+     * Setado para true ao enviar $ML:, resetado apenas em:
+     *   - FN: (ciclo encerrado pelo ESP32)
+     *   - Watchdog timeout (para permitir retry manual)
+     *   - Erro de envio (sendCommand falhou)
+     *
+     * OBJETIVO: impedir que o usuário acione o botão múltiplas vezes durante
+     * uma parada temporária da válvula, evitando que a ESP32 receba N comandos
+     * $ML: empilhados e sirva N×volume ao invés de 1×volume.
+     */
+    private volatile boolean mDispenseLocked = false;
+
+    /**
+     * Timestamp do último clique no btnLiberar.
+     * Usado como debounce extra de 3s entre cliques consecutivos.
+     */
+    private long mLastBtnClickMs = 0L;
+    private static final long BTN_DEBOUNCE_MS = 3_000L;
+
+    /**
+     * Kill-switch de emergência: se o volume acumulado ultrapassar
+     * qtd_ml + VOLUME_OVERFLOW_TOLERANCE_ML, envia $TO:0 para fechar
+     * a válvula imediatamente, independente do estado do ciclo.
+     */
+    private static final double VOLUME_OVERFLOW_TOLERANCE_ML = 30.0;
+
     // ── Dados do pedido ──────────────────────────────────────────────────────────────────
     private String checkout_id;
     private String android_id;
@@ -125,19 +153,35 @@ public class PagamentoConcluido extends AppCompatActivity {
     private Runnable mAutoRetryRunnable = null;
 
     private final Runnable mWatchdogRunnable = () -> {
-        Log.e(TAG, "[APP] WATCHDOG disparado! liberado=" + liberado + " qtd_ml=" + qtd_ml);
-        mWatchdogActive  = false;
+        Log.e(TAG, "[APP] WATCHDOG disparado! liberado=" + liberado + " qtd_ml=" + qtd_ml
+                + " | liberadoTotal=" + liberadoTotalFloat);
+        mWatchdogActive = false;
         // CORREÇÃO v4.2: retoma o PING quando o watchdog dispara (timeout sem fluxo).
         if (mBluetoothService != null) mBluetoothService.retomarPing();
         atualizarStatus("Timeout: fluxo nao detectado.");
+        // v5.5: Libera o lock de dispense para permitir retry manual
+        mDispenseLocked = false;
+        mComandoEnviado = false;
+        // v5.5: Reseta o lock de ciclo no serviço BLE para permitir novo $ML:
+        if (mBluetoothService != null) mBluetoothService.resetDispenseCycle();
         runOnUiThread(() -> {
-            if (liberado < qtd_ml) {
-                int restante = qtd_ml - liberado;
+            int totalLiberadoInt = (int) Math.round(liberadoTotalFloat + liberadoFloat);
+            if (totalLiberadoInt < qtd_ml) {
+                int restante = qtd_ml - totalLiberadoInt;
+                // v5.5: Botão habilitado após cooldown de 3s (anti-spam)
                 btnLiberar.setText("Tentar novamente (" + restante + "ml)");
+                btnLiberar.setEnabled(false); // desabilitado durante cooldown
                 btnLiberar.setVisibility(View.VISIBLE);
                 mLiberacaoFinalizada = false;
+                // Habilita o botão após BTN_DEBOUNCE_MS para evitar clique acidental
+                mMainHandler.postDelayed(() -> {
+                    if (!mDispenseLocked && !mLiberacaoFinalizada) {
+                        btnLiberar.setEnabled(true);
+                        Log.d(TAG, "[SEGURANCA] btnLiberar habilitado após cooldown de " + BTN_DEBOUNCE_MS + "ms");
+                    }
+                }, BTN_DEBOUNCE_MS);
             }
-            mostrarSnackbar("Tempo esgotado.");
+            mostrarSnackbar("Tempo esgotado. Toque em \"Tentar novamente\" para continuar.");
         });
     };
 
@@ -279,11 +323,30 @@ public class PagamentoConcluido extends AppCompatActivity {
                     liberadoFloat = mlFloat;
                     liberado = (int) Math.round(liberadoFloat);
                     final double mlExibir = liberadoFloat;
-                    Log.d(TAG, "[VP] Volume acumulado: " + mlExibir + "ml");
+                    final double totalAcumulado = liberadoTotalFloat + mlFloat;
+                    Log.d(TAG, "[VP] Volume acumulado: " + mlExibir + "ml | total=" + totalAcumulado + "ml");
+
+                    // ── SEGURANÇA v5.5: Kill-switch de overflow ──────────────────────────
+                    // Se o volume total acumulado ultrapassar o contratado + tolerância,
+                    // envia $TO:0 para fechar a válvula imediatamente.
+                    if (totalAcumulado > qtd_ml + VOLUME_OVERFLOW_TOLERANCE_ML) {
+                        Log.e(TAG, "[SEGURANCA] OVERFLOW DETECTADO! total=" + totalAcumulado
+                                + "ml > limite=" + (qtd_ml + VOLUME_OVERFLOW_TOLERANCE_ML)
+                                + "ml — enviando $TO:0 para fechar válvula");
+                        if (mBluetoothService != null) {
+                            mBluetoothService.sendCommand("$TO:0");
+                        }
+                        cancelarWatchdog();
+                        mDispenseLocked = true;
+                        atualizarStatus("ALERTA: volume excedido! Válvula fechada.");
+                        runOnUiThread(() -> mostrarSnackbar("Volume excedido! Válvula fechada automaticamente."));
+                    }
+
                     runOnUiThread(() -> {
                         txtMls.setText(String.format("%.0f ML", mlExibir));
                         if (progressBar != null && qtd_ml > 0) {
-                            progressBar.setProgress((int) ((mlExibir / qtd_ml) * 100));
+                            int progresso = (int) ((totalAcumulado / qtd_ml) * 100);
+                            progressBar.setProgress(Math.min(progresso, 100));
                         }
                         atualizarStatus("Liberando... " + String.format("%.1f", mlExibir) + " / " + qtd_ml + " ML");
                     });
@@ -332,6 +395,10 @@ public class PagamentoConcluido extends AppCompatActivity {
             if (mBluetoothService != null) mBluetoothService.retomarPing();
             mLiberacaoFinalizada = true;
             mComandoEnviado      = false;
+            // v5.5: Libera o lock de dispense — ciclo encerrado pelo ESP32
+            mDispenseLocked      = false;
+            // v5.5: Reseta o lock de ciclo no serviço BLE também
+            if (mBluetoothService != null) mBluetoothService.resetDispenseCycle();
             // v5.1: soma o ciclo atual ao total acumulado entre todos os ciclos da venda.
             // BUG CORRIGIDO: sem isso, o app comparava apenas o volume do ciclo atual
             // com qtd_ml e nunca detectava que a venda foi concluída em múltiplos ciclos.
@@ -395,24 +462,63 @@ public class PagamentoConcluido extends AppCompatActivity {
     // ─────────────────────────────────────────────────────────────────────────
 
     private void enviarComandoML(int volumeMl) {
+        // ── SEGURANÇA v5.5: Lock global de dispense ──────────────────────────────────
+        if (mDispenseLocked) {
+            Log.w(TAG, "[SEGURANCA] enviarComandoML BLOQUEADO — mDispenseLocked=true. "
+                    + "Ignorando $ML:" + volumeMl + " (ciclo já em andamento)");
+            return;
+        }
+        // ── SEGURANÇA v5.5: Proteção de volume máximo ─────────────────────────────
+        if (liberadoTotalFloat >= qtd_ml) {
+            Log.w(TAG, "[SEGURANCA] enviarComandoML BLOQUEADO — volume já atingido: "
+                    + liberadoTotalFloat + "ml >= " + qtd_ml + "ml contratado");
+            mLiberacaoFinalizada = true;
+            atualizarStatus("Dosagem completa! Volume já atingido.");
+            runOnUiThread(() -> btnLiberar.setVisibility(View.GONE));
+            return;
+        }
         if (mBluetoothService == null) {
             Log.e(TAG, "[BLE] BluetoothService nulo — nao foi possivel enviar $ML");
             atualizarStatus("Aguardando conexao BLE...");
             return;
         }
-        String command = "$ML:" + volumeMl;
-        Log.i(TAG, "[BLE] Enviando: " + command + " | BLE status=" + mBluetoothService.getCurrentStatus());
+        // Ajusta volume para não ultrapassar o contratado
+        int volumeSeguro = volumeMl;
+        double restanteReal = qtd_ml - liberadoTotalFloat;
+        if (restanteReal > 0 && volumeMl > (int) Math.ceil(restanteReal)) {
+            volumeSeguro = (int) Math.ceil(restanteReal);
+            Log.w(TAG, "[SEGURANCA] Volume ajustado de " + volumeMl + "ml para " + volumeSeguro
+                    + "ml (limite contratado=" + qtd_ml + "ml, já liberado=" + liberadoTotalFloat + "ml)");
+        }
+        String command = "$ML:" + volumeSeguro;
+        Log.i(TAG, "[BLE] Enviando: " + command + " | BLE status=" + mBluetoothService.getCurrentStatus()
+                + " | liberadoTotal=" + liberadoTotalFloat + "ml | qtd_ml=" + qtd_ml);
+        // Ativa o lock ANTES de enviar para evitar race condition
+        mDispenseLocked       = true;
+        mComandoEnviado       = true;
         mUltimoComandoEnviado = command;
-        mComandoEnviado = true;
+        // Desabilita o botão imediatamente para bloquear novos cliques
+        runOnUiThread(() -> {
+            btnLiberar.setEnabled(false);
+            btnLiberar.setText("Servindo...");
+        });
         boolean ok = mBluetoothService.sendCommand(command);
         if (ok) {
             atualizarStatus("Enviando comando de liberacao...");
             Log.i(TAG, "[BLE] sendCommand() OK — $ML enfileirado");
         } else {
             Log.e(TAG, "[BLE] sendCommand() falhou para: " + command);
-            mComandoEnviado = false;
+            // Falha de envio: libera o lock para permitir retry
+            mDispenseLocked       = false;
+            mComandoEnviado       = false;
             mUltimoComandoEnviado = "";
             atualizarStatus("Falha ao enviar comando. BLE desconectado?");
+            runOnUiThread(() -> {
+                int restante = qtd_ml - (int) Math.round(liberadoTotalFloat);
+                btnLiberar.setText("Tentar novamente (" + restante + "ml)");
+                btnLiberar.setEnabled(true);
+                btnLiberar.setVisibility(View.VISIBLE);
+            });
         }
     }
 
@@ -561,22 +667,50 @@ public class PagamentoConcluido extends AppCompatActivity {
         txtQtd.setText(qtd_ml + " ML");
         carregarImagemComFallback();
 
-        // Botão "Continuar Servindo" — recuperação após timeout ou fluxo parcial
+        // Botão "Continuar Servindo" / "Tentar novamente" — recuperação após timeout ou fluxo parcial
         btnLiberar.setOnClickListener(v -> {
+            // ── SEGURANÇA v5.5: Debounce de 3s entre cliques ────────────────────────
+            long agora = System.currentTimeMillis();
+            if (agora - mLastBtnClickMs < BTN_DEBOUNCE_MS) {
+                Log.w(TAG, "[SEGURANCA] Clique ignorado — debounce ativo ("
+                        + (BTN_DEBOUNCE_MS - (agora - mLastBtnClickMs)) + "ms restantes)");
+                return;
+            }
+            mLastBtnClickMs = agora;
+
+            // ── SEGURANÇA v5.5: Bloqueia se lock de dispense ativo ──────────────────
+            if (mDispenseLocked) {
+                Log.w(TAG, "[SEGURANCA] Clique ignorado — mDispenseLocked=true (ciclo em andamento)");
+                mostrarSnackbar("Aguarde: já está servindo...");
+                return;
+            }
+
+            // ── SEGURANÇA v5.5: Bloqueia se volume já atingido ────────────────────
+            if (liberadoTotalFloat >= qtd_ml) {
+                Log.w(TAG, "[SEGURANCA] Clique ignorado — volume já atingido: "
+                        + liberadoTotalFloat + "ml >= " + qtd_ml + "ml");
+                btnLiberar.setVisibility(View.GONE);
+                return;
+            }
+
             // Cancela auto-retry pendente para evitar envio duplo
             if (mAutoRetryRunnable != null) {
                 mMainHandler.removeCallbacks(mAutoRetryRunnable);
                 mAutoRetryRunnable = null;
             }
 
+            // Desabilita o botão imediatamente após clique válido
+            btnLiberar.setEnabled(false);
+            btnLiberar.setText("Aguarde...");
+
             // CORREÇÃO v4.4: usa liberadoFloat para calcular o restante real.
             // O campo 'liberado' (int) perde a parte fracionária (ex: 0.17ml → 0),
             // fazendo o retry enviar $ML:300 em vez de $ML:299 (ou o valor correto).
-            // Usa Math.ceil para garantir que fracionamentos não sejam ignorados.
-            int liberadoIntReal = (int) Math.floor(liberadoFloat);
+            int liberadoIntReal = (int) Math.floor(liberadoTotalFloat + liberadoFloat);
             int restante = qtd_ml - liberadoIntReal;
             if (restante > 0) {
                 Log.i(TAG, "[RETRY] Retomando dispensacao | liberadoFloat=" + liberadoFloat
+                        + " | liberadoTotal=" + liberadoTotalFloat
                         + " | liberadoInt=" + liberadoIntReal
                         + " | restante=" + restante + "ml");
                 // v5.1: NÃO acumula aqui — o FN: do ciclo atual já acumula em liberadoTotalFloat.
@@ -585,6 +719,10 @@ public class PagamentoConcluido extends AppCompatActivity {
                 liberado      = 0;
                 // Reenvia $TO antes do $ML para garantir timeout correto no ESP32
                 enviarTimeoutESP32(10, () -> enviarComandoML(restante));
+            } else {
+                // Volume já atingido (calculado com floor)
+                Log.w(TAG, "[SEGURANCA] Restante calculado=0 — volume já atingido");
+                btnLiberar.setVisibility(View.GONE);
             }
         });
 
