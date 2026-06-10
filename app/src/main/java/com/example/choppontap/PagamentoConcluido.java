@@ -13,6 +13,7 @@ import android.content.pm.ActivityInfo;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.os.Bundle;
+import android.os.CountDownTimer;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -151,6 +152,16 @@ public class PagamentoConcluido extends AppCompatActivity {
     // ── Watchdog ──────────────────────────────────────────────────────────────
     private boolean  mWatchdogActive    = false;
     private Runnable mAutoRetryRunnable = null;
+
+    // ── Contador regressivo "Continuar servindo" (v5.11) ─────────────────────
+    /** Duração do contador regressivo antes de liberar a válvula (ms). */
+    private static final long COUNTDOWN_TOTAL_MS = 5_000L;
+    /** Intervalo de tick do contador (ms). */
+    private static final long COUNTDOWN_TICK_MS  = 1_000L;
+    /** Instância ativa do contador. Cancelado se Activity for destruída. */
+    private CountDownTimer mCountdownTimer = null;
+    /** Volume restante capturado no momento do clique (para o countdown). */
+    private int mCountdownRestante = 0;
 
     private final Runnable mWatchdogRunnable = () -> {
         Log.e(TAG, "[APP] WATCHDOG disparado! liberado=" + liberado + " qtd_ml=" + qtd_ml
@@ -558,6 +569,66 @@ public class PagamentoConcluido extends AppCompatActivity {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Contador regressivo "Continuar servindo" (v5.11)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Inicia um contador regressivo de COUNTDOWN_TOTAL_MS ms.
+     * A cada tick, atualiza o texto do botão com o tempo restante.
+     * Ao finalizar, reseta liberadoFloat/liberado e envia $TO + $ML.
+     *
+     * @param volumeRestante volume em ml a ser liberado no próximo ciclo
+     */
+    private void iniciarContadorRegressivo(int volumeRestante) {
+        int totalSegundos = (int) (COUNTDOWN_TOTAL_MS / 1_000L);
+        Log.i(TAG, "[COUNTDOWN] Iniciando contagem regressiva de " + totalSegundos
+                + "s para liberar " + volumeRestante + "ml");
+        atualizarStatus("Preparando para continuar em " + totalSegundos + "s...");
+        btnLiberar.setText("Liberando em " + totalSegundos + "s...");
+        btnLiberar.setVisibility(View.VISIBLE);
+
+        mCountdownTimer = new CountDownTimer(COUNTDOWN_TOTAL_MS, COUNTDOWN_TICK_MS) {
+            @Override
+            public void onTick(long millisUntilFinished) {
+                int segsRestantes = (int) Math.ceil(millisUntilFinished / 1_000.0);
+                Log.d(TAG, "[COUNTDOWN] " + segsRestantes + "s restantes");
+                runOnUiThread(() -> {
+                    btnLiberar.setText("Liberando em " + segsRestantes + "s...");
+                    atualizarStatus("Preparando para continuar em " + segsRestantes + "s...");
+                });
+            }
+
+            @Override
+            public void onFinish() {
+                Log.i(TAG, "[COUNTDOWN] Contagem finalizada — enviando $ML:" + volumeRestante);
+                mCountdownTimer = null;
+                // v5.1: NÃO acumula aqui — o FN: do ciclo anterior já acumulou em liberadoTotalFloat.
+                // Reseta apenas o acumulador do ciclo corrente para o novo ciclo.
+                liberadoFloat = 0.0;
+                liberado      = 0;
+                runOnUiThread(() -> {
+                    btnLiberar.setText("Servindo...");
+                    atualizarStatus("Liberando " + volumeRestante + "ml...");
+                });
+                // Reenvia $TO antes do $ML para garantir timeout correto no ESP32
+                enviarTimeoutESP32(10, () -> enviarComandoML(volumeRestante));
+            }
+        }.start();
+    }
+
+    /**
+     * Cancela o contador regressivo se estiver ativo.
+     * Deve ser chamado em onDestroy() e quando o ciclo for cancelado por outro motivo.
+     */
+    private void cancelarContadorRegressivo() {
+        if (mCountdownTimer != null) {
+            mCountdownTimer.cancel();
+            mCountdownTimer = null;
+            Log.d(TAG, "[COUNTDOWN] Contador regressivo cancelado");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Fluxo de venda
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -670,29 +741,39 @@ public class PagamentoConcluido extends AppCompatActivity {
 
         // Botão "Continuar Servindo" / "Tentar novamente" — recuperação após timeout ou fluxo parcial
         btnLiberar.setOnClickListener(v -> {
-            // ── SEGURANÇA v5.5: Debounce de 3s entre cliques ────────────────────────
-            long agora = System.currentTimeMillis();
-            if (agora - mLastBtnClickMs < BTN_DEBOUNCE_MS) {
-                Log.w(TAG, "[SEGURANCA] Clique ignorado — debounce ativo ("
-                        + (BTN_DEBOUNCE_MS - (agora - mLastBtnClickMs)) + "ms restantes)");
-                return;
-            }
-            mLastBtnClickMs = agora;
-
-            // ── SEGURANÇA v5.5: Bloqueia se lock de dispense ativo ──────────────────
+            // ── SEGURANÇA v5.5: Bloqueia se lock de dispense ativo ──────────────
             if (mDispenseLocked) {
                 Log.w(TAG, "[SEGURANCA] Clique ignorado — mDispenseLocked=true (ciclo em andamento)");
                 mostrarSnackbar("Aguarde: já está servindo...");
                 return;
             }
 
-            // ── SEGURANÇA v5.5: Bloqueia se volume já atingido ────────────────────
-            if (liberadoTotalFloat >= qtd_ml) {
+            // ── SEGURANÇA: Bloqueia se countdown já em andamento ────────────────────
+            if (mCountdownTimer != null) {
+                Log.w(TAG, "[COUNTDOWN] Clique ignorado — countdown já em andamento");
+                return;
+            }
+
+            // FIX v5.11: usa apenas liberadoTotalFloat para calcular o restante.
+            // liberadoFloat representa o ciclo ATUAL (ainda não iniciado após FN:),
+            // e já foi somado a liberadoTotalFloat pelo bloco FN:.
+            // Usar (liberadoTotalFloat + liberadoFloat) duplicava o ciclo anterior
+            // e resultava em restante=0, ocultando o botão indevidamente.
+            int liberadoIntReal = (int) Math.floor(liberadoTotalFloat);
+            int restante = qtd_ml - liberadoIntReal;
+
+            // ── SEGURANÇA: Bloqueia se volume já atingido ────────────────────────
+            if (restante <= 0) {
                 Log.w(TAG, "[SEGURANCA] Clique ignorado — volume já atingido: "
                         + liberadoTotalFloat + "ml >= " + qtd_ml + "ml");
                 btnLiberar.setVisibility(View.GONE);
                 return;
             }
+
+            Log.i(TAG, "[RETRY] Clique válido | liberadoTotal=" + liberadoTotalFloat
+                    + " | liberadoFloat=" + liberadoFloat
+                    + " | liberadoInt=" + liberadoIntReal
+                    + " | restante=" + restante + "ml");
 
             // Cancela auto-retry pendente para evitar envio duplo
             if (mAutoRetryRunnable != null) {
@@ -700,31 +781,12 @@ public class PagamentoConcluido extends AppCompatActivity {
                 mAutoRetryRunnable = null;
             }
 
-            // Desabilita o botão imediatamente após clique válido
-            btnLiberar.setEnabled(false);
-            btnLiberar.setText("Aguarde...");
-
-            // CORREÇÃO v4.4: usa liberadoFloat para calcular o restante real.
-            // O campo 'liberado' (int) perde a parte fracionária (ex: 0.17ml → 0),
-            // fazendo o retry enviar $ML:300 em vez de $ML:299 (ou o valor correto).
-            int liberadoIntReal = (int) Math.floor(liberadoTotalFloat + liberadoFloat);
-            int restante = qtd_ml - liberadoIntReal;
-            if (restante > 0) {
-                Log.i(TAG, "[RETRY] Retomando dispensacao | liberadoFloat=" + liberadoFloat
-                        + " | liberadoTotal=" + liberadoTotalFloat
-                        + " | liberadoInt=" + liberadoIntReal
-                        + " | restante=" + restante + "ml");
-                // v5.1: NÃO acumula aqui — o FN: do ciclo atual já acumula em liberadoTotalFloat.
-                // Apenas reseta o acumulador do ciclo corrente para o novo ciclo.
-                liberadoFloat = 0.0;
-                liberado      = 0;
-                // Reenvia $TO antes do $ML para garantir timeout correto no ESP32
-                enviarTimeoutESP32(10, () -> enviarComandoML(restante));
-            } else {
-                // Volume já atingido (calculado com floor)
-                Log.w(TAG, "[SEGURANCA] Restante calculado=0 — volume já atingido");
-                btnLiberar.setVisibility(View.GONE);
-            }
+            // v5.11: Inicia contador regressivo de 5s antes de liberar a válvula.
+            // O botão permanece visível e mostra a contagem regressiva.
+            // Ao finalizar, reseta o ciclo e envia $TO + $ML.
+            mCountdownRestante = restante;
+            btnLiberar.setEnabled(false); // desabilita durante a contagem
+            iniciarContadorRegressivo(restante);
         });
 
         bindService(new Intent(this, BluetoothServiceIndustrial.class), mServiceConnection, BIND_AUTO_CREATE);
@@ -771,6 +833,7 @@ public class PagamentoConcluido extends AppCompatActivity {
     protected void onDestroy() {
         super.onDestroy();
         cancelarWatchdog();
+        cancelarContadorRegressivo(); // v5.11: cancela countdown se Activity for destruída
         mMainHandler.removeCallbacksAndMessages(null);
         if (currentImageTask != null) currentImageTask.cancel(true);
         imageExecutor.shutdown();
