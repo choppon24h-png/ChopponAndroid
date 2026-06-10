@@ -419,6 +419,7 @@ public class PagamentoConcluido extends AppCompatActivity {
                     }
                     atualizarStatus("Fluxo interrompido. " + totalUI + "/" + qtd_ml + " ML");
                     btnLiberar.setText("Continuar servindo (" + restante + "ml)");
+                    btnLiberar.setEnabled(true);  // FIX v5.10: habilitar após ciclo parcial
                     btnLiberar.setVisibility(View.VISIBLE);
                     mLiberacaoFinalizada = false; // permite reenvio
                 });
