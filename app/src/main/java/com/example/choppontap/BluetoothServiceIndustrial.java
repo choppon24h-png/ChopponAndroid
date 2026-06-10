@@ -645,10 +645,21 @@ public class BluetoothServiceIndustrial extends Service {
             if (data == null) return;
             String msg = new String(data, StandardCharsets.UTF_8).trim();
             Log.d(TAG, "[RX] Recebido: " + msg);
-
             BleCommand.Response r = BleCommand.parse(msg);
             if (r.isPong()) {
                 Log.d(TAG, "[PING] PONG recebido - sessao valida");
+            }
+            // ── SEGURANÇA v5.9: reset automático do mCycleActive ao receber FN: ──────
+            // Garante que o próximo $ML: não seja bloqueado mesmo que o PagamentoConcluido
+            // tenha sido destruído/recriado e não tenha chamado resetDispenseCycle().
+            // Sem isso: nova instância de PagamentoConcluido envia $ML: mas é bloqueada
+            // por mCycleActive=true do ciclo anterior → app trava em "Continuar servindo".
+            if ("FN:".equals(msg) || "FN".equals(msg)) {
+                if (mCycleActive) {
+                    mCycleActive = false;
+                    Log.i(TAG, "[SEGURANCA-BLE] FN: recebido — mCycleActive resetado automaticamente");
+                }
+                retomarPing();
             }
             broadcastData(msg);
         }
