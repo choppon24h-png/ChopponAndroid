@@ -37,13 +37,23 @@ public class BleCommand {
     // -------------------------------------------------------------------------
     // Prefixos de comando (Android -> ESP32)
     // -------------------------------------------------------------------------
-    public static final String CMD_ML   = "$ML:";   // libera mL
-    public static final String CMD_LB   = "$LB:";   // libera continuo
-    public static final String CMD_PL   = "$PL:";   // pulsos/litro
-    public static final String CMD_TO   = "$TO:";   // timeout em SEGUNDOS
-    public static final String CMD_RS   = "$RS:";   // retoma ciclo incompleto
-    public static final String CMD_DB   = "$DB:";   // diagnostico
-    public static final String CMD_PING = "PING";   // keepalive (sem $)
+    public static final String CMD_ML      = "$ML:";   // libera mL
+    public static final String CMD_LB      = "$LB:";   // libera continuo
+    public static final String CMD_PL      = "$PL:";   // pulsos/litro
+    public static final String CMD_TO      = "$TO:";   // timeout em SEGUNDOS
+    public static final String CMD_RS      = "$RS:";   // retoma ciclo incompleto
+    public static final String CMD_DB      = "$DB:";   // diagnostico
+    public static final String CMD_PING    = "PING";   // keepalive (sem $)
+    /**
+     * Comando de parada de emergência da solenoide.
+     * $ML:0 instrui o firmware a fechar a válvula imediatamente e encerrar
+     * qualquer ciclo ativo ($ML: ou $LB:), sem aguardar o volume alvo.
+     * O ESP32 responde com FN: após fechar a válvula.
+     *
+     * v5.12: Substituiu o uso incorreto de $TO:0 (que é apenas um GET do
+     * timeout atual, não fecha a solenoide) como kill-switch de emergência.
+     */
+    public static final String CMD_ML_STOP = "$ML:0"; // fecha solenoide (emergência)
 
     // -------------------------------------------------------------------------
     // Prefixos de resposta (ESP32 -> Android)
@@ -119,6 +129,16 @@ public class BleCommand {
     /** Diagnostico: retorna PIN=, VAL=, TO=, PL=, QP=. */
     public static String buildDiagnostico() {
         return CMD_DB;
+    }
+
+    /**
+     * Comando de parada de emergência: fecha a solenoide imediatamente.
+     * Deve ser enviado em onPause/onStop/onDestroy de qualquer Activity
+     * que possa ter iniciado um ciclo de dispenção.
+     * O ESP32 responde com FN: após fechar a válvula.
+     */
+    public static String buildEmergencyStop() {
+        return CMD_ML_STOP;
     }
 
     // -------------------------------------------------------------------------

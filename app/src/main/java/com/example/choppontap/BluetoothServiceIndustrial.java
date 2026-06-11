@@ -257,9 +257,12 @@ public class BluetoothServiceIndustrial extends Service {
             Log.w(TAG, "[CMD] RxChar ou GATT nulo");
             return false;
         }
-        // ── SEGURANÇA v5.5: Bloqueia $ML: duplicado se ciclo já ativo ────────────────────
-        // $TO:0 (kill-switch de emergência) SEMPRE passa, mesmo com ciclo ativo.
-        if (command.startsWith(BleCommand.CMD_ML) && !command.equals(BleCommand.CMD_ML + ":0")) {
+        // ── SEGURANÇA v5.12: Bloqueia $ML: duplicado se ciclo já ativo ────────────────────
+        // $ML:0 (parada de emergência) SEMPRE passa, mesmo com ciclo ativo.
+        // FIX v5.12: a comparação anterior usava CMD_ML + ":0" = "$ML::0" (errado).
+        // Agora usa CMD_ML_STOP = "$ML:0" (correto).
+        boolean isEmergencyStop = command.equals(BleCommand.CMD_ML_STOP);
+        if (command.startsWith(BleCommand.CMD_ML) && !isEmergencyStop) {
             if (mCycleActive) {
                 Log.e(TAG, "[SEGURANCA-BLE] sendCommand BLOQUEADO — mCycleActive=true. "
                         + "Rejeitando " + command + " (ciclo já em andamento no ESP32)");
@@ -269,8 +272,16 @@ public class BluetoothServiceIndustrial extends Service {
             mCycleActive = true;
             Log.i(TAG, "[SEGURANCA-BLE] Ciclo ativado — mCycleActive=true");
         }
+        if (isEmergencyStop) {
+            // Parada de emergência: reseta o ciclo imediatamente no lado Android
+            mCycleActive = false;
+            Log.w(TAG, "[SEGURANCA-BLE] EMERGENCY STOP ($ML:0) — mCycleActive=false");
+        }
         // Suspende PING durante dispensação ($ML, $LB, $RS)
-        if (command.startsWith(BleCommand.CMD_ML) && !command.equals(BleCommand.CMD_ML + "0")) {
+        // Retoma PING imediatamente após parada de emergência
+        if (isEmergencyStop) {
+            retomarPing();
+        } else if (command.startsWith(BleCommand.CMD_ML)) {
             pausarPing();
         } else if (command.equals(BleCommand.CMD_LB)) {
             pausarPing();

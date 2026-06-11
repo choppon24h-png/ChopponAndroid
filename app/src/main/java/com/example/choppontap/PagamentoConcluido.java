@@ -79,6 +79,19 @@ public class PagamentoConcluido extends AppCompatActivity {
     private static final long HOME_NAVIGATE_DELAY_MS = 3_000L;
     private static final long WATCHDOG_TIMEOUT_MS    = 30_000L;
 
+    /**
+     * v5.12: Watchdog de válvula aberta sem fluxo.
+     * Se a válvula estiver aberta (IN: recebido) e nenhum VP: chegar em
+     * OPEN_VALVE_WATCHDOG_MS, o sistema envia $ML:0 para fechar a solenoide.
+     * Evita que o chopp saia ininterruptamente por falha de sensor ou
+     * por alguém segurar a alavanca sem que o fluxo seja detectado.
+     *
+     * Valor padrão: 2 minutos (120 000 ms).
+     * Resetado a cada VP: recebido (há fluxo real).
+     * Cancelado ao receber FN: (ciclo encerrado normalmente).
+     */
+    private static final long OPEN_VALVE_WATCHDOG_MS = 120_000L; // 2 minutos
+
     // ── Handlers ─────────────────────────────────────────────────────────────────────────────────────
     private final Handler mMainHandler     = new Handler(Looper.getMainLooper());
     private final Handler mWatchdogHandler = new Handler(Looper.getMainLooper());
@@ -152,6 +165,13 @@ public class PagamentoConcluido extends AppCompatActivity {
     // ── Watchdog ──────────────────────────────────────────────────────────────
     private boolean  mWatchdogActive    = false;
     private Runnable mAutoRetryRunnable = null;
+
+    // ── Open-Valve Watchdog (v5.12) ──────────────────────────────────────────
+    // Fecha a solenoide se a válvula ficar aberta sem VP: por OPEN_VALVE_WATCHDOG_MS.
+    private final Handler  mOpenValveHandler  = new Handler(Looper.getMainLooper());
+    private boolean        mValveOpen         = false; // true após IN:, false após FN:/emergência
+    private long           mLastVpTimeMs      = 0L;    // timestamp do último VP: recebido
+    private Runnable       mOpenValveRunnable = null;
 
     // ── Contador regressivo "Continuar servindo" (v5.11) ─────────────────────
     /** Duração do contador regressivo antes de liberar a válvula (ms). */
@@ -294,6 +314,10 @@ public class PagamentoConcluido extends AppCompatActivity {
         if ("IN:".equals(msg) || "IN".equals(msg)) {
             Log.i(TAG, "[IN] Válvula abriu — ciclo iniciado");
             resetarWatchdog(); // watchdog reinicia a partir da abertura real
+            // v5.12: inicia o watchdog de válvula aberta sem fluxo
+            mValveOpen = true;
+            mLastVpTimeMs = System.currentTimeMillis();
+            iniciarOpenValveWatchdog();
             atualizarStatus("Válvula aberta. Puxe a alavanca!");
             return;
         }
@@ -323,6 +347,9 @@ public class PagamentoConcluido extends AppCompatActivity {
         // ── VP: — volume parcial acumulado durante liberação ──────────────────
         if (msg.startsWith("VP:")) {
             resetarWatchdog();
+            // v5.12: há fluxo real — reseta o open-valve watchdog
+            mLastVpTimeMs = System.currentTimeMillis();
+            resetarOpenValveWatchdog();
             try {
                 double mlFloat = Double.parseDouble(msg.substring(3).trim());
                 // v5.0: VP reporta volume ACUMULADO desde o início do ciclo.
@@ -404,6 +431,9 @@ public class PagamentoConcluido extends AppCompatActivity {
             Log.i(TAG, "[FN] Ciclo encerrado definitivamente pelo ESP32");
             // v5.1: FN: é o sinal definitivo — retomar PING aqui.
             if (mBluetoothService != null) mBluetoothService.retomarPing();
+            // v5.12: válvula fechou normalmente — cancela open-valve watchdog
+            mValveOpen = false;
+            cancelarOpenValveWatchdog();
             mLiberacaoFinalizada = true;
             mComandoEnviado      = false;
             // v5.5: Libera o lock de dispense — ciclo encerrado pelo ESP32
@@ -816,6 +846,14 @@ public class PagamentoConcluido extends AppCompatActivity {
     @Override
     protected void onPause() {
         super.onPause();
+        // v5.12: SEGURANÇA — fecha a solenoide se a Activity sair do foreground
+        // com um ciclo ativo (usuário pressionou Voltar, Home, ou saiu do app).
+        // O countdown também é cancelado para não enviar $ML: com a tela invisível.
+        cancelarContadorRegressivo();
+        if (mDispenseLocked) {
+            Log.w(TAG, "[SEGURANCA-v5.12] onPause com ciclo ativo — enviando EMERGENCY STOP ($ML:0)");
+            fecharSolenoideEmergencia("onPause");
+        }
         // CORREÇÃO 3: unregister do receiver global
         try {
             unregisterReceiver(mServiceUpdateReceiver);
@@ -827,13 +865,26 @@ public class PagamentoConcluido extends AppCompatActivity {
     @Override
     protected void onStop() {
         super.onStop();
+        // v5.12: segunda linha de defesa — se onPause não conseguiu enviar
+        // (ex: BLE ainda não pronto), tenta novamente em onStop.
+        if (mDispenseLocked) {
+            Log.w(TAG, "[SEGURANCA-v5.12] onStop com ciclo ativo — enviando EMERGENCY STOP ($ML:0)");
+            fecharSolenoideEmergencia("onStop");
+        }
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
         cancelarWatchdog();
-        cancelarContadorRegressivo(); // v5.11: cancela countdown se Activity for destruída
+        cancelarContadorRegressivo();
+        cancelarOpenValveWatchdog(); // v5.12: garante que o open-valve watchdog seja cancelado
+        // v5.12: terceira linha de defesa — onDestroy é chamado quando o sistema
+        // mata a Activity (memória baixa, crash, etc.).
+        if (mDispenseLocked) {
+            Log.w(TAG, "[SEGURANCA-v5.12] onDestroy com ciclo ativo — enviando EMERGENCY STOP ($ML:0)");
+            fecharSolenoideEmergencia("onDestroy");
+        }
         mMainHandler.removeCallbacksAndMessages(null);
         if (currentImageTask != null) currentImageTask.cancel(true);
         imageExecutor.shutdown();
@@ -942,7 +993,102 @@ public class PagamentoConcluido extends AppCompatActivity {
         mWatchdogHandler.removeCallbacks(mWatchdogRunnable);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
+    // ───────────────────────────────────────────────────────────────────────────
+    // Open-Valve Watchdog (v5.12) — fecha solenoide se válvula aberta sem fluxo
+    // ───────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Inicia o watchdog de válvula aberta sem fluxo.
+     * Disparado em IN: (válvula abriu). Se nenhum VP: chegar em
+     * OPEN_VALVE_WATCHDOG_MS, envia $ML:0 para fechar a solenoide.
+     */
+    private void iniciarOpenValveWatchdog() {
+        cancelarOpenValveWatchdog();
+        mOpenValveRunnable = () -> {
+            long silencioMs = System.currentTimeMillis() - mLastVpTimeMs;
+            Log.e(TAG, "[OPEN-VALVE-WD] DISPARADO! Válvula aberta sem VP: por "
+                    + silencioMs + "ms (limite=" + OPEN_VALVE_WATCHDOG_MS + "ms)"
+                    + " | mValveOpen=" + mValveOpen);
+            if (mValveOpen) {
+                // Fecha a solenoide de emergência
+                fecharSolenoideEmergencia("openValveWatchdog");
+                runOnUiThread(() -> {
+                    mostrarSnackbar("SEGURANÇA: válvula fechada — sem fluxo por 2 minutos.");
+                    atualizarStatus("Válvula fechada automaticamente (sem fluxo).");
+                    // Exibe botão para o usuário tentar novamente
+                    int totalLiberadoInt = (int) Math.round(liberadoTotalFloat);
+                    if (totalLiberadoInt < qtd_ml) {
+                        int restante = qtd_ml - totalLiberadoInt;
+                        btnLiberar.setText("Tentar novamente (" + restante + "ml)");
+                        btnLiberar.setEnabled(true);
+                        btnLiberar.setVisibility(View.VISIBLE);
+                        mLiberacaoFinalizada = false;
+                    }
+                });
+            }
+        };
+        mOpenValveHandler.postDelayed(mOpenValveRunnable, OPEN_VALVE_WATCHDOG_MS);
+        Log.d(TAG, "[OPEN-VALVE-WD] Iniciado — timeout=" + OPEN_VALVE_WATCHDOG_MS + "ms");
+    }
+
+    /** Reseta o watchdog de válvula aberta (chamado a cada VP: recebido). */
+    private void resetarOpenValveWatchdog() {
+        if (mValveOpen && mOpenValveRunnable != null) {
+            mOpenValveHandler.removeCallbacks(mOpenValveRunnable);
+            mOpenValveHandler.postDelayed(mOpenValveRunnable, OPEN_VALVE_WATCHDOG_MS);
+        }
+    }
+
+    /** Cancela o watchdog de válvula aberta (chamado em FN: ou emergência). */
+    private void cancelarOpenValveWatchdog() {
+        if (mOpenValveRunnable != null) {
+            mOpenValveHandler.removeCallbacks(mOpenValveRunnable);
+            mOpenValveRunnable = null;
+        }
+        mValveOpen = false;
+        Log.d(TAG, "[OPEN-VALVE-WD] Cancelado");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // Segurança BLE — Parada de emergência da solenoide (v5.12)
+    // ───────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Envia $ML:0 ao ESP32 para fechar a solenoide imediatamente.
+     * Deve ser chamado em qualquer ponto de saída da Activity enquanto
+     * mDispenseLocked=true (ciclo ativo).
+     *
+     * Também reseta todos os locks locais para que a Activity não tente
+     * retomar o ciclo após a parada.
+     *
+     * @param origem string de diagnóstico (ex: "onPause", "backButton")
+     */
+    private void fecharSolenoideEmergencia(String origem) {
+        Log.w(TAG, "[EMERGENCY-STOP] Fechando solenoide — origem=" + origem
+                + " | mDispenseLocked=" + mDispenseLocked
+                + " | liberadoTotal=" + liberadoTotalFloat
+                + " | liberadoFloat=" + liberadoFloat);
+        // Cancela timers para evitar que enviem $ML: após o stop
+        cancelarWatchdog();
+        cancelarContadorRegressivo();
+        if (mAutoRetryRunnable != null) {
+            mMainHandler.removeCallbacks(mAutoRetryRunnable);
+            mAutoRetryRunnable = null;
+        }
+        // Reseta locks locais
+        mDispenseLocked = false;
+        mComandoEnviado = false;
+        mLiberacaoFinalizada = true; // impede retry automático
+        // Envia $ML:0 ao ESP32
+        if (mBluetoothService != null && mIsServiceBound) {
+            boolean ok = mBluetoothService.sendCommand(BleCommand.buildEmergencyStop());
+            Log.w(TAG, "[EMERGENCY-STOP] $ML:0 enviado=" + ok + " | origem=" + origem);
+        } else {
+            Log.e(TAG, "[EMERGENCY-STOP] BluetoothService nulo ou não vinculado — $ML:0 NAO enviado!");
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
     // UI helpers
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -963,11 +1109,17 @@ public class PagamentoConcluido extends AppCompatActivity {
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT);
     }
     // v5.2: Impede que o botão Voltar caia na AcessoMaster via back stack.
+    // v5.12: Fecha a solenoide antes de navegar para Home se houver ciclo ativo.
     private void setupBackBlock() {
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
-                android.util.Log.i("PAGAMENTO_CONCLUIDO", "[KIOSK] Botão Voltar bloqueado → Home");
+                android.util.Log.i("PAGAMENTO_CONCLUIDO",
+                        "[KIOSK] Botão Voltar bloqueado → Home | mDispenseLocked=" + mDispenseLocked);
+                // v5.12: fecha solenoide se ciclo ativo antes de sair
+                if (mDispenseLocked) {
+                    fecharSolenoideEmergencia("backButton");
+                }
                 android.content.Intent intent = new android.content.Intent(PagamentoConcluido.this, Home.class);
                 intent.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
                         | android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP);

@@ -712,7 +712,36 @@ public class CalibrarPulsos extends AppCompatActivity {
         return true;
     }
 
+    /**
+     * v5.12: Fecha a solenoide de emergência antes de sair da tela de calibração.
+     * Chamado em navegarHome() e onPause() quando há operação ativa.
+     */
+    private void fecharSolenoideEmergenciaCalibrar(String origem) {
+        Log.w(TAG_CAL, "[EMERGENCY-STOP] Fechando solenoide — origem=" + origem
+                + " | mLiberandoContinuo=" + mLiberandoContinuo
+                + " | mLiberando100ml=" + mLiberando100ml
+                + " | estadoCal=" + estadoCal);
+        // Cancela handlers pendentes
+        handler.removeCallbacksAndMessages(null);
+        // Reseta flags locais
+        mLiberandoContinuo = false;
+        mLiberando100ml    = false;
+        // Envia $ML:0 para fechar a solenoide imediatamente
+        if (mIsServiceBound && mBluetoothService != null) {
+            boolean ok = mBluetoothService.sendCommand(BleCommand.buildEmergencyStop());
+            Log.w(TAG_CAL, "[EMERGENCY-STOP] $ML:0 enviado=" + ok + " | origem=" + origem);
+        } else {
+            Log.e(TAG_CAL, "[EMERGENCY-STOP] BluetoothService nulo — $ML:0 NAO enviado!");
+        }
+    }
+
     private void navegarHome() {
+        // v5.12: fecha solenoide se houver operação ativa antes de sair
+        boolean operacaoAtiva = mLiberandoContinuo || mLiberando100ml
+                || estadoCal == EstadoCal.CAL_DISPENSANDO;
+        if (operacaoAtiva) {
+            fecharSolenoideEmergenciaCalibrar("navegarHome");
+        }
         // Volta para ServiceTools (tela pai), nao para Home
         Intent i = new Intent(this, ServiceTools.class);
         i.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
@@ -749,6 +778,13 @@ public class CalibrarPulsos extends AppCompatActivity {
     @Override
     protected void onPause() {
         super.onPause();
+        // v5.12: fecha solenoide ANTES de desvincular o serviço BLE
+        boolean operacaoAtiva = mLiberandoContinuo || mLiberando100ml
+                || estadoCal == EstadoCal.CAL_DISPENSANDO;
+        if (operacaoAtiva) {
+            Log.w(TAG_CAL, "[SEGURANCA-v5.12] onPause com operação ativa — enviando EMERGENCY STOP");
+            fecharSolenoideEmergenciaCalibrar("onPause");
+        }
         try { unregisterReceiver(mServiceUpdateReceiver); } catch (Exception ignored) {}
         if (mIsServiceBound) {
             unbindService(mServiceConnection);
