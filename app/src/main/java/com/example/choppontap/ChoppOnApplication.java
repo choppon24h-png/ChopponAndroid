@@ -54,6 +54,10 @@ public class ChoppOnApplication extends Application {
             throw new RuntimeException("Falha critica na inicializacao", e);
         }
 
+        // 3. v5.13: Inicializa SoundManager (SoundPool) para efeitos sonoros de UI
+        SoundManager.init(this);
+        Log.i(TAG, "[SOUND] SoundManager inicializado com 6 efeitos sonoros");
+
         // NOTA: BluetoothServiceIndustrial NÃO é iniciado aqui.
         // Motivo: No Android 12+, BLUETOOTH_SCAN é permissão de runtime.
         // O serviço é iniciado por Imei.java após permissões concedidas,

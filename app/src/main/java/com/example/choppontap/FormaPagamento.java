@@ -349,9 +349,18 @@ public class FormaPagamento extends AppCompatActivity {
         // v5.2: Bloqueia o botão Voltar — redireciona para Home sem abrir AcessoMaster.
         setupBackBlock();
 
-        btnPix.setOnClickListener(v -> handlePaymentClick("pix"));
-        btnCard.setOnClickListener(v -> handlePaymentClick("credit"));
-        btnCardDebit.setOnClickListener(v -> handlePaymentClick("debit"));
+        btnPix.setOnClickListener(v -> {
+            SoundManager.getInstance().playSelectPayment(); // v5.13
+            handlePaymentClick("pix");
+        });
+        btnCard.setOnClickListener(v -> {
+            SoundManager.getInstance().playSelectPayment(); // v5.13
+            handlePaymentClick("credit");
+        });
+        btnCardDebit.setOnClickListener(v -> {
+            SoundManager.getInstance().playSelectPayment(); // v5.13
+            handlePaymentClick("debit");
+        });
         btnCancelarCartao.setOnClickListener(v -> SendCardCancel());
         btnVoltar.setOnClickListener(v -> voltarParaHome());
 
@@ -683,6 +692,7 @@ public class FormaPagamento extends AppCompatActivity {
     private void navigateToSuccess() {
         runOnUiThread(() -> {
             Log.i(TAG, "[PAYMENT] Pagamento confirmado");
+            SoundManager.getInstance().playPaymentSuccess(); // v5.13
             Log.i(TAG, "[PAYMENT] Volume selecionado: " + quantidade + " ml");
             Log.i(TAG, "[PAYMENT] checkout_id: " + checkout_id);
             cancelInactivityTimer(); // v5.3: garantir que o timer seja cancelado ao concluir
@@ -831,6 +841,7 @@ public class FormaPagamento extends AppCompatActivity {
     }
 
     public void startCountDown(int seconds) {
+        SoundManager.getInstance().resetTimerWarning(); // v5.13: reseta o flag de warning
         runnableCountDown = new Runnable() {
             int i = 1;
 
@@ -838,12 +849,17 @@ public class FormaPagamento extends AppCompatActivity {
                 if (i <= seconds) {
                     final int currentI = i;
                     runOnUiThread(() -> {
-                        String t = (seconds - currentI) + "s";
+                        int restantes = seconds - currentI;
+                        String t = restantes + "s";
                         if (layoutInstrucaoCartao.getVisibility() == View.VISIBLE) {
                             txtTimerCartao.setText(t);
                         } else {
                             TextView tv = findViewById(R.id.txtTimer);
                             if (tv != null) tv.setText(t);
+                        }
+                        // v5.13: bip de alerta quando restam 20 segundos
+                        if (restantes == 20) {
+                            SoundManager.getInstance().playTimerWarning();
                         }
                     });
                     i++;

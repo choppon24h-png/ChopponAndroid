@@ -447,18 +447,22 @@ public class Home extends AppCompatActivity {
 
         // Volumes: btn100=300ml, btn300=500ml, btn500=700ml, btn700=1000ml
         btn100.setOnClickListener(v -> {
+            SoundManager.getInstance().playSelectChopp(); // v5.13
             highlightSelectedButton(btn100);
             openIntent(3);
         });
         btn300.setOnClickListener(v -> {
+            SoundManager.getInstance().playSelectChopp(); // v5.13
             highlightSelectedButton(btn300);
             openIntent(5);
         });
         btn500.setOnClickListener(v -> {
+            SoundManager.getInstance().playSelectChopp(); // v5.13
             highlightSelectedButton(btn500);
             openIntent(7);
         });
         btn700.setOnClickListener(v -> {
+            SoundManager.getInstance().playSelectChopp(); // v5.13
             highlightSelectedButton(btn700);
             openIntent(10);
         });

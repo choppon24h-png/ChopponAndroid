@@ -318,6 +318,8 @@ public class PagamentoConcluido extends AppCompatActivity {
             mValveOpen = true;
             mLastVpTimeMs = System.currentTimeMillis();
             iniciarOpenValveWatchdog();
+            // v5.13: som de válvula disponível
+            SoundManager.getInstance().playValveOpen();
             atualizarStatus("Válvula aberta. Puxe a alavanca!");
             return;
         }
@@ -622,6 +624,8 @@ public class PagamentoConcluido extends AppCompatActivity {
             public void onTick(long millisUntilFinished) {
                 int segsRestantes = (int) Math.ceil(millisUntilFinished / 1_000.0);
                 Log.d(TAG, "[COUNTDOWN] " + segsRestantes + "s restantes");
+                // v5.13: bip a cada segundo do contador regressivo
+                SoundManager.getInstance().playValveTick();
                 runOnUiThread(() -> {
                     btnLiberar.setText("Liberando em " + segsRestantes + "s...");
                     atualizarStatus("Preparando para continuar em " + segsRestantes + "s...");
