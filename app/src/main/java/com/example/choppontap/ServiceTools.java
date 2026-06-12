@@ -78,10 +78,19 @@ public class ServiceTools extends AppCompatActivity {
 
     private static final String TAG = "SERVICE_TOOLS";
 
-    // ── URL do endpoint de versão — usa o endpoint PHP do ERP (com fallback para version.json)
-    // Fonte de verdade: admin/app_update.php no ERP publica a versão no banco e sincroniza o JSON
-    private static final String VERSION_URL =
-            ApiConfig.getBaseUrl() + "app_version.php";
+    // ── OTA: URL base da pasta de APKs no servidor ──────────────────────────
+    // Estrutura esperada no servidor:
+    //   https://www.choppon24h.com.br/apk/version.json  ← fonte primária (JSON)
+    //   https://www.choppon24h.com.br/apk/APK01.apk    ← versão base (instalada)
+    //   https://www.choppon24h.com.br/apk/APK02.apk    ← versão superior → atualiza
+    //   https://www.choppon24h.com.br/apk/             ← fallback: parse do HTML
+    //
+    // Regra de versão: o número extraído do nome do arquivo (APK01→1, APK02→2,
+    // chopponv1→1, chopponv2→2) é comparado com APK_BASE_VERSION (1).
+    // Qualquer número maior dispara o download.
+    private static final String OTA_BASE_URL      = "https://www.choppon24h.com.br/apk/";
+    private static final String OTA_VERSION_JSON  = OTA_BASE_URL + "version.json";
+    private static final int    APK_BASE_VERSION  = 1;   // APK01 = versão base instalada
 
     // ── Nome do arquivo APK salvo no Downloads ────────────────────────────────
     private static final String APK_FILE_NAME = "choppontap-update.apk";
@@ -218,22 +227,23 @@ public class ServiceTools extends AppCompatActivity {
     }
 
     // =========================================================================
-    // SISTEMA DE ATUALIZAÇÃO DE APK — v3.2.0
-    // Todos os métodos abaixo são novos e não alteram nenhuma lógica existente.
+    // SISTEMA OTA DE ATUALIZAÇÃO DE APK — v5.14
+    // Consulta https://www.choppon24h.com.br/apk/
+    // Fluxo:
+    //   1. Tenta version.json (fonte primária)
+    //   2. Fallback: parse do HTML da pasta /apk/ para extrair o APK mais recente
+    //   3. Compara o número do APK do servidor com APK_BASE_VERSION (1 = APK01)
+    //   4. Se servidor > instalado: exibe diálogo de download
+    //   5. Se servidor <= instalado: informa que está atualizado
     // =========================================================================
 
     /**
-     * Ponto de entrada público para verificação de atualização.
-     * Pode ser chamado por qualquer Activity via:
-     *   ServiceTools.checkAppUpdate(context)  — chamada estática
-     * ou internamente pelo botão btnAtualizarApp.
-     *
-     * @param context Context da Activity chamadora
+     * Ponto de entrada público para verificação de atualização OTA.
+     * Chamado pelo botão btnAtualizarApp ou por qualquer Activity.
      */
     public static void checkAppUpdate(Context context) {
-        Log.d(TAG, "[UPDATE] checkAppUpdate() iniciado — URL: " + VERSION_URL);
+        Log.i(TAG, "[OTA] Iniciando verificação — " + OTA_VERSION_JSON);
 
-        // Desabilita o botão e mostra progresso se chamado de dentro da própria Activity
         if (context instanceof ServiceTools) {
             ServiceTools st = (ServiceTools) context;
             if (st.btnAtualizarApp != null) {
@@ -243,114 +253,263 @@ public class ServiceTools extends AppCompatActivity {
             if (st.progressUpdate != null) st.progressUpdate.setVisibility(View.VISIBLE);
         }
 
-        OkHttpClient client = new OkHttpClient();
-        Request request = new Request.Builder()
-                .url(VERSION_URL)
-                .addHeader("Cache-Control", "no-cache")
+        OkHttpClient client = new OkHttpClient.Builder()
+                .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
                 .build();
 
-        client.newCall(request).enqueue(new okhttp3.Callback() {
+        // Passo 1: tenta version.json
+        Request req = new Request.Builder()
+                .url(OTA_VERSION_JSON)
+                .addHeader("Cache-Control", "no-cache, no-store")
+                .build();
+
+        client.newCall(req).enqueue(new okhttp3.Callback() {
             @Override
             public void onFailure(okhttp3.Call call, IOException e) {
-                Log.e(TAG, "[UPDATE] Falha de rede: " + e.getMessage());
-                if (context instanceof AppCompatActivity) {
-                    AppCompatActivity activity = (AppCompatActivity) context;
-                    activity.runOnUiThread(() -> {
-                        if (context instanceof ServiceTools) ((ServiceTools) context).resetUpdateButton();
-                        Toast.makeText(context,
-                                "Não foi possível verificar atualizações.\nVerifique a conexão Wi-Fi.",
-                                Toast.LENGTH_LONG).show();
-                    });
-                }
+                Log.w(TAG, "[OTA] version.json inacessível: " + e.getMessage() + " — usando fallback HTML");
+                fetchApkListFallback(context, client);
             }
 
             @Override
             public void onResponse(okhttp3.Call call, okhttp3.Response response) throws IOException {
                 try (okhttp3.ResponseBody rb = response.body()) {
-                    if (!response.isSuccessful() || rb == null) {
-                        Log.e(TAG, "[UPDATE] Resposta inválida HTTP " + response.code());
-                        if (context instanceof AppCompatActivity) {
-                            AppCompatActivity activity = (AppCompatActivity) context;
-                            activity.runOnUiThread(() -> {
-                                if (context instanceof ServiceTools) ((ServiceTools) context).resetUpdateButton();
-                                Toast.makeText(context,
-                                        "Servidor retornou erro " + response.code() + ". Tente novamente.",
-                                        Toast.LENGTH_LONG).show();
-                            });
-                        }
+                    String body = rb != null ? rb.string() : "";
+                    Log.d(TAG, "[OTA] version.json HTTP=" + response.code() + " body=" + body.substring(0, Math.min(200, body.length())));
+
+                    // Se retornou HTML (página de erro/redirect) ou não é JSON válido, usa fallback
+                    if (!response.isSuccessful() || !body.trim().startsWith("{")) {
+                        Log.w(TAG, "[OTA] version.json não é JSON válido — usando fallback HTML");
+                        fetchApkListFallback(context, client);
                         return;
                     }
 
-                    String json = rb.string();
-                    Log.d(TAG, "[UPDATE] Resposta: " + json);
-
-                    VersionInfo info = parseVersionJson(json);
-                    if (info == null) {
-                        Log.e(TAG, "[UPDATE] Falha ao parsear JSON de versão");
-                        if (context instanceof AppCompatActivity) {
-                            ((AppCompatActivity) context).runOnUiThread(() -> {
-                                if (context instanceof ServiceTools) ((ServiceTools) context).resetUpdateButton();
-                                Toast.makeText(context, "Erro ao processar resposta do servidor.", Toast.LENGTH_LONG).show();
-                            });
-                        }
+                    OtaInfo info = parseVersionJson(body);
+                    if (info == null || info.apkNumber <= 0) {
+                        Log.w(TAG, "[OTA] version.json inválido — usando fallback HTML");
+                        fetchApkListFallback(context, client);
                         return;
                     }
 
-                    int currentVersionCode = getCurrentVersionCode(context);
-                    Log.d(TAG, "[UPDATE] Versão instalada: " + currentVersionCode
-                            + " | Versão servidor: " + info.versionCode
-                            + " | Nome: " + info.versionName);
-
-                    if (context instanceof AppCompatActivity) {
-                        AppCompatActivity activity = (AppCompatActivity) context;
-                        activity.runOnUiThread(() -> {
-                            if (context instanceof ServiceTools) ((ServiceTools) context).resetUpdateButton();
-                            handleUpdateResult(activity, info, currentVersionCode);
-                        });
-                    }
+                    Log.i(TAG, "[OTA] version.json OK — APK#" + info.apkNumber + " (" + info.apkName + ") base=" + APK_BASE_VERSION);
+                    avaliarEExibir(context, info);
                 }
             }
         });
     }
 
     /**
-     * Avalia o resultado da verificação e exibe o diálogo adequado.
+     * Fallback: faz GET na página HTML de /apk/ e extrai o APK mais recente
+     * referenciado no HTML (href ou onclick com .apk).
      */
-    private static void handleUpdateResult(AppCompatActivity activity,
-                                           VersionInfo info,
-                                           int currentVersionCode) {
-        if (info.versionCode > currentVersionCode) {
-            // Nova versão disponível
-            String titulo   = "Nova atualização disponível";
-            String mensagem = "Versão " + info.versionName + " disponível.\n"
-                    + "Versão instalada: " + getCurrentVersionName(activity) + "\n\n"
-                    + (info.changelog != null && !info.changelog.isEmpty()
-                    ? "O que há de novo:\n" + info.changelog : "");
+    private static void fetchApkListFallback(Context context, OkHttpClient client) {
+        Log.i(TAG, "[OTA] Fallback: consultando " + OTA_BASE_URL);
 
-            AlertDialog.Builder builder = new AlertDialog.Builder(activity)
-                    .setTitle(titulo)
-                    .setMessage(mensagem)
-                    .setPositiveButton("Atualizar agora", (dialog, which) -> {
-                        if (activity instanceof ServiceTools) {
-                            ((ServiceTools) activity).downloadNewVersion(info.apkUrl);
-                        }
-                    })
-                    .setNegativeButton("Agora não", null);
+        Request req = new Request.Builder()
+                .url(OTA_BASE_URL)
+                .addHeader("Cache-Control", "no-cache, no-store")
+                .build();
 
-            if (info.force) {
-                // Atualização obrigatória: remove o botão "Agora não"
-                builder.setCancelable(false)
-                        .setNegativeButton(null, null);
+        client.newCall(req).enqueue(new okhttp3.Callback() {
+            @Override
+            public void onFailure(okhttp3.Call call, IOException e) {
+                Log.e(TAG, "[OTA] Fallback falhou: " + e.getMessage());
+                notificarErro(context, "Não foi possível verificar atualizações.\nVerifique a conexão Wi-Fi.");
             }
 
-            builder.show();
+            @Override
+            public void onResponse(okhttp3.Call call, okhttp3.Response response) throws IOException {
+                try (okhttp3.ResponseBody rb = response.body()) {
+                    if (!response.isSuccessful() || rb == null) {
+                        notificarErro(context, "Servidor retornou erro " + response.code() + ".");
+                        return;
+                    }
 
-        } else {
-            // App já está atualizado
-            Toast.makeText(activity,
-                    "O aplicativo já está na versão mais recente (" + getCurrentVersionName(activity) + ").",
-                    Toast.LENGTH_LONG).show();
-            Log.d(TAG, "checkAppUpdate - app já está atualizado");
+                    String html = rb.string();
+                    Log.d(TAG, "[OTA] HTML recebido (" + html.length() + " chars)");
+
+                    OtaInfo info = extrairApkDoHtml(html);
+                    if (info == null) {
+                        Log.e(TAG, "[OTA] Nenhum APK encontrado no HTML");
+                        notificarErro(context, "Não foi possível identificar a versão disponível no servidor.");
+                        return;
+                    }
+
+                    Log.i(TAG, "[OTA] APK encontrado no HTML: " + info.apkName + " (#" + info.apkNumber + ")");
+                    avaliarEExibir(context, info);
+                }
+            }
+        });
+    }
+
+    /**
+     * Compara o número do APK do servidor com a versão base instalada
+     * e exibe o diálogo ou mensagem de versão atual.
+     *
+     * Regra:
+     *   servidor > APK_BASE_VERSION  → nova versão disponível
+     *   servidor <= APK_BASE_VERSION → versão já está atual
+     */
+    private static void avaliarEExibir(Context context, OtaInfo info) {
+        if (!(context instanceof AppCompatActivity)) return;
+        AppCompatActivity activity = (AppCompatActivity) context;
+
+        activity.runOnUiThread(() -> {
+            if (context instanceof ServiceTools) ((ServiceTools) context).resetUpdateButton();
+
+            if (info.apkNumber > APK_BASE_VERSION) {
+                // Nova versão disponível
+                String titulo = "⬆️ Nova atualização disponível";
+                String msg = "Versão disponivel no servidor: " + info.apkName + "\n"
+                        + "Versão base instalada: APK0" + APK_BASE_VERSION + "\n\n"
+                        + (info.changelog != null && !info.changelog.isEmpty()
+                            ? "O que há de novo:\n" + info.changelog + "\n\n" : "")
+                        + "Deseja baixar e instalar agora?";
+
+                Log.i(TAG, "[OTA] Atualização disponível: " + info.apkName + " (#" + info.apkNumber + " > " + APK_BASE_VERSION + ")");
+
+                new AlertDialog.Builder(activity)
+                        .setTitle(titulo)
+                        .setMessage(msg)
+                        .setPositiveButton("Baixar e instalar", (dialog, which) -> {
+                            if (activity instanceof ServiceTools) {
+                                ((ServiceTools) activity).downloadNewVersion(info.apkUrl);
+                            }
+                        })
+                        .setNegativeButton("Agora não", null)
+                        .show();
+
+            } else {
+                // Versão atual
+                String msg = "✅ Versão atual!\n"
+                        + "APK instalado: APK0" + APK_BASE_VERSION + "\n"
+                        + "Servidor: " + info.apkName + "\n"
+                        + "Nenhuma atualização disponível.";
+                Log.i(TAG, "[OTA] Versão atual — servidor=" + info.apkNumber + " base=" + APK_BASE_VERSION);
+
+                new AlertDialog.Builder(activity)
+                        .setTitle("Versão atual")
+                        .setMessage(msg)
+                        .setPositiveButton("OK", null)
+                        .show();
+            }
+        });
+    }
+
+    /**
+     * Parseia o version.json do servidor.
+     * Formato esperado:
+     * {
+     *   "apkNumber": 2,
+     *   "apkName": "APK02.apk",
+     *   "apkUrl": "https://www.choppon24h.com.br/apk/APK02.apk",
+     *   "changelog": "Descrição das mudanças"
+     * }
+     * Também aceita o formato legado com "versionCode" e "apkUrl".
+     */
+    private static OtaInfo parseVersionJson(String json) {
+        try {
+            int idx = json.indexOf('{');
+            if (idx > 0) json = json.substring(idx);
+
+            com.google.gson.JsonObject obj =
+                    com.google.gson.JsonParser.parseString(json).getAsJsonObject();
+
+            OtaInfo info = new OtaInfo();
+
+            // Formato novo: apkNumber + apkName + apkUrl
+            if (obj.has("apkNumber")) {
+                info.apkNumber  = obj.get("apkNumber").getAsInt();
+                info.apkName    = obj.has("apkName")  ? obj.get("apkName").getAsString()  : "APK0" + info.apkNumber + ".apk";
+                info.apkUrl     = obj.has("apkUrl")   ? obj.get("apkUrl").getAsString()   : OTA_BASE_URL + info.apkName;
+                info.changelog  = obj.has("changelog") ? obj.get("changelog").getAsString() : "";
+                return info;
+            }
+
+            // Formato legado: versionCode + apkUrl
+            if (obj.has("versionCode") && obj.has("apkUrl")) {
+                info.apkNumber  = obj.get("versionCode").getAsInt();
+                info.apkName    = obj.has("versionName") ? obj.get("versionName").getAsString() : "APK0" + info.apkNumber;
+                info.apkUrl     = obj.get("apkUrl").getAsString();
+                info.changelog  = obj.has("changelog") ? obj.get("changelog").getAsString() : "";
+                return info;
+            }
+
+            Log.w(TAG, "[OTA] JSON sem campos reconhecidos");
+            return null;
+        } catch (Exception e) {
+            Log.e(TAG, "[OTA] parseVersionJson erro: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Extrai o APK mais recente referenciado no HTML da página /apk/.
+     * Suporta padrões:
+     *   APK01.apk, APK02.apk, APK10.apk  (padrão principal)
+     *   chopponv1.apk, chopponv2.apk      (padrão alternativo)
+     *   qualquer .apk referenciado em href ou onclick
+     *
+     * Retorna o APK com o MAIOR número encontrado.
+     */
+    private static OtaInfo extrairApkDoHtml(String html) {
+        // Regex 1: APK seguido de números (APK01, APK02, APK10...)
+        java.util.regex.Pattern p1 = java.util.regex.Pattern.compile(
+                "APK(\\d+)\\.apk", java.util.regex.Pattern.CASE_INSENSITIVE);
+        // Regex 2: chopponvN.apk
+        java.util.regex.Pattern p2 = java.util.regex.Pattern.compile(
+                "chopponv(\\d+)\\.apk", java.util.regex.Pattern.CASE_INSENSITIVE);
+        // Regex 3: qualquer .apk referenciado (href ou src)
+        java.util.regex.Pattern p3 = java.util.regex.Pattern.compile(
+                "['\"]([^'\"]*\\.apk)['\"]" , java.util.regex.Pattern.CASE_INSENSITIVE);
+
+        int bestNumber = -1;
+        String bestName = null;
+
+        // Testa padrão APK##
+        java.util.regex.Matcher m1 = p1.matcher(html);
+        while (m1.find()) {
+            int n = Integer.parseInt(m1.group(1));
+            if (n > bestNumber) { bestNumber = n; bestName = m1.group(0); }
+        }
+
+        // Testa padrão chopponvN
+        java.util.regex.Matcher m2 = p2.matcher(html);
+        while (m2.find()) {
+            int n = Integer.parseInt(m2.group(1));
+            if (n > bestNumber) { bestNumber = n; bestName = m2.group(0); }
+        }
+
+        // Fallback genérico: qualquer .apk entre aspas
+        if (bestName == null) {
+            java.util.regex.Matcher m3 = p3.matcher(html);
+            if (m3.find()) {
+                String rawName = m3.group(1);
+                // Extrai número do nome se possível
+                java.util.regex.Matcher numM = java.util.regex.Pattern.compile("(\\d+)").matcher(rawName);
+                bestNumber = numM.find() ? Integer.parseInt(numM.group(1)) : 1;
+                // Pega apenas o nome do arquivo (sem path)
+                bestName = rawName.contains("/") ? rawName.substring(rawName.lastIndexOf('/') + 1) : rawName;
+            }
+        }
+
+        if (bestName == null) return null;
+
+        OtaInfo info = new OtaInfo();
+        info.apkNumber = bestNumber;
+        info.apkName   = bestName;
+        info.apkUrl    = OTA_BASE_URL + bestName;
+        info.changelog = "";
+        return info;
+    }
+
+    /** Exibe Toast de erro na UI thread. */
+    private static void notificarErro(Context context, String mensagem) {
+        if (context instanceof AppCompatActivity) {
+            ((AppCompatActivity) context).runOnUiThread(() -> {
+                if (context instanceof ServiceTools) ((ServiceTools) context).resetUpdateButton();
+                Toast.makeText(context, mensagem, Toast.LENGTH_LONG).show();
+            });
         }
     }
 
@@ -508,56 +667,6 @@ public class ServiceTools extends AppCompatActivity {
                 APK_FILE_NAME);
     }
 
-    /** Obtém o versionCode atual do app instalado. */
-    private static int getCurrentVersionCode(Context context) {
-        try {
-            PackageInfo pi = context.getPackageManager()
-                    .getPackageInfo(context.getPackageName(), 0);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                return (int) pi.getLongVersionCode();
-            } else {
-                //noinspection deprecation
-                return pi.versionCode;
-            }
-        } catch (PackageManager.NameNotFoundException e) {
-            Log.e(TAG, "getCurrentVersionCode - " + e.getMessage());
-            return 0;
-        }
-    }
-
-    /** Obtém o versionName atual do app instalado. */
-    private static String getCurrentVersionName(Context context) {
-        try {
-            return context.getPackageManager()
-                    .getPackageInfo(context.getPackageName(), 0).versionName;
-        } catch (PackageManager.NameNotFoundException e) {
-            return "desconhecida";
-        }
-    }
-
-    /** Parseia o JSON de versão retornado pelo servidor. */
-    private static VersionInfo parseVersionJson(String json) {
-        try {
-            // Limpa possíveis caracteres antes do JSON
-            int idx = json.indexOf('{');
-            if (idx > 0) json = json.substring(idx);
-
-            com.google.gson.JsonObject obj =
-                    com.google.gson.JsonParser.parseString(json).getAsJsonObject();
-
-            VersionInfo info = new VersionInfo();
-            info.versionCode = obj.has("versionCode") ? obj.get("versionCode").getAsInt()    : 0;
-            info.versionName = obj.has("versionName") ? obj.get("versionName").getAsString() : "";
-            info.apkUrl      = obj.has("apkUrl")      ? obj.get("apkUrl").getAsString()      : "";
-            info.force       = obj.has("force")       && obj.get("force").getAsBoolean();
-            info.changelog   = obj.has("changelog")   ? obj.get("changelog").getAsString()   : "";
-            return info;
-        } catch (Exception e) {
-            Log.e(TAG, "parseVersionJson - erro: " + e.getMessage());
-            return null;
-        }
-    }
-
     /** Restaura o estado do botão de atualização. */
     private void resetUpdateButton() {
         if (progressUpdate != null) progressUpdate.setVisibility(View.GONE);
@@ -567,13 +676,12 @@ public class ServiceTools extends AppCompatActivity {
         }
     }
 
-    /** Modelo de dados do version.json. */
-    private static class VersionInfo {
-        int     versionCode = 0;
-        String  versionName = "";
-        String  apkUrl      = "";
-        boolean force       = false;
-        String  changelog   = "";
+    /** Modelo de dados OTA (versão unificada). */
+    private static class OtaInfo {
+        int    apkNumber = 0;   // Número do APK: APK01→1, APK02→2, etc.
+        String apkName   = "";  // Nome do arquivo: APK02.apk
+        String apkUrl    = "";  // URL completa para download
+        String changelog = "";  // Descrição das mudanças (opcional)
     }
 
     // =========================================================================
