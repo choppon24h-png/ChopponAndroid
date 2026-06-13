@@ -299,11 +299,79 @@ public class ServiceTools extends AppCompatActivity {
     }
 
     /**
-     * Fallback: faz GET na página HTML de /apk/ e extrai o APK mais recente
-     * referenciado no HTML (href ou onclick com .apk).
+     * Fallback Tier-1: probe direto nos arquivos APK##.apk no servidor.
+     *
+     * Faz HEAD requests em APK02.apk, APK03.apk ... APK99.apk e retorna
+     * o maior número que existir (HTTP 200). Se nenhum existir além da base,
+     * cai no Fallback Tier-2 (parse do HTML).
+     *
+     * Isso é robusto mesmo quando o index.html não menciona o APK mais recente.
      */
     private static void fetchApkListFallback(Context context, OkHttpClient client) {
-        Log.i(TAG, "[OTA] Fallback: consultando " + OTA_BASE_URL);
+        Log.i(TAG, "[OTA] Fallback Tier-1: probe direto nos arquivos APK##.apk");
+
+        // Executa em thread de background para não bloquear a UI
+        new Thread(() -> {
+            int highestFound = APK_BASE_VERSION; // começa da versão base
+            String highestName = null;
+
+            // Testa APK02 até APK20 (limite razoável para evitar muitas requisições)
+            for (int n = APK_BASE_VERSION + 1; n <= 20; n++) {
+                String paddedNum = String.format("%02d", n);  // 2 → "02", 10 → "10"
+                String apkName   = "APK" + paddedNum + ".apk";
+                String apkUrl    = OTA_BASE_URL + apkName;
+
+                try {
+                    Request headReq = new Request.Builder()
+                            .url(apkUrl)
+                            .head()   // HEAD: verifica existência sem baixar o arquivo
+                            .addHeader("Cache-Control", "no-cache")
+                            .build();
+
+                    okhttp3.Response resp = client.newCall(headReq).execute();
+                    int code = resp.code();
+                    resp.close();
+
+                    if (code == 200) {
+                        Log.i(TAG, "[OTA] Probe: " + apkName + " existe (HTTP 200)");
+                        highestFound = n;
+                        highestName  = apkName;
+                    } else if (code == 404) {
+                        // A partir do primeiro 404 consecutivo, para a busca
+                        Log.d(TAG, "[OTA] Probe: " + apkName + " não existe (HTTP 404) — parando");
+                        break;
+                    } else {
+                        Log.w(TAG, "[OTA] Probe: " + apkName + " HTTP " + code + " — ignorando");
+                    }
+                } catch (IOException e) {
+                    Log.w(TAG, "[OTA] Probe: " + apkName + " falhou: " + e.getMessage());
+                    break;
+                }
+            }
+
+            if (highestFound > APK_BASE_VERSION && highestName != null) {
+                // Encontrou versão superior via probe
+                OtaInfo info = new OtaInfo();
+                info.apkNumber = highestFound;
+                info.apkName   = highestName;
+                info.apkUrl    = OTA_BASE_URL + highestName;
+                info.changelog = "";
+                Log.i(TAG, "[OTA] Probe concluído: versão mais alta = " + highestName + " (#" + highestFound + ")");
+                avaliarEExibir(context, info);
+            } else {
+                // Nenhum APK superior encontrado via probe — tenta parse do HTML como Tier-2
+                Log.i(TAG, "[OTA] Probe: nenhum APK superior encontrado — tentando parse HTML");
+                fetchApkHtmlFallback(context, client);
+            }
+        }).start();
+    }
+
+    /**
+     * Fallback Tier-2: parse do HTML da página /apk/.
+     * Usado apenas se o probe direto não encontrou nenhum APK superior.
+     */
+    private static void fetchApkHtmlFallback(Context context, OkHttpClient client) {
+        Log.i(TAG, "[OTA] Fallback Tier-2: parse HTML de " + OTA_BASE_URL);
 
         Request req = new Request.Builder()
                 .url(OTA_BASE_URL)
@@ -313,7 +381,7 @@ public class ServiceTools extends AppCompatActivity {
         client.newCall(req).enqueue(new okhttp3.Callback() {
             @Override
             public void onFailure(okhttp3.Call call, IOException e) {
-                Log.e(TAG, "[OTA] Fallback falhou: " + e.getMessage());
+                Log.e(TAG, "[OTA] Fallback Tier-2 falhou: " + e.getMessage());
                 notificarErro(context, "Não foi possível verificar atualizações.\nVerifique a conexão Wi-Fi.");
             }
 
@@ -329,9 +397,14 @@ public class ServiceTools extends AppCompatActivity {
                     Log.d(TAG, "[OTA] HTML recebido (" + html.length() + " chars)");
 
                     OtaInfo info = extrairApkDoHtml(html);
-                    if (info == null) {
-                        Log.e(TAG, "[OTA] Nenhum APK encontrado no HTML");
-                        notificarErro(context, "Não foi possível identificar a versão disponível no servidor.");
+                    if (info == null || info.apkNumber <= APK_BASE_VERSION) {
+                        // Nenhum APK superior encontrado em nenhuma fonte
+                        Log.i(TAG, "[OTA] Nenhuma atualização encontrada em nenhuma fonte");
+                        OtaInfo atual = new OtaInfo();
+                        atual.apkNumber = APK_BASE_VERSION;
+                        atual.apkName   = "APK0" + APK_BASE_VERSION + ".apk";
+                        atual.apkUrl    = "";
+                        avaliarEExibir(context, atual);
                         return;
                     }
 
